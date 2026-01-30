@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls:*)",
+      "Bash(git add:*)",
+      "Bash(git commit -m \"$\\(cat <<''EOF''\nfeat: Add init script for AI-assisted ralph setup\n\nAdds ralph/init script that runs Claude or Codex to automate ralph setup:\n- Adds ralph/ to .git/info/exclude\n- Creates prompt files from example templates\n- Supports --beads flag to initialize beads and use .example.beads.md templates\n- Supports --claude flag to set up .claude/commands/ symlinks\n- Supports --yolo for full permissions mode\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>\nEOF\n\\)\")",
+      "Bash(git push)",
+      "Bash(git commit:*)"
+    ]
+  }
+}
