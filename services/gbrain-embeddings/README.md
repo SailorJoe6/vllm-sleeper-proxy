@@ -186,6 +186,41 @@ LITELLM_BASE_URL = http://127.0.0.1:4000/v1
 Remote GBrain instances on the private LAN should use the DGX Spark private LAN
 address on port `4000`.
 
+## Production Handoff State
+
+Captured on 2026-05-09 at 16:52 UTC.
+
+- Production source of truth:
+  `/home/sailorjoe6/Code/vllm-sleeper-proxy/services/gbrain-embeddings`
+- Installed systemd unit:
+  `/etc/systemd/system/gbrain-embeddings.service`
+- Supported local endpoint:
+  `http://127.0.0.1:4000/v1`
+- Selected private LAN endpoint:
+  `http://10.0.4.225:4000/v1`
+- LiteLLM image:
+  `docker.litellm.ai/berriai/litellm@sha256:3d80908e35230a0dfb58051ae4e2847371b2a327b44e105e79b8c4f67a65596c`
+  resolved locally to image id
+  `sha256:4b47db195c267a2f1d7f0802caa702c13b6f425d04b57353011ee111912668d5`.
+- vLLM image:
+  `vllm-node:latest`, resolved locally to image id
+  `sha256:cfa6b2c37c09a5afff8daedfacc8a0436b1b6e8dfef064ca31d8adea8775eaf8`.
+- Runtime state:
+  `systemctl status gbrain-embeddings --no-pager` reported `active (running)`,
+  `systemctl is-enabled gbrain-embeddings` reported `enabled`, and
+  `docker compose ps` showed both `gbrain-embeddings-vllm` and
+  `gbrain-embeddings-litellm` healthy on ports `8888` and `4000`.
+- Smoke evidence:
+  `scripts/smoke-gbrain-embeddings.sh` printed
+  `PASS vLLM model listed: Qwen/Qwen3-Embedding-8B`,
+  `PASS LiteLLM alias listed: Qwen3-Embedding-8B`, and
+  `PASS embedding vector length: 4096`.
+- LAN evidence:
+  `curl http://10.0.4.225:4000/v1/models` listed `Qwen3-Embedding-8B`.
+- Reboot validation:
+  not performed during handoff; run the reboot validation commands above at the
+  next maintenance window before treating boot-start behavior as fully tested.
+
 ## Fresh GBrain Compatibility Smoke
 
 Use an isolated `GBRAIN_HOME` so this does not mutate an existing brain. Unset
