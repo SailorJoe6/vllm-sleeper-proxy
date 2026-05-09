@@ -1,0 +1,81 @@
+name: ${COMPOSE_PROJECT_NAME:-gbrain-embeddings}
+
+services:
+  vllm:
+    image: ${VLLM_IMAGE:-vllm-node:latest}
+    container_name: ${VLLM_CONTAINER_NAME:-gbrain-embeddings-vllm}
+    restart: unless-stopped
+    ipc: host
+    ports:
+      - "${VLLM_HOST_PORT:-8888}:${VLLM_CONTAINER_PORT:-8888}"
+    environment:
+      HF_HOME: ${HF_HOME:-/root/.cache/huggingface}
+      HUGGING_FACE_HUB_TOKEN: ${HUGGING_FACE_HUB_TOKEN:-}
+    volumes:
+      - ${HF_CACHE_DIR:-${HOME}/.cache/huggingface}:/root/.cache/huggingface
+    command:
+      - vllm
+      - serve
+      - ${VLLM_MODEL_ID:-Qwen/Qwen3-Embedding-8B}
+      - --runner
+      - pooling
+      - --max-model-len
+      - "${VLLM_MAX_MODEL_LEN:-32768}"
+      - --gpu-memory-utilization
+      - "${VLLM_GPU_MEMORY_UTILIZATION:-0.7}"
+      - -tp
+      - "${VLLM_TENSOR_PARALLEL:-1}"
+      - --host
+      - "0.0.0.0"
+      - --port
+      - "${VLLM_CONTAINER_PORT:-8888}"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          python3 -c "import json,sys,urllib.request;
+          data=json.load(urllib.request.urlopen('http://127.0.0.1:${VLLM_CONTAINER_PORT:-8888}/v1/models', timeout=5));
+          sys.exit(0 if any(m.get('id') == '${VLLM_MODEL_ID:-Qwen/Qwen3-Embedding-8B}' for m in data.get('data', [])) else 1)"
+      interval: 30s
+      timeout: 10s
+      retries: 20
+      start_period: 180s
+
+  litellm:
+    image: ${LITELLM_IMAGE:-docker.litellm.ai/berriai/litellm@sha256:3d80908e35230a0dfb58051ae4e2847371b2a327b44e105e79b8c4f67a65596c}
+    container_name: ${LITELLM_CONTAINER_NAME:-gbrain-embeddings-litellm}
+    restart: unless-stopped
+    depends_on:
+      vllm:
+        condition: service_healthy
+    ports:
+      - "${LITELLM_HOST_PORT:-4000}:4000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./litellm.yaml:/app/config.yaml:ro
+    command:
+      - --config
+      - /app/config.yaml
+      - --host
+      - "0.0.0.0"
+      - --port
+      - "4000"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          python3 -c "import json,sys,urllib.request;
+          data=json.load(urllib.request.urlopen('http://127.0.0.1:4000/v1/models', timeout=5));
+          sys.exit(0 if any(m.get('id') == '${LITELLM_MODEL_ALIAS:-Qwen3-Embedding-8B}' for m in data.get('data', [])) else 1)"
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 30s

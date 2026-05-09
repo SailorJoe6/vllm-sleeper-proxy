@@ -1,0 +1,9 @@
+litellm_settings:
+  drop_params: true
+
+model_list:
+  - model_name: Qwen3-Embedding-8B
+    litellm_params:
+      model: hosted_vllm/Qwen/Qwen3-Embedding-8B
+      api_base: http://host.docker.internal:8888/v1
+      api_key: dummy
