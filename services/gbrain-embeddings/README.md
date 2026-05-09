@@ -186,6 +186,66 @@ LITELLM_BASE_URL = http://127.0.0.1:4000/v1
 Remote GBrain instances on the private LAN should use the DGX Spark private LAN
 address on port `4000`.
 
+## Fresh GBrain Compatibility Smoke
+
+Use an isolated `GBRAIN_HOME` so this does not mutate an existing brain. Unset
+cloud API keys to prove the embedding path is local-only:
+
+```bash
+rm -rf /tmp/gbrain-litellm-smoke
+mkdir -p /tmp/gbrain-litellm-smoke/corpus
+printf '%s\n' \
+  '# Local Embedding Smoke' \
+  '' \
+  'GBrain verifies local LiteLLM embeddings using Qwen3-Embedding-8B.' \
+  '' \
+  'The retrieval keyword is obsidian-papaya.' \
+  > /tmp/gbrain-litellm-smoke/corpus/local-embedding-smoke.md
+
+env -u OPENAI_API_KEY -u ANTHROPIC_API_KEY \
+  GBRAIN_HOME=/tmp/gbrain-litellm-smoke \
+  LITELLM_BASE_URL=http://127.0.0.1:4000/v1 \
+  gbrain init --pglite \
+    --embedding-model litellm:Qwen3-Embedding-8B \
+    --embedding-dimensions 4096
+
+env -u OPENAI_API_KEY -u ANTHROPIC_API_KEY \
+  GBRAIN_HOME=/tmp/gbrain-litellm-smoke \
+  LITELLM_BASE_URL=http://127.0.0.1:4000/v1 \
+  gbrain import /tmp/gbrain-litellm-smoke/corpus --progress-json
+
+env -u OPENAI_API_KEY -u ANTHROPIC_API_KEY \
+  GBRAIN_HOME=/tmp/gbrain-litellm-smoke \
+  LITELLM_BASE_URL=http://127.0.0.1:4000/v1 \
+  gbrain search obsidian-papaya
+
+env -u OPENAI_API_KEY -u ANTHROPIC_API_KEY \
+  GBRAIN_HOME=/tmp/gbrain-litellm-smoke \
+  LITELLM_BASE_URL=http://127.0.0.1:4000/v1 \
+  gbrain query "What page mentions obsidian-papaya?" --no-expand
+
+env -u OPENAI_API_KEY -u ANTHROPIC_API_KEY \
+  GBRAIN_HOME=/tmp/gbrain-litellm-smoke \
+  LITELLM_BASE_URL=http://127.0.0.1:4000/v1 \
+  gbrain doctor --json
+```
+
+Expected evidence:
+
+- `gbrain init` creates a PGLite brain with
+  `litellm:Qwen3-Embedding-8B` at 4096 dimensions.
+- Import reports `1 pages imported` and `1 chunks created`.
+- Search and query return `local-embedding-smoke`.
+- Doctor reports `embedding_provider` as
+  `litellm:Qwen3-Embedding-8B` with `4096 dims, DB aligned`.
+
+Validated on 2026-05-09 with the systemd-managed service active and enabled.
+The local test used `oven/bun:1.3.13` with host networking to run the GBrain
+checkout because the interactive `gbrain` binary was not on this shell's PATH;
+the service-facing inputs were the same as above. The LiteLLM LAN endpoint
+`http://10.0.4.225:4000/v1/models` listed `Qwen3-Embedding-8B`, and a LAN-address
+embedding request returned a 4096-dimensional vector from this host.
+
 ## Image Updates and Rollback
 
 LiteLLM is pinned by repo digest in `docker-compose.yml` and `.env.example`.
