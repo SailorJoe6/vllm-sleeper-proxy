@@ -56,11 +56,26 @@ docker compose ps
 ../../scripts/smoke-gbrain-embeddings.sh
 ```
 
+Expected Compose state after startup:
+
+```text
+gbrain-embeddings-vllm      Up ... (healthy)   0.0.0.0:8888->8888/tcp
+gbrain-embeddings-litellm   Up ... (healthy)   0.0.0.0:4000->4000/tcp
+```
+
+The vLLM container can take a few minutes to become healthy while loading
+`Qwen/Qwen3-Embedding-8B`. LiteLLM starts after the vLLM health check passes.
+
 Stop the stack:
 
 ```bash
 docker compose down
 ```
+
+The containers use `restart: unless-stopped`, so process exits are restarted by
+Docker. Manual operator stops such as `docker stop` or `docker kill` are treated
+as intentional stops and should be followed by `docker compose up -d` or
+`sudo systemctl restart gbrain-embeddings`.
 
 ## systemd Install
 
@@ -101,6 +116,13 @@ Expected evidence:
 PASS vLLM model listed: Qwen/Qwen3-Embedding-8B
 PASS LiteLLM alias listed: Qwen3-Embedding-8B
 PASS embedding vector length: 4096
+```
+
+The direct model endpoints should also list the expected IDs:
+
+```bash
+curl -fsS http://127.0.0.1:4000/v1/models
+curl -fsS http://127.0.0.1:8888/v1/models
 ```
 
 For a LAN client, override URLs:
