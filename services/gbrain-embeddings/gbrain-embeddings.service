@@ -8,6 +8,8 @@ Wants=network-online.target nvidia-persistenced.service
 [Service]
 Type=simple
 WorkingDirectory=/home/sailorjoe6/Code/vllm-sleeper-proxy/services/gbrain-embeddings
+Environment=HOME=/home/sailorjoe6
+Environment=HF_CACHE_DIR=/home/sailorjoe6/.cache/huggingface
 ExecStart=/usr/bin/docker compose up --remove-orphans
 ExecStop=/usr/bin/docker compose down
 Restart=always

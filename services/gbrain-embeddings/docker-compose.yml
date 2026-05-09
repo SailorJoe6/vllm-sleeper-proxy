@@ -12,7 +12,7 @@ services:
       HF_HOME: ${HF_HOME:-/root/.cache/huggingface}
       HUGGING_FACE_HUB_TOKEN: ${HUGGING_FACE_HUB_TOKEN:-}
     volumes:
-      - ${HF_CACHE_DIR:-${HOME}/.cache/huggingface}:/root/.cache/huggingface
+      - ${HF_CACHE_DIR:-/home/sailorjoe6/.cache/huggingface}:/root/.cache/huggingface
     command:
       - vllm
       - serve

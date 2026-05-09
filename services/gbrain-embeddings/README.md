@@ -102,6 +102,43 @@ systemctl status gbrain-embeddings --no-pager
 journalctl -u gbrain-embeddings -f
 ```
 
+Validation after install or restart:
+
+```bash
+systemctl is-active --quiet gbrain-embeddings && echo active
+systemctl is-enabled --quiet gbrain-embeddings && echo enabled
+journalctl -u gbrain-embeddings -n 80 --no-pager
+docker compose ps
+../../scripts/smoke-gbrain-embeddings.sh
+```
+
+The systemd unit sets `HOME=/home/sailorjoe6` and
+`HF_CACHE_DIR=/home/sailorjoe6/.cache/huggingface` so boot-time Compose runs use
+the same Hugging Face cache as interactive validation.
+
+To validate container failure recovery under systemd, terminate the vLLM process
+inside the managed container and wait for Docker to restart it:
+
+```bash
+docker exec gbrain-embeddings-vllm pkill -TERM -f "vllm serve"
+docker inspect gbrain-embeddings-vllm --format '{{.RestartCount}}'
+docker compose ps
+../../scripts/smoke-gbrain-embeddings.sh
+```
+
+Manual `docker stop` and `docker kill` are operator stops under
+`restart: unless-stopped`; recover those with
+`sudo systemctl restart gbrain-embeddings`.
+
+Reboot validation, when practical:
+
+```bash
+sudo reboot
+systemctl is-active --quiet gbrain-embeddings && echo active
+systemctl is-enabled --quiet gbrain-embeddings && echo enabled
+../../scripts/smoke-gbrain-embeddings.sh
+```
+
 ## Smoke Test
 
 Run:
