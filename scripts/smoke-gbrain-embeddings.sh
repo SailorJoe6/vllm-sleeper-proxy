@@ -3,6 +3,7 @@ set -euo pipefail
 
 LITELLM_BASE_URL="${LITELLM_BASE_URL:-http://127.0.0.1:4000/v1}"
 VLLM_BASE_URL="${VLLM_BASE_URL:-http://127.0.0.1:8888/v1}"
+SLEEPER_PROXY_BASE_URL="${SLEEPER_PROXY_BASE_URL:-http://127.0.0.1:8889/v1}"
 LITELLM_MODEL_ALIAS="${LITELLM_MODEL_ALIAS:-Qwen3-Embedding-8B}"
 VLLM_MODEL_ID="${VLLM_MODEL_ID:-Qwen/Qwen3-Embedding-8B}"
 EXPECTED_DIMENSIONS="${EXPECTED_DIMENSIONS:-4096}"
@@ -32,6 +33,20 @@ ids = [model.get("id") for model in data.get("data", [])]
 if expected not in ids:
     raise SystemExit(f"vLLM model missing: {expected}; saw {ids}")
 print(f"PASS vLLM model listed: {expected}")
+PY
+
+curl -fsS "${SLEEPER_PROXY_BASE_URL}/models" > "${tmpdir}/sleeper-proxy-models.json"
+python3 - "${tmpdir}/sleeper-proxy-models.json" "${LITELLM_MODEL_ALIAS}" <<'PY'
+import json
+import sys
+
+path, expected = sys.argv[1], sys.argv[2]
+with open(path, "r", encoding="utf-8") as f:
+    data = json.load(f)
+ids = [model.get("id") for model in data.get("data", [])]
+if expected not in ids:
+    raise SystemExit(f"sleeper proxy model missing: {expected}; saw {ids}")
+print(f"PASS sleeper proxy model listed: {expected}")
 PY
 
 curl -fsS "${LITELLM_BASE_URL}/models" > "${tmpdir}/litellm-models.json"

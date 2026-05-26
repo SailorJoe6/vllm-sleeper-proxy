@@ -10,6 +10,22 @@ This allows individual models to consume **nearly all available GPU / unified me
 
 ---
 
+## Current implementation
+
+This repo now includes a minimal, dependency-light Python sleeper proxy plus a
+GBrain embedding Compose integration:
+
+* `vllm_sleeper_proxy/` exposes `/v1/models`, `/api/tags`, `/healthz`, and
+  OpenAI-compatible request forwarding for `/v1/embeddings`,
+  `/v1/chat/completions`, `/v1/completions`, and `/v1/responses`.
+* Before forwarding a request, the proxy calls vLLM `/wake_up`, waits for
+  `/is_sleeping` and `/v1/models` readiness, rewrites the logical model alias to
+  the upstream vLLM model id, then forwards the request.
+* `services/gbrain-embeddings/` wires GBrain → LiteLLM → sleeper proxy → vLLM
+  for `Qwen/Qwen3-Embedding-8B`.
+* `scripts/sleep-gbrain-embeddings.sh` intentionally sleeps Qwen so GPU memory
+  can be reclaimed; the next GBrain embedding call should wake it again.
+
 ## Key features
 
 * **Single OpenAI-compatible inference endpoint**

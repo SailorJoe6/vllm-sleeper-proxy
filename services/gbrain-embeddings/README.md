@@ -18,13 +18,19 @@ LiteLLM on `:4000`.
 ```text
 GBrain
   -> LiteLLM :4000
+  -> sleeper proxy :8889
   -> vLLM :8888
   -> Qwen/Qwen3-Embedding-8B
 ```
 
-LiteLLM exposes only the `Qwen3-Embedding-8B` alias for this service. Chat,
-coder, and reasoning models intentionally remain outside this always-on stack
-so the future sleeper proxy can manage them separately.
+LiteLLM exposes only the `Qwen3-Embedding-8B` alias for this service. The
+sleeper proxy sits between LiteLLM and vLLM, exposes a stable logical model
+list, and calls vLLM `/wake_up` before forwarding embedding requests. This lets
+an operator manually sleep Qwen to free GPU memory and rely on the next GBrain
+embedding request to wake it again.
+
+Chat, coder, and reasoning models intentionally remain outside this embedding
+stack for now.
 
 The legacy `/home/sailorjoe6/litellm/start` helper is no longer the production
 run path. Keep it only as an ad hoc development helper unless an operator
@@ -32,10 +38,10 @@ explicitly removes it.
 
 ## Files
 
-- `docker-compose.yml` defines the LiteLLM and vLLM containers, ports, restart
-  policies, GPU reservation, and readiness health checks.
-- `litellm.yaml` maps `Qwen3-Embedding-8B` to the vLLM OpenAI-compatible
-  backend.
+- `docker-compose.yml` defines the LiteLLM, sleeper proxy, and vLLM containers,
+  ports, restart policies, GPU reservation, and readiness health checks.
+- `litellm.yaml` maps `Qwen3-Embedding-8B` to the sleeper proxy
+  OpenAI-compatible backend.
 - `.env.example` documents all host-specific overrides.
 - `gbrain-embeddings.service` supervises the Compose project with systemd.
 - `../../scripts/install-gbrain-embeddings-systemd.sh` installs and enables the
@@ -59,8 +65,9 @@ docker compose ps
 Expected Compose state after startup:
 
 ```text
-gbrain-embeddings-vllm      Up ... (healthy)   0.0.0.0:8888->8888/tcp
-gbrain-embeddings-litellm   Up ... (healthy)   0.0.0.0:4000->4000/tcp
+gbrain-embeddings-vllm            Up ... (healthy)   0.0.0.0:8888->8888/tcp
+gbrain-embeddings-sleeper-proxy   Up ... (healthy)   0.0.0.0:8889->8889/tcp
+gbrain-embeddings-litellm         Up ... (healthy)   0.0.0.0:4000->4000/tcp
 ```
 
 The vLLM container can take a few minutes to become healthy while loading
@@ -151,14 +158,27 @@ Expected evidence:
 
 ```text
 PASS vLLM model listed: Qwen/Qwen3-Embedding-8B
+PASS sleeper proxy model listed: Qwen3-Embedding-8B
 PASS LiteLLM alias listed: Qwen3-Embedding-8B
 PASS embedding vector length: 4096
 ```
+
+To deliberately free GPU memory for Isaac Labs or another local workload:
+
+```bash
+../../scripts/sleep-gbrain-embeddings.sh
+```
+
+The script defaults to vLLM sleep level 1, which is the right same-model sleep
+path for Qwen: GPU memory is released, weights remain backed by CPU RAM, and a
+plain `/wake_up` can restore the model. The next GBrain embedding request
+through LiteLLM should wake Qwen before the request is forwarded to vLLM.
 
 The direct model endpoints should also list the expected IDs:
 
 ```bash
 curl -fsS http://127.0.0.1:4000/v1/models
+curl -fsS http://127.0.0.1:8889/v1/models
 curl -fsS http://127.0.0.1:8888/v1/models
 ```
 
