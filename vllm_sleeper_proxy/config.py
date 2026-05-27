@@ -22,7 +22,10 @@ class ModelConfig:
         return (self.name, *self.aliases)
 
     def matches(self, model: str) -> bool:
-        return model in self.all_names
+        return model in self.all_names or model in {
+            self.upstream_model,
+            f"hosted_vllm/{self.upstream_model}",
+        }
 
 
 def _strip_trailing_slash(value: str) -> str:

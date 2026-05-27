@@ -70,6 +70,20 @@ class ModelManagerTests(unittest.TestCase):
         manager = ModelManager([model], FakeHttp(), poll_interval_s=0, wake_timeout_s=1)
         self.assertEqual(manager.ensure_awake("qwen-emb").name, "Qwen3-Embedding-8B")
 
+    def test_upstream_model_id_resolves_to_model(self) -> None:
+        manager = ModelManager([qwen_model()], FakeHttp(), poll_interval_s=0, wake_timeout_s=1)
+        self.assertEqual(
+            manager.ensure_awake("Qwen/Qwen3-Embedding-8B").name,
+            "Qwen3-Embedding-8B",
+        )
+
+    def test_litellm_hosted_vllm_model_id_resolves_to_model(self) -> None:
+        manager = ModelManager([qwen_model()], FakeHttp(), poll_interval_s=0, wake_timeout_s=1)
+        self.assertEqual(
+            manager.ensure_awake("hosted_vllm/Qwen/Qwen3-Embedding-8B").name,
+            "Qwen3-Embedding-8B",
+        )
+
     def test_unknown_model_is_rejected(self) -> None:
         manager = ModelManager([qwen_model()], FakeHttp())
         with self.assertRaises(UnknownModelError):

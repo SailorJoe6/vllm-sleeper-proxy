@@ -85,6 +85,25 @@ class ServerTests(unittest.TestCase):
         self.assertIn("http://vllm:8888/wake_up", urls)
         self.assertIn("http://vllm:8888/v1/embeddings", urls)
 
+    def test_embedding_request_accepts_upstream_model_id(self) -> None:
+        status, payload = self.post_json(
+            "/v1/embeddings",
+            {"model": "Qwen/Qwen3-Embedding-8B", "input": "hello"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["data"][0]["embedding"], [1, 2, 3])
+
+    def test_chat_completions_not_exposed_until_streaming_is_supported(self) -> None:
+        req = Request(
+            f"{self.base_url}/v1/chat/completions",
+            data=b'{"model":"Qwen3-Embedding-8B","messages":[]}',
+            headers={"content-type": "application/json"},
+            method="POST",
+        )
+        with self.assertRaises(HTTPError) as caught:
+            urlopen(req, timeout=2)  # noqa: S310 - local test server
+        self.assertEqual(caught.exception.code, 404)
+
     def test_unknown_model_returns_404(self) -> None:
         req = Request(
             f"{self.base_url}/v1/embeddings",

@@ -25,9 +25,6 @@ HOP_BY_HOP_HEADERS = {
 
 PROXIED_POST_PATHS = {
     "/v1/embeddings",
-    "/v1/chat/completions",
-    "/v1/completions",
-    "/v1/responses",
 }
 
 

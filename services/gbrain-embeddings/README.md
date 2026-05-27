@@ -159,8 +159,22 @@ Expected evidence:
 ```text
 PASS vLLM model listed: Qwen/Qwen3-Embedding-8B
 PASS sleeper proxy model listed: Qwen3-Embedding-8B
-PASS LiteLLM alias listed: Qwen3-Embedding-8B
+PASS LiteLLM alias model listed: Qwen3-Embedding-8B
 PASS embedding vector length: 4096
+```
+
+To validate the actual operator path — sleep Qwen first, then make the first
+post-sleep inference request through GBrain's LiteLLM/sleeper-proxy route:
+
+```bash
+SLEEPER_WAKE_PATH_SMOKE=1 ../../scripts/smoke-gbrain-embeddings.sh
+```
+
+Expected additional evidence:
+
+```text
+PASS vLLM sleep requested before LiteLLM embedding: level=1
+PASS vLLM post-wake model listed: Qwen/Qwen3-Embedding-8B
 ```
 
 To deliberately free GPU memory for Isaac Labs or another local workload:
