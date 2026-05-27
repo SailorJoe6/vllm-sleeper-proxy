@@ -15,8 +15,13 @@ class FakeHttp:
 
     def request(self, method, url, *, headers=None, body=None, timeout=None):
         self.calls.append((method, url, body))
-        if url.endswith("/wake_up"):
+        if url.endswith("/wake_up") or url.endswith("/wake_up?tags=weights"):
             self.sleeping = False
+            return HttpResponse(200, {}, b"{}")
+        if url.endswith("/wake_up?tags=kv_cache"):
+            self.sleeping = False
+            return HttpResponse(200, {}, b"{}")
+        if url.endswith("/collective_rpc"):
             return HttpResponse(200, {}, b"{}")
         if "/sleep?" in url:
             self.sleeping = True
@@ -55,9 +60,21 @@ class ModelManagerTests(unittest.TestCase):
         self.assertEqual(target.upstream_model, "Qwen/Qwen3-Embedding-8B")
         self.assertEqual(manager.active_model_name, "Qwen3-Embedding-8B")
         urls = [url for _, url, _ in http.calls]
-        self.assertIn("http://vllm:8888/wake_up", urls)
+        self.assertIn("http://vllm:8888/wake_up?tags=weights", urls)
+        self.assertIn("http://vllm:8888/collective_rpc", urls)
+        self.assertIn("http://vllm:8888/wake_up?tags=kv_cache", urls)
         self.assertIn("http://vllm:8888/is_sleeping", urls)
         self.assertIn("http://vllm:8888/v1/models", urls)
+
+    def test_unknown_active_state_does_not_wake_when_already_awake(self) -> None:
+        http = FakeHttp()
+        http.sleeping = False
+        manager = ModelManager([qwen_model()], http, poll_interval_s=0, wake_timeout_s=1)
+        self.assertEqual(manager.ensure_awake("Qwen3-Embedding-8B").name, "Qwen3-Embedding-8B")
+        urls = [url for _, url, _ in http.calls]
+        self.assertIn("http://vllm:8888/is_sleeping", urls)
+        self.assertNotIn("http://vllm:8888/wake_up?tags=weights", urls)
+        self.assertNotIn("http://vllm:8888/collective_rpc", urls)
 
     def test_aliases_resolve_to_model(self) -> None:
         model = ModelConfig(

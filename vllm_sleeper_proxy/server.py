@@ -139,6 +139,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         wake_timeout_s=float(os.environ.get("SLEEPER_WAKE_TIMEOUT_SECONDS", "300")),
         poll_interval_s=float(os.environ.get("SLEEPER_POLL_INTERVAL_SECONDS", "1")),
         always_wake=os.environ.get("SLEEPER_ALWAYS_WAKE", "1") != "0",
+        wake_strategy=os.environ.get("SLEEPER_WAKE_STRATEGY", "level2"),
     )
     httpd = build_server(host, port, manager)
     print(f"vllm-sleeper-proxy listening on http://{host}:{port}", flush=True)

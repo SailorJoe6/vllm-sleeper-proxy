@@ -2,7 +2,7 @@
 set -euo pipefail
 
 VLLM_CONTROL_URL="${VLLM_CONTROL_URL:-http://127.0.0.1:8888}"
-SLEEP_LEVEL="${SLEEP_LEVEL:-1}"
+SLEEP_LEVEL="${SLEEP_LEVEL:-2}"
 
 need() {
   if ! command -v "$1" >/dev/null 2>&1; then

@@ -15,13 +15,24 @@ from vllm_sleeper_proxy.server import build_server
 class ProxyHttp:
     def __init__(self) -> None:
         self.requests: list[tuple[str, str, bytes | None]] = []
+        self.sleeping = True
 
     def request(self, method, url, *, headers=None, body=None, timeout=None):
         self.requests.append((method, url, body))
-        if url.endswith("/wake_up"):
+        if url.endswith("/wake_up") or url.endswith("/wake_up?tags=weights"):
+            self.sleeping = False
+            return HttpResponse(200, {}, b"{}")
+        if url.endswith("/wake_up?tags=kv_cache"):
+            self.sleeping = False
+            return HttpResponse(200, {}, b"{}")
+        if url.endswith("/collective_rpc"):
             return HttpResponse(200, {}, b"{}")
         if url.endswith("/is_sleeping"):
-            return HttpResponse(200, {}, b'{"is_sleeping":false}')
+            return HttpResponse(
+                200,
+                {},
+                json.dumps({"is_sleeping": self.sleeping}).encode(),
+            )
         if url.endswith("/v1/models"):
             return HttpResponse(200, {}, b'{"data":[{"id":"Qwen/Qwen3-Embedding-8B"}]}')
         if url.endswith("/v1/embeddings"):
@@ -82,7 +93,9 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(payload["data"][0]["embedding"], [1, 2, 3])
         urls = [url for _, url, _ in self.http.requests]
-        self.assertIn("http://vllm:8888/wake_up", urls)
+        self.assertIn("http://vllm:8888/wake_up?tags=weights", urls)
+        self.assertIn("http://vllm:8888/collective_rpc", urls)
+        self.assertIn("http://vllm:8888/wake_up?tags=kv_cache", urls)
         self.assertIn("http://vllm:8888/v1/embeddings", urls)
 
     def test_embedding_request_accepts_upstream_model_id(self) -> None:

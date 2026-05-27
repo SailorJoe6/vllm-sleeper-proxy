@@ -35,6 +35,7 @@ class ModelManager:
         wake_timeout_s: float = 300.0,
         poll_interval_s: float = 1.0,
         always_wake: bool = True,
+        wake_strategy: str = "level2",
     ) -> None:
         self.models = list(models)
         if not self.models:
@@ -45,6 +46,7 @@ class ModelManager:
         self.wake_timeout_s = wake_timeout_s
         self.poll_interval_s = poll_interval_s
         self.always_wake = always_wake
+        self.wake_strategy = wake_strategy
         self._lock = threading.Lock()
         self._active_model_name: str | None = None
 
@@ -96,7 +98,12 @@ class ModelManager:
                 self._active_model_name = None
 
             should_wake = self._active_model_name != target.name
-            if self.always_wake and self._active_model_name == target.name:
+            if self._active_model_name is None:
+                sleeping = self._is_sleeping(target)
+                if sleeping is False:
+                    should_wake = False
+                    self._active_model_name = target.name
+            elif self.always_wake and self._active_model_name == target.name:
                 sleeping = self._is_sleeping(target)
                 should_wake = sleeping is not False
 
@@ -119,6 +126,10 @@ class ModelManager:
             raise WakeError(f"sleep failed for {model.name}: HTTP {resp.status}: {resp.body[:300]!r}")
 
     def _wake(self, model: ModelConfig) -> None:
+        if self.wake_strategy == "level2":
+            self._wake_level2(model)
+            return
+
         resp = self.http.request(
             "POST",
             f"{model.control_base_url}/wake_up",
@@ -126,6 +137,28 @@ class ModelManager:
         )
         if resp.status >= 400:
             raise WakeError(f"wake_up failed for {model.name}: HTTP {resp.status}: {resp.body[:300]!r}")
+
+    def _wake_level2(self, model: ModelConfig) -> None:
+        for url, body, label in (
+            (f"{model.control_base_url}/wake_up?tags=weights", None, "wake_up weights"),
+            (
+                f"{model.control_base_url}/collective_rpc",
+                b'{"method":"reload_weights"}',
+                "reload_weights",
+            ),
+            (f"{model.control_base_url}/wake_up?tags=kv_cache", None, "wake_up kv_cache"),
+        ):
+            resp = self.http.request(
+                "POST",
+                url,
+                headers={"content-type": "application/json"} if body else None,
+                body=body,
+                timeout=self.request_timeout_s,
+            )
+            if resp.status >= 400:
+                raise WakeError(
+                    f"{label} failed for {model.name}: HTTP {resp.status}: {resp.body[:300]!r}"
+                )
 
     def _is_sleeping(self, model: ModelConfig) -> bool | None:
         resp = self.http.request(

@@ -173,7 +173,7 @@ SLEEPER_WAKE_PATH_SMOKE=1 ../../scripts/smoke-gbrain-embeddings.sh
 Expected additional evidence:
 
 ```text
-PASS vLLM sleep requested before LiteLLM embedding: level=1
+PASS vLLM sleep requested before LiteLLM embedding: level=2
 PASS vLLM post-wake model listed: Qwen/Qwen3-Embedding-8B
 ```
 
@@ -183,10 +183,12 @@ To deliberately free GPU memory for Isaac Labs or another local workload:
 ../../scripts/sleep-gbrain-embeddings.sh
 ```
 
-The script defaults to vLLM sleep level 1, which is the right same-model sleep
-path for Qwen: GPU memory is released, weights remain backed by CPU RAM, and a
-plain `/wake_up` can restore the model. The next GBrain embedding request
-through LiteLLM should wake Qwen before the request is forwarded to vLLM.
+The script defaults to vLLM sleep level 2 for DGX Spark. Level 2 discards both
+model weights and KV cache instead of backing weights in CPU RAM. The sleeper
+proxy uses vLLM's documented level-2 wake sequence before forwarding the next
+LiteLLM embedding request: wake weights, reload weights, then wake KV cache.
+The service gives that reload path a longer upstream timeout because loading
+Qwen weights can take longer than ordinary embedding requests.
 
 The direct model endpoints should also list the expected IDs:
 
