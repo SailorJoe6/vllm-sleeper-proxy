@@ -12,8 +12,10 @@ if [[ ! -f "${UNIT_SRC}" ]]; then
   exit 1
 fi
 
-if [[ "${SERVICE_DIR}" != "/home/sailorjoe6/Code/vllm-sleeper-proxy/services/gbrain-embeddings" ]]; then
-  echo "This unit is pinned to /home/sailorjoe6/Code/vllm-sleeper-proxy." >&2
+EXPECTED_SERVICE_DIR="/home/sailorjoe6/openclaw-setup/deps/vllm-sleeper-proxy/services/gbrain-embeddings"
+
+if [[ "${SERVICE_DIR}" != "${EXPECTED_SERVICE_DIR}" ]]; then
+  echo "This unit is pinned to ${EXPECTED_SERVICE_DIR}." >&2
   echo "Move the repo there or update services/gbrain-embeddings/${UNIT_NAME} deliberately." >&2
   exit 1
 fi

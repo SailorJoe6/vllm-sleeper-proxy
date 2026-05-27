@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm-sleeper-proxy"
+version = "0.1.0"
+description = "OpenAI-compatible vLLM sleep/wake proxy for single-GPU systems"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+
+[project.scripts]
+vllm-sleeper-proxy = "vllm_sleeper_proxy.server:main"
+
+[tool.setuptools.packages.find]
+include = ["vllm_sleeper_proxy*"]

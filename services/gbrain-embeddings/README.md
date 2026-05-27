@@ -18,13 +18,19 @@ LiteLLM on `:4000`.
 ```text
 GBrain
   -> LiteLLM :4000
+  -> sleeper proxy :8889
   -> vLLM :8888
   -> Qwen/Qwen3-Embedding-8B
 ```
 
-LiteLLM exposes only the `Qwen3-Embedding-8B` alias for this service. Chat,
-coder, and reasoning models intentionally remain outside this always-on stack
-so the future sleeper proxy can manage them separately.
+LiteLLM exposes only the `Qwen3-Embedding-8B` alias for this service. The
+sleeper proxy sits between LiteLLM and vLLM, exposes a stable logical model
+list, and calls vLLM `/wake_up` before forwarding embedding requests. This lets
+an operator manually sleep Qwen to free GPU memory and rely on the next GBrain
+embedding request to wake it again.
+
+Chat, coder, and reasoning models intentionally remain outside this embedding
+stack for now.
 
 The legacy `/home/sailorjoe6/litellm/start` helper is no longer the production
 run path. Keep it only as an ad hoc development helper unless an operator
@@ -32,10 +38,10 @@ explicitly removes it.
 
 ## Files
 
-- `docker-compose.yml` defines the LiteLLM and vLLM containers, ports, restart
-  policies, GPU reservation, and readiness health checks.
-- `litellm.yaml` maps `Qwen3-Embedding-8B` to the vLLM OpenAI-compatible
-  backend.
+- `docker-compose.yml` defines the LiteLLM, sleeper proxy, and vLLM containers,
+  ports, restart policies, GPU reservation, and readiness health checks.
+- `litellm.yaml` maps `Qwen3-Embedding-8B` to the sleeper proxy
+  OpenAI-compatible backend.
 - `.env.example` documents all host-specific overrides.
 - `gbrain-embeddings.service` supervises the Compose project with systemd.
 - `../../scripts/install-gbrain-embeddings-systemd.sh` installs and enables the
@@ -59,8 +65,9 @@ docker compose ps
 Expected Compose state after startup:
 
 ```text
-gbrain-embeddings-vllm      Up ... (healthy)   0.0.0.0:8888->8888/tcp
-gbrain-embeddings-litellm   Up ... (healthy)   0.0.0.0:4000->4000/tcp
+gbrain-embeddings-vllm            Up ... (healthy)   0.0.0.0:8888->8888/tcp
+gbrain-embeddings-sleeper-proxy   Up ... (healthy)   0.0.0.0:8889->8889/tcp
+gbrain-embeddings-litellm         Up ... (healthy)   0.0.0.0:4000->4000/tcp
 ```
 
 The vLLM container can take a few minutes to become healthy while loading
@@ -82,7 +89,7 @@ as intentional stops and should be followed by `docker compose up -d` or
 The unit is pinned to:
 
 ```text
-/home/sailorjoe6/Code/vllm-sleeper-proxy/services/gbrain-embeddings
+/home/sailorjoe6/openclaw-setup/deps/vllm-sleeper-proxy/services/gbrain-embeddings
 ```
 
 Install and enable it:
@@ -151,14 +158,43 @@ Expected evidence:
 
 ```text
 PASS vLLM model listed: Qwen/Qwen3-Embedding-8B
-PASS LiteLLM alias listed: Qwen3-Embedding-8B
+PASS sleeper proxy model listed: Qwen3-Embedding-8B
+PASS LiteLLM alias model listed: Qwen3-Embedding-8B
 PASS embedding vector length: 4096
 ```
+
+To validate the actual operator path — sleep Qwen first, then make the first
+post-sleep inference request through GBrain's LiteLLM/sleeper-proxy route:
+
+```bash
+SLEEPER_WAKE_PATH_SMOKE=1 ../../scripts/smoke-gbrain-embeddings.sh
+```
+
+Expected additional evidence:
+
+```text
+PASS vLLM sleep requested before LiteLLM embedding: level=2
+PASS vLLM post-wake model listed: Qwen/Qwen3-Embedding-8B
+```
+
+To deliberately free GPU memory for Isaac Labs or another local workload:
+
+```bash
+../../scripts/sleep-gbrain-embeddings.sh
+```
+
+The script defaults to vLLM sleep level 2 for DGX Spark. Level 2 discards both
+model weights and KV cache instead of backing weights in CPU RAM. The sleeper
+proxy uses vLLM's documented level-2 wake sequence before forwarding the next
+LiteLLM embedding request: wake weights, reload weights, then wake KV cache.
+The service gives that reload path a longer upstream timeout because loading
+Qwen weights can take longer than ordinary embedding requests.
 
 The direct model endpoints should also list the expected IDs:
 
 ```bash
 curl -fsS http://127.0.0.1:4000/v1/models
+curl -fsS http://127.0.0.1:8889/v1/models
 curl -fsS http://127.0.0.1:8888/v1/models
 ```
 
@@ -191,7 +227,7 @@ address on port `4000`.
 Captured on 2026-05-09 at 16:52 UTC.
 
 - Production source of truth:
-  `/home/sailorjoe6/Code/vllm-sleeper-proxy/services/gbrain-embeddings`
+  `/home/sailorjoe6/openclaw-setup/deps/vllm-sleeper-proxy/services/gbrain-embeddings`
 - Installed systemd unit:
   `/etc/systemd/system/gbrain-embeddings.service`
 - Supported local endpoint:
