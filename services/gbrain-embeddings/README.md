@@ -89,7 +89,7 @@ as intentional stops and should be followed by `docker compose up -d` or
 The unit is pinned to:
 
 ```text
-/home/sailorjoe6/Code/vllm-sleeper-proxy/services/gbrain-embeddings
+/home/sailorjoe6/openclaw-setup/deps/vllm-sleeper-proxy/services/gbrain-embeddings
 ```
 
 Install and enable it:
@@ -225,7 +225,7 @@ address on port `4000`.
 Captured on 2026-05-09 at 16:52 UTC.
 
 - Production source of truth:
-  `/home/sailorjoe6/Code/vllm-sleeper-proxy/services/gbrain-embeddings`
+  `/home/sailorjoe6/openclaw-setup/deps/vllm-sleeper-proxy/services/gbrain-embeddings`
 - Installed systemd unit:
   `/etc/systemd/system/gbrain-embeddings.service`
 - Supported local endpoint:
