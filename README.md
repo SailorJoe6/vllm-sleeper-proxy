@@ -16,11 +16,17 @@ This repo now includes a minimal, dependency-light Python sleeper proxy plus a
 GBrain embedding Compose integration:
 
 * `vllm_sleeper_proxy/` exposes `/v1/models`, `/api/tags`, `/healthz`, and
-  OpenAI-compatible request forwarding for `/v1/embeddings`.
+  OpenAI-compatible request forwarding for `/v1/embeddings` and
+  `/v1/chat/completions`.
 * Before forwarding a request, the proxy calls vLLM `/wake_up`, waits for
   `/is_sleeping` and `/v1/models` readiness, rewrites the logical model alias
   or LiteLLM/vLLM model id to the upstream vLLM model id, then forwards the
   request.
+* Chat completions preserve image-and-text message content and support both
+  buffered JSON responses and streaming Server-Sent Events (SSE).
+* Each request owns its active model until its buffered or streaming response
+  ends. A request for another model waits before sleeping the current engine,
+  preventing an in-flight response from being evicted.
 * `services/gbrain-embeddings/` wires GBrain → LiteLLM → sleeper proxy → vLLM
   for `Qwen/Qwen3-Embedding-8B`.
 * `scripts/sleep-gbrain-embeddings.sh` intentionally sleeps Qwen so GPU memory
@@ -34,7 +40,24 @@ GBrain embedding Compose integration:
 * **At-most-one awake model invariant** (prevents OOM on unified-memory systems)
 * **Fast switching** between frequently used models
 * **Model discovery APIs** compatible with common local runtimes
+* **Multimodal chat forwarding** with streaming and in-flight draining
 * Designed for **home labs and single-node setups**, not Kubernetes
+
+## Supported inference endpoints
+
+| Endpoint | Request | Response |
+| --- | --- | --- |
+| `POST /v1/embeddings` | OpenAI-compatible JSON | Buffered upstream response |
+| `POST /v1/chat/completions` | OpenAI-compatible text or inline multimodal JSON | Buffered JSON, or SSE when `"stream": true` |
+
+The proxy rewrites only the top-level `model` field. It does not transform
+`messages`, inline `data:` image URLs, generation parameters, or response
+content. Remote-media policy belongs to the vLLM engine and deployment; a
+local-only deployment should allow inline content and leave vLLM remote media
+access disabled.
+
+See [Multimodal chat transport](docs/multimodal-chat.md) for configuration,
+lifecycle, failure behavior, smoke tests, compatibility, and limitations.
 
 ---
 
@@ -110,4 +133,3 @@ This separation allows clients and agents to remain simple, while the proxy abso
 * Acting as a general model registry or downloader
 
 This project intentionally favors **determinism, simplicity, and maximal hardware utilization** over generality.
-

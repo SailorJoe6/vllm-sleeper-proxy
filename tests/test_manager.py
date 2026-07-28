@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 import unittest
 
 from vllm_sleeper_proxy.client import HttpResponse
 from vllm_sleeper_proxy.config import ModelConfig
-from vllm_sleeper_proxy.manager import ModelManager, UnknownModelError
+from vllm_sleeper_proxy.manager import ModelManager, UnknownModelError, WakeError
 
 
 class FakeHttp:
@@ -44,6 +46,42 @@ def qwen_model() -> ModelConfig:
         upstream_base_url="http://vllm:8888/v1",
         control_base_url="http://vllm:8888",
     )
+
+
+def vision_model() -> ModelConfig:
+    return ModelConfig(
+        name="chess-vlm-bootstrap",
+        upstream_model="Qwen/Qwen3-VL-4B-Instruct",
+        upstream_base_url="http://vision:8000/v1",
+        control_base_url="http://vision:8000",
+    )
+
+
+class SwitchingHttp(FakeHttp):
+    def request(self, method, url, *, headers=None, body=None, timeout=None):
+        self.calls.append((method, url, body))
+        if "/sleep?" in url:
+            self.sleeping = True
+            return HttpResponse(200, {}, b"{}")
+        if url.endswith("/wake_up?tags=weights"):
+            self.sleeping = False
+            return HttpResponse(200, {}, b"{}")
+        if url.endswith("/wake_up?tags=kv_cache") or url.endswith("/collective_rpc"):
+            return HttpResponse(200, {}, b"{}")
+        if url.endswith("/is_sleeping"):
+            return HttpResponse(200, {}, json.dumps({"is_sleeping": self.sleeping}).encode())
+        if url.endswith("/v1/models"):
+            model = (
+                "Qwen/Qwen3-VL-4B-Instruct"
+                if url.startswith("http://vision")
+                else "Qwen/Qwen3-Embedding-8B"
+            )
+            return HttpResponse(
+                200,
+                {},
+                json.dumps({"data": [{"id": model}]}).encode(),
+            )
+        raise AssertionError(f"unexpected request: {method} {url}")
 
 
 class ModelManagerTests(unittest.TestCase):
@@ -115,6 +153,153 @@ class ModelManagerTests(unittest.TestCase):
             json.loads(rewritten.decode()),
             {"model": "Qwen/Qwen3-Embedding-8B", "input": "hello"},
         )
+
+    def test_model_switch_waits_for_inflight_request(self) -> None:
+        http = SwitchingHttp()
+        manager = ModelManager(
+            [qwen_model(), vision_model()],
+            http,
+            poll_interval_s=0,
+            wake_timeout_s=1,
+        )
+        embedding_lease = manager.acquire("Qwen3-Embedding-8B")
+        acquired_vision = threading.Event()
+
+        def switch_model() -> None:
+            with manager.acquire("chess-vlm-bootstrap"):
+                acquired_vision.set()
+
+        thread = threading.Thread(target=switch_model)
+        thread.start()
+        time.sleep(0.05)
+        self.assertFalse(acquired_vision.is_set())
+        self.assertEqual(manager.inflight_requests, 1)
+        self.assertFalse(any("/sleep?" in url for _, url, _ in http.calls))
+
+        embedding_lease.release()
+        thread.join(timeout=1)
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(acquired_vision.is_set())
+        self.assertEqual(manager.inflight_requests, 0)
+        self.assertEqual(manager.active_model_name, "chess-vlm-bootstrap")
+        self.assertTrue(any("/sleep?" in url for _, url, _ in http.calls))
+
+    def test_request_ownership_releases_on_exception(self) -> None:
+        manager = ModelManager(
+            [qwen_model()],
+            FakeHttp(),
+            poll_interval_s=0,
+            wake_timeout_s=1,
+        )
+        with self.assertRaisesRegex(RuntimeError, "upstream failed"):
+            with manager.acquire("Qwen3-Embedding-8B"):
+                self.assertEqual(manager.inflight_requests, 1)
+                raise RuntimeError("upstream failed")
+        self.assertEqual(manager.inflight_requests, 0)
+
+    def test_pending_switch_blocks_late_request_for_current_model(self) -> None:
+        http = SwitchingHttp()
+        manager = ModelManager(
+            [qwen_model(), vision_model()],
+            http,
+            poll_interval_s=0,
+            wake_timeout_s=1,
+        )
+        initial = manager.acquire("Qwen3-Embedding-8B")
+        vision_acquired = threading.Event()
+        release_vision = threading.Event()
+        embedding_acquired = threading.Event()
+
+        def switch_to_vision() -> None:
+            with manager.acquire("chess-vlm-bootstrap"):
+                vision_acquired.set()
+                release_vision.wait(timeout=1)
+
+        def late_embedding() -> None:
+            with manager.acquire("Qwen3-Embedding-8B"):
+                embedding_acquired.set()
+
+        switch_thread = threading.Thread(target=switch_to_vision)
+        switch_thread.start()
+        deadline = time.monotonic() + 1
+        while manager._pending_switch_name != "chess-vlm-bootstrap":  # noqa: SLF001
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.005)
+
+        embedding_thread = threading.Thread(target=late_embedding)
+        embedding_thread.start()
+        initial.release()
+        self.assertTrue(vision_acquired.wait(timeout=1))
+        self.assertFalse(embedding_acquired.is_set())
+        release_vision.set()
+        switch_thread.join(timeout=1)
+        embedding_thread.join(timeout=1)
+        self.assertTrue(embedding_acquired.is_set())
+
+    def test_switch_drain_has_a_deadline(self) -> None:
+        manager = ModelManager(
+            [qwen_model(), vision_model()],
+            SwitchingHttp(),
+            poll_interval_s=0,
+            wake_timeout_s=1,
+            drain_timeout_s=0,
+        )
+        lease = manager.acquire("Qwen3-Embedding-8B")
+        try:
+            with self.assertRaisesRegex(WakeError, "timed out draining"):
+                manager.acquire("chess-vlm-bootstrap")
+        finally:
+            lease.release()
+
+    def test_lifecycle_transport_failure_becomes_wake_error(self) -> None:
+        class BrokenLifecycle(FakeHttp):
+            def request(self, method, url, *, headers=None, body=None, timeout=None):
+                raise ConnectionError("control endpoint unavailable")
+
+        manager = ModelManager([qwen_model()], BrokenLifecycle())
+        with self.assertRaisesRegex(WakeError, "lifecycle check failed"):
+            manager.acquire("Qwen3-Embedding-8B")
+
+    def test_partial_wake_failure_is_slept_before_another_model_wakes(self) -> None:
+        class FailVisionReadinessOnce(SwitchingHttp):
+            def __init__(self) -> None:
+                super().__init__()
+                self.fail_vision_readiness = True
+
+            def request(self, method, url, *, headers=None, body=None, timeout=None):
+                if (
+                    self.fail_vision_readiness
+                    and url == "http://vision:8000/v1/models"
+                ):
+                    self.calls.append((method, url, body))
+                    self.fail_vision_readiness = False
+                    raise ConnectionError("vision discovery unavailable")
+                return super().request(
+                    method,
+                    url,
+                    headers=headers,
+                    body=body,
+                    timeout=timeout,
+                )
+
+        http = FailVisionReadinessOnce()
+        manager = ModelManager(
+            [qwen_model(), vision_model()],
+            http,
+            poll_interval_s=0,
+            wake_timeout_s=1,
+        )
+        manager.acquire("Qwen3-Embedding-8B").release()
+        with self.assertRaisesRegex(WakeError, "vision discovery unavailable"):
+            manager.acquire("chess-vlm-bootstrap")
+        self.assertEqual(manager.active_model_name, "chess-vlm-bootstrap")
+
+        before_retry = len(http.calls)
+        manager.acquire("Qwen3-Embedding-8B").release()
+        retry_urls = [url for _, url, _ in http.calls[before_retry:]]
+        vision_sleep = retry_urls.index("http://vision:8000/sleep?level=2")
+        embedding_wake = retry_urls.index("http://vllm:8888/wake_up?tags=weights")
+        self.assertLess(vision_sleep, embedding_wake)
 
 
 if __name__ == "__main__":

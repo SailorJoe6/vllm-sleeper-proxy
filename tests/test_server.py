@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import socket
 import threading
+import time
 import unittest
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
@@ -12,13 +14,63 @@ from vllm_sleeper_proxy.manager import ModelManager
 from vllm_sleeper_proxy.server import build_server
 
 
+class FakeStream:
+    def __init__(self, chunks: list[bytes]) -> None:
+        self.status = 200
+        self.headers = {"content-type": "text/event-stream"}
+        self.chunks = chunks
+        self.closed = False
+
+    def iter_chunks(self, chunk_size=64 * 1024):
+        yield from self.chunks
+
+    def close(self):
+        self.closed = True
+
+
+class FailingStream(FakeStream):
+    def iter_chunks(self, chunk_size=64 * 1024):
+        yield b'data: {"choices":[{"delta":{"content":"e2"}}]}\n\n'
+        raise TimeoutError("upstream stream timed out")
+
+
+class ControlledDisconnectStream(FakeStream):
+    def __init__(self) -> None:
+        super().__init__([])
+        self.started = threading.Event()
+        self.resume = threading.Event()
+        self.finished = threading.Event()
+
+    def iter_chunks(self, chunk_size=64 * 1024):
+        self.started.set()
+        yield b"data: first\n\n"
+        self.resume.wait(timeout=1)
+        for _ in range(16):
+            yield b"x" * (1024 * 1024)
+
+    def close(self):
+        super().close()
+        self.finished.set()
+
+
 class ProxyHttp:
     def __init__(self) -> None:
         self.requests: list[tuple[str, str, bytes | None]] = []
         self.sleeping = True
+        self.buffer_error: Exception | None = None
+        self.stream_error: Exception | None = None
+        self.lifecycle_error: Exception | None = None
+        self.last_stream: FakeStream | None = None
+        self.stream_factory = None
 
     def request(self, method, url, *, headers=None, body=None, timeout=None):
         self.requests.append((method, url, body))
+        if self.lifecycle_error and (
+            url.endswith("/is_sleeping")
+            or url.endswith("/wake_up?tags=weights")
+            or url.endswith("/v1/models")
+        ):
+            raise self.lifecycle_error
         if url.endswith("/wake_up") or url.endswith("/wake_up?tags=weights"):
             self.sleeping = False
             return HttpResponse(200, {}, b"{}")
@@ -44,7 +96,39 @@ class ProxyHttp:
                 {"content-type": "application/json"},
                 b'{"object":"list","data":[{"embedding":[1,2,3]}]}',
             )
+        if url.endswith("/v1/chat/completions"):
+            if self.buffer_error:
+                raise self.buffer_error
+            decoded = json.loads((body or b"{}").decode())
+            if decoded["model"] != "Qwen/Qwen3-Embedding-8B":
+                return HttpResponse(400, {"content-type": "application/json"}, b'{"bad":"model"}')
+            return HttpResponse(
+                200,
+                {"content-type": "application/json", "x-upstream": "vllm"},
+                b'{"choices":[{"message":{"content":"e2e4"}}]}',
+            )
         raise AssertionError(f"unexpected request {method} {url}")
+
+    def stream(self, method, url, *, headers=None, body=None, timeout=None):
+        self.requests.append((method, url, body))
+        if self.stream_error:
+            raise self.stream_error
+        if not url.endswith("/v1/chat/completions"):
+            raise AssertionError(f"unexpected streaming request {method} {url}")
+        decoded = json.loads((body or b"{}").decode())
+        if decoded["model"] != "Qwen/Qwen3-Embedding-8B":
+            raise AssertionError("logical model was not rewritten")
+        if self.stream_factory is not None:
+            self.last_stream = self.stream_factory()
+            return self.last_stream
+        self.last_stream = FakeStream(
+            [
+                b'data: {"choices":[{"delta":{"content":"e2"}}]}\n\n',
+                b'data: {"choices":[{"delta":{"content":"e4"}}]}\n\n',
+                b"data: [DONE]\n\n",
+            ]
+        )
+        return self.last_stream
 
 
 class ServerTests(unittest.TestCase):
@@ -56,8 +140,8 @@ class ServerTests(unittest.TestCase):
             upstream_base_url="http://vllm:8888/v1",
             control_base_url="http://vllm:8888",
         )
-        manager = ModelManager([model], self.http, poll_interval_s=0, wake_timeout_s=1)
-        self.server = build_server("127.0.0.1", 0, manager)
+        self.manager = ModelManager([model], self.http, poll_interval_s=0, wake_timeout_s=1)
+        self.server = build_server("127.0.0.1", 0, self.manager)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.base_url = f"http://127.0.0.1:{self.server.server_address[1]}"
@@ -80,6 +164,12 @@ class ServerTests(unittest.TestCase):
         )
         with urlopen(req, timeout=2) as resp:  # noqa: S310 - local test server
             return resp.status, json.loads(resp.read().decode())
+
+    def assert_request_ownership_released(self) -> None:
+        deadline = time.monotonic() + 1
+        while self.manager.inflight_requests != 0 and time.monotonic() < deadline:
+            time.sleep(0.005)
+        self.assertEqual(self.manager.inflight_requests, 0)
 
     def test_v1_models(self) -> None:
         payload = self.get_json("/v1/models")
@@ -106,7 +196,89 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(payload["data"][0]["embedding"], [1, 2, 3])
 
-    def test_chat_completions_not_exposed_until_streaming_is_supported(self) -> None:
+    def test_non_streaming_chat_preserves_multimodal_messages(self) -> None:
+        payload = {
+            "model": "Qwen3-Embedding-8B",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "What move occurred?"},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "data:image/jpeg;base64,AAAA"},
+                        },
+                    ],
+                }
+            ],
+            "temperature": 0,
+        }
+        status, response = self.post_json("/v1/chat/completions", payload)
+        self.assertEqual(status, 200)
+        self.assertEqual(response["choices"][0]["message"]["content"], "e2e4")
+        forwarded = json.loads(self.http.requests[-1][2].decode())
+        self.assertEqual(forwarded["messages"], payload["messages"])
+        self.assertEqual(forwarded["model"], "Qwen/Qwen3-Embedding-8B")
+
+    def test_streaming_chat_preserves_sse_framing(self) -> None:
+        req = Request(
+            f"{self.base_url}/v1/chat/completions",
+            data=json.dumps(
+                {
+                    "model": "Qwen3-Embedding-8B",
+                    "messages": [{"role": "user", "content": "move?"}],
+                    "stream": True,
+                }
+            ).encode(),
+            headers={"content-type": "application/json"},
+            method="POST",
+        )
+        with urlopen(req, timeout=2) as response:  # noqa: S310 - local test server
+            body = response.read()
+            self.assertEqual(response.headers["content-type"], "text/event-stream")
+        self.assertEqual(body.count(b"\n\n"), 3)
+        self.assertTrue(body.endswith(b"data: [DONE]\n\n"))
+        self.assertTrue(self.http.last_stream.closed)
+        self.assert_request_ownership_released()
+
+    def test_midstream_timeout_closes_upstream_and_releases(self) -> None:
+        self.http.stream_factory = lambda: FailingStream([])
+        req = Request(
+            f"{self.base_url}/v1/chat/completions",
+            data=b'{"model":"Qwen3-Embedding-8B","messages":[],"stream":true}',
+            headers={"content-type": "application/json"},
+            method="POST",
+        )
+        with urlopen(req, timeout=2) as response:  # noqa: S310 - local test server
+            self.assertIn(b"data:", response.read())
+        self.assertTrue(self.http.last_stream.closed)
+        self.assert_request_ownership_released()
+
+    def test_downstream_disconnect_closes_upstream_and_releases(self) -> None:
+        controlled = ControlledDisconnectStream()
+        self.http.stream_factory = lambda: controlled
+        body = b'{"model":"Qwen3-Embedding-8B","messages":[],"stream":true}'
+        client = socket.create_connection(
+            ("127.0.0.1", self.server.server_address[1]),
+            timeout=2,
+        )
+        client.sendall(
+            b"POST /v1/chat/completions HTTP/1.1\r\n"
+            b"Host: localhost\r\n"
+            b"content-type: application/json\r\n"
+            + f"content-length: {len(body)}\r\n".encode()
+            + b"connection: close\r\n\r\n"
+            + body
+        )
+        self.assertTrue(controlled.started.wait(timeout=1))
+        client.close()
+        controlled.resume.set()
+        self.assertTrue(controlled.finished.wait(timeout=2))
+        self.assertTrue(controlled.closed)
+        self.assert_request_ownership_released()
+
+    def test_buffered_upstream_failure_returns_stable_error_and_releases(self) -> None:
+        self.http.buffer_error = ConnectionError("vLLM unavailable")
         req = Request(
             f"{self.base_url}/v1/chat/completions",
             data=b'{"model":"Qwen3-Embedding-8B","messages":[]}',
@@ -115,7 +287,81 @@ class ServerTests(unittest.TestCase):
         )
         with self.assertRaises(HTTPError) as caught:
             urlopen(req, timeout=2)  # noqa: S310 - local test server
-        self.assertEqual(caught.exception.code, 404)
+        self.assertEqual(caught.exception.code, 502)
+        payload = json.loads(caught.exception.read().decode())
+        self.assertEqual(payload["error"]["type"], "upstream_unavailable")
+        self.assert_request_ownership_released()
+
+    def test_stream_open_failure_returns_stable_error_and_releases(self) -> None:
+        self.http.stream_error = TimeoutError("vLLM timed out")
+        req = Request(
+            f"{self.base_url}/v1/chat/completions",
+            data=b'{"model":"Qwen3-Embedding-8B","messages":[],"stream":true}',
+            headers={"content-type": "application/json"},
+            method="POST",
+        )
+        with self.assertRaises(HTTPError) as caught:
+            urlopen(req, timeout=2)  # noqa: S310 - local test server
+        self.assertEqual(caught.exception.code, 502)
+        caught.exception.read()
+        self.assert_request_ownership_released()
+
+    def test_lifecycle_transport_failure_returns_wake_error(self) -> None:
+        self.http.lifecycle_error = ConnectionError("control endpoint unavailable")
+        req = Request(
+            f"{self.base_url}/v1/chat/completions",
+            data=b'{"model":"Qwen3-Embedding-8B","messages":[]}',
+            headers={"content-type": "application/json"},
+            method="POST",
+        )
+        with self.assertRaises(HTTPError) as caught:
+            urlopen(req, timeout=2)  # noqa: S310 - local test server
+        self.assertEqual(caught.exception.code, 503)
+        payload = json.loads(caught.exception.read().decode())
+        self.assertEqual(payload["error"]["type"], "wake_failed")
+
+    def test_invalid_json_returns_stable_error(self) -> None:
+        req = Request(
+            f"{self.base_url}/v1/chat/completions",
+            data=b"not json",
+            headers={"content-type": "application/json"},
+            method="POST",
+        )
+        with self.assertRaises(HTTPError) as caught:
+            urlopen(req, timeout=2)  # noqa: S310 - local test server
+        self.assertEqual(caught.exception.code, 400)
+        payload = json.loads(caught.exception.read().decode())
+        self.assertEqual(payload["error"]["type"], "invalid_request")
+
+    def test_request_body_limit_returns_413(self) -> None:
+        self.server.RequestHandlerClass.max_request_body_bytes = 4
+        req = Request(
+            f"{self.base_url}/v1/chat/completions",
+            data=b"12345",
+            headers={"content-type": "application/json"},
+            method="POST",
+        )
+        with self.assertRaises(HTTPError) as caught:
+            urlopen(req, timeout=2)  # noqa: S310 - local test server
+        self.assertEqual(caught.exception.code, 413)
+
+    def test_chunked_request_body_is_rejected_explicitly(self) -> None:
+        with socket.create_connection(
+            ("127.0.0.1", self.server.server_address[1]),
+            timeout=2,
+        ) as client:
+            client.sendall(
+                b"POST /v1/chat/completions HTTP/1.1\r\n"
+                b"Host: localhost\r\n"
+                b"content-type: application/json\r\n"
+                b"transfer-encoding: chunked\r\n"
+                b"connection: close\r\n\r\n"
+            )
+            response = b""
+            while chunk := client.recv(4096):
+                response += chunk
+        self.assertIn(b" 411 ", response.split(b"\r\n", 1)[0])
+        self.assertIn(b'"type":"length_required"', response)
 
     def test_unknown_model_returns_404(self) -> None:
         req = Request(

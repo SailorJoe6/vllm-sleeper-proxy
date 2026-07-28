@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from typing import Iterable
 from urllib.parse import urlencode
 
@@ -15,6 +16,26 @@ class UnknownModelError(ValueError):
 
 class WakeError(RuntimeError):
     pass
+
+
+class ModelLease:
+    """Own one active-model request until its response reaches a terminal path."""
+
+    def __init__(self, manager: ModelManager, target: ModelConfig) -> None:
+        self.manager = manager
+        self.target = target
+        self._released = False
+
+    def __enter__(self) -> ModelConfig:
+        return self.target
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self.release()
+
+    def release(self) -> None:
+        if not self._released:
+            self.manager.release(self.target)
+            self._released = True
 
 
 class ModelManager:
@@ -33,6 +54,7 @@ class ModelManager:
         sleep_level: int = 2,
         request_timeout_s: float = 30.0,
         wake_timeout_s: float = 300.0,
+        drain_timeout_s: float = 300.0,
         poll_interval_s: float = 1.0,
         always_wake: bool = True,
         wake_strategy: str = "level2",
@@ -44,15 +66,24 @@ class ModelManager:
         self.sleep_level = sleep_level
         self.request_timeout_s = request_timeout_s
         self.wake_timeout_s = wake_timeout_s
+        self.drain_timeout_s = drain_timeout_s
         self.poll_interval_s = poll_interval_s
         self.always_wake = always_wake
         self.wake_strategy = wake_strategy
-        self._lock = threading.Lock()
+        self._condition = threading.Condition()
         self._active_model_name: str | None = None
+        self._active_model_ready = False
+        self._inflight_requests = 0
+        self._pending_switch_name: str | None = None
 
     @property
     def active_model_name(self) -> str | None:
         return self._active_model_name
+
+    @property
+    def inflight_requests(self) -> int:
+        with self._condition:
+            return self._inflight_requests
 
     def find_model(self, requested: str) -> ModelConfig:
         for model in self.models:
@@ -91,29 +122,99 @@ class ModelManager:
 
     def ensure_awake(self, requested: str) -> ModelConfig:
         target = self.find_model(requested)
-        with self._lock:
-            if self._active_model_name and self._active_model_name != target.name:
-                current = self.find_model(self._active_model_name)
-                self._sleep(current)
-                self._active_model_name = None
+        with self._condition:
+            self._wait_for_switch_safety(target)
+            return self._activate_locked(target)
 
-            should_wake = self._active_model_name != target.name
-            if self._active_model_name is None:
-                sleeping = self._is_sleeping(target)
-                if sleeping is False:
-                    should_wake = False
-                    self._active_model_name = target.name
-            elif self.always_wake and self._active_model_name == target.name:
-                sleeping = self._is_sleeping(target)
-                should_wake = sleeping is not False
+    def acquire(self, requested: str) -> ModelLease:
+        """Wake a model and hold it awake for one buffered or streaming request."""
 
-            if should_wake:
-                self._wake(target)
-                self._wait_until_not_sleeping(target)
-                self._wait_until_model_listed(target)
+        target = self.find_model(requested)
+        with self._condition:
+            self._wait_for_switch_safety(target)
+            self._activate_locked(target)
+            self._inflight_requests += 1
+        return ModelLease(self, target)
+
+    def release(self, target: ModelConfig) -> None:
+        with self._condition:
+            if self._inflight_requests <= 0:
+                raise RuntimeError(f"no in-flight request to release for {target.name}")
+            self._inflight_requests -= 1
+            self._condition.notify_all()
+
+    def _wait_for_switch_safety(self, target: ModelConfig) -> None:
+        deadline = time.monotonic() + self.drain_timeout_s
+        while True:
+            if (
+                self._pending_switch_name is not None
+                and self._pending_switch_name != target.name
+            ):
+                self._wait_for_drain(deadline, target)
+                continue
+            if (
+                self._active_model_name is not None
+                and self._active_model_name != target.name
+                and self._inflight_requests > 0
+            ):
+                self._pending_switch_name = target.name
+                self._wait_for_drain(deadline, target)
+                continue
+            return
+
+    def _wait_for_drain(self, deadline: float, target: ModelConfig) -> None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            if self._pending_switch_name == target.name:
+                self._pending_switch_name = None
+                self._condition.notify_all()
+            raise WakeError(f"timed out draining requests before switching to {target.name}")
+        self._condition.wait(timeout=remaining)
+
+    def _activate_locked(self, target: ModelConfig) -> ModelConfig:
+        try:
+            return self._ensure_awake_locked(target)
+        except WakeError:
+            raise
+        except (ConnectionError, OSError, TimeoutError, TypeError, ValueError) as exc:
+            raise WakeError(f"lifecycle check failed for {target.name}: {exc}") from exc
+        finally:
+            if self._pending_switch_name == target.name:
+                self._pending_switch_name = None
+                self._condition.notify_all()
+
+    def _ensure_awake_locked(self, target: ModelConfig) -> ModelConfig:
+        if self._active_model_name and self._active_model_name != target.name:
+            current = self.find_model(self._active_model_name)
+            self._sleep(current)
+            self._active_model_name = None
+            self._active_model_ready = False
+
+        should_wake = self._active_model_name != target.name
+        if self._active_model_name is None:
+            sleeping = self._is_sleeping(target)
+            if sleeping is False:
+                should_wake = False
                 self._active_model_name = target.name
+                self._active_model_ready = False
+        elif self.always_wake and self._active_model_name == target.name:
+            sleeping = self._is_sleeping(target)
+            should_wake = sleeping is not False
 
-            return target
+        if should_wake:
+            # Conservatively remember the target before wake begins. A partial
+            # wake failure can leave weights resident; the next model switch
+            # must sleep this engine even when readiness never completed.
+            self._active_model_name = target.name
+            self._active_model_ready = False
+            self._wake(target)
+            self._wait_until_not_sleeping(target)
+
+        if not self._active_model_ready:
+            self._wait_until_model_listed(target)
+            self._active_model_ready = True
+
+        return target
 
     def _sleep(self, model: ModelConfig) -> None:
         query = urlencode({"level": str(self.sleep_level)})

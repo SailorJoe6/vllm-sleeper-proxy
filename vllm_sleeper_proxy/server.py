@@ -3,6 +3,7 @@ from __future__ import annotations
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
+import socket
 from typing import Iterable
 from urllib.parse import urlsplit
 
@@ -24,12 +25,14 @@ HOP_BY_HOP_HEADERS = {
 }
 
 PROXIED_POST_PATHS = {
+    "/v1/chat/completions",
     "/v1/embeddings",
 }
 
 
 class SleeperProxyHandler(BaseHTTPRequestHandler):
     manager: ModelManager
+    max_request_body_bytes = 10 * 1024 * 1024
 
     server_version = "vllm-sleeper-proxy/0.1"
 
@@ -55,35 +58,77 @@ class SleeperProxyHandler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": {"message": f"not found: {path}"}})
             return
 
-        body = self.rfile.read(int(self.headers.get("content-length", "0") or "0"))
-        requested_model = self._extract_model(body)
-        if not requested_model:
-            self._send_json(400, {"error": {"message": "request JSON must include a model field"}})
+        if self.headers.get("transfer-encoding") is not None:
+            self._send_error(411, "chunked request bodies are not supported", "length_required")
             return
+        raw_content_length = self.headers.get("content-length")
+        if raw_content_length is None:
+            self._send_error(411, "content-length is required", "length_required")
+            return
+        try:
+            content_length = int(raw_content_length)
+        except ValueError:
+            self._send_error(400, "content-length must be an integer", "invalid_request")
+            return
+        if content_length < 0:
+            self._send_error(400, "content-length must not be negative", "invalid_request")
+            return
+        if content_length > self.max_request_body_bytes:
+            self._send_error(
+                413,
+                f"request body exceeds {self.max_request_body_bytes} bytes",
+                "request_too_large",
+            )
+            return
+        body = self.rfile.read(content_length)
+        if len(body) != content_length:
+            self._send_error(400, "request body ended before content-length", "truncated_request")
+            return
+        payload = self._decode_payload(body)
+        if payload is None:
+            self._send_error(400, "request body must be a JSON object", "invalid_request")
+            return
+        requested_model = payload.get("model")
+        if not isinstance(requested_model, str) or not requested_model:
+            self._send_error(400, "request JSON must include a model field", "invalid_request")
+            return
+        stream = path == "/v1/chat/completions" and payload.get("stream") is True
 
         try:
-            target = self.manager.ensure_awake(requested_model)
+            lease = self.manager.acquire(requested_model)
         except UnknownModelError as exc:
-            self._send_json(404, {"error": {"message": str(exc), "type": "unknown_model"}})
+            self._send_error(404, str(exc), "unknown_model")
             return
         except WakeError as exc:
-            self.send_response(503)
-            self.send_header("content-type", "application/json")
-            self.send_header("retry-after", "10")
-            self.end_headers()
-            self.wfile.write(json.dumps({"error": {"message": str(exc), "type": "wake_failed"}}).encode())
+            self._send_error(503, str(exc), "wake_failed", {"retry-after": "10"})
             return
 
-        upstream_body = self.manager.rewrite_request_body(body, target)
-        upstream_url = f"{target.upstream_base_url}{path.removeprefix('/v1')}"
-        headers = self._forward_headers(extra_content_length=len(upstream_body))
-        response = self.manager.http.request(
-            "POST",
-            upstream_url,
-            headers=headers,
-            body=upstream_body,
-            timeout=self.manager.request_timeout_s,
-        )
+        with lease as target:
+            upstream_body = self.manager.rewrite_request_body(body, target)
+            upstream_url = f"{target.upstream_base_url}{path.removeprefix('/v1')}"
+            headers = self._forward_headers(extra_content_length=len(upstream_body))
+            if stream:
+                self._forward_stream(upstream_url, headers, upstream_body)
+            else:
+                self._forward_buffered(upstream_url, headers, upstream_body)
+
+    def _forward_buffered(
+        self,
+        upstream_url: str,
+        headers: dict[str, str],
+        upstream_body: bytes,
+    ) -> None:
+        try:
+            response = self.manager.http.request(
+                "POST",
+                upstream_url,
+                headers=headers,
+                body=upstream_body,
+                timeout=self.manager.request_timeout_s,
+            )
+        except (ConnectionError, TimeoutError, socket.timeout) as exc:
+            self._send_error(502, str(exc), "upstream_unavailable")
+            return
         self.send_response(response.status)
         for key, value in response.headers.items():
             if key.lower() not in HOP_BY_HOP_HEADERS:
@@ -91,6 +136,45 @@ class SleeperProxyHandler(BaseHTTPRequestHandler):
         self.send_header("content-length", str(len(response.body)))
         self.end_headers()
         self.wfile.write(response.body)
+
+    def _forward_stream(
+        self,
+        upstream_url: str,
+        headers: dict[str, str],
+        upstream_body: bytes,
+    ) -> None:
+        try:
+            response = self.manager.http.stream(
+                "POST",
+                upstream_url,
+                headers=headers,
+                body=upstream_body,
+                timeout=self.manager.request_timeout_s,
+            )
+        except (ConnectionError, TimeoutError, socket.timeout) as exc:
+            self._send_error(502, str(exc), "upstream_unavailable")
+            return
+
+        try:
+            self.send_response(response.status)
+            for key, value in response.headers.items():
+                if key.lower() not in HOP_BY_HOP_HEADERS:
+                    self.send_header(key, value)
+            self.send_header("connection", "close")
+            self.end_headers()
+            for chunk in response.iter_chunks():
+                self.wfile.write(chunk)
+                self.wfile.flush()
+        except (
+            BrokenPipeError,
+            ConnectionError,
+            ConnectionResetError,
+            TimeoutError,
+            socket.timeout,
+        ):
+            self.close_connection = True
+        finally:
+            response.close()
 
     def _forward_headers(self, *, extra_content_length: int) -> dict[str, str]:
         headers = {
@@ -102,14 +186,31 @@ class SleeperProxyHandler(BaseHTTPRequestHandler):
         headers.setdefault("content-type", "application/json")
         return headers
 
-    def _extract_model(self, body: bytes) -> str | None:
+    def _decode_payload(self, body: bytes) -> dict[str, object] | None:
         try:
             decoded = json.loads(body.decode("utf-8"))
         except Exception:
             return None
-        if isinstance(decoded, dict) and isinstance(decoded.get("model"), str):
-            return decoded["model"]
-        return None
+        return decoded if isinstance(decoded, dict) else None
+
+    def _send_error(
+        self,
+        status: int,
+        message: str,
+        error_type: str,
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        encoded = json.dumps(
+            {"error": {"message": message, "type": error_type}},
+            separators=(",", ":"),
+        ).encode("utf-8")
+        self.send_response(status)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(encoded)))
+        for key, value in (headers or {}).items():
+            self.send_header(key, value)
+        self.end_headers()
+        self.wfile.write(encoded)
 
     def _send_json(self, status: int, payload: object) -> None:
         encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
@@ -120,11 +221,18 @@ class SleeperProxyHandler(BaseHTTPRequestHandler):
         self.wfile.write(encoded)
 
 
-def build_server(host: str, port: int, manager: ModelManager) -> ThreadingHTTPServer:
+def build_server(
+    host: str,
+    port: int,
+    manager: ModelManager,
+    *,
+    max_request_body_bytes: int = 10 * 1024 * 1024,
+) -> ThreadingHTTPServer:
     class Handler(SleeperProxyHandler):
         pass
 
     Handler.manager = manager
+    Handler.max_request_body_bytes = max_request_body_bytes
     return ThreadingHTTPServer((host, port), Handler)
 
 
@@ -137,11 +245,19 @@ def main(argv: Iterable[str] | None = None) -> int:
         sleep_level=int(os.environ.get("SLEEPER_SLEEP_LEVEL", "2")),
         request_timeout_s=float(os.environ.get("SLEEPER_REQUEST_TIMEOUT_SECONDS", "30")),
         wake_timeout_s=float(os.environ.get("SLEEPER_WAKE_TIMEOUT_SECONDS", "300")),
+        drain_timeout_s=float(os.environ.get("SLEEPER_DRAIN_TIMEOUT_SECONDS", "300")),
         poll_interval_s=float(os.environ.get("SLEEPER_POLL_INTERVAL_SECONDS", "1")),
         always_wake=os.environ.get("SLEEPER_ALWAYS_WAKE", "1") != "0",
         wake_strategy=os.environ.get("SLEEPER_WAKE_STRATEGY", "level2"),
     )
-    httpd = build_server(host, port, manager)
+    httpd = build_server(
+        host,
+        port,
+        manager,
+        max_request_body_bytes=int(
+            os.environ.get("SLEEPER_MAX_REQUEST_BODY_BYTES", str(10 * 1024 * 1024))
+        ),
+    )
     print(f"vllm-sleeper-proxy listening on http://{host}:{port}", flush=True)
     httpd.serve_forever()
     return 0

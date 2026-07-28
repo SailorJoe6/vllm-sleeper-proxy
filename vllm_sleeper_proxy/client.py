@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 import time
-from typing import Protocol
+from typing import Iterator, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -30,6 +30,40 @@ class HttpClient(Protocol):
         body: bytes | None = None,
         timeout: float | None = None,
     ) -> HttpResponse: ...
+
+    def stream(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: dict[str, str] | None = None,
+        body: bytes | None = None,
+        timeout: float | None = None,
+    ) -> HttpStream: ...
+
+
+class HttpStream(Protocol):
+    status: int
+    headers: dict[str, str]
+
+    def iter_chunks(self, chunk_size: int = 64 * 1024) -> Iterator[bytes]: ...
+
+    def close(self) -> None: ...
+
+
+class UrllibHttpStream:
+    def __init__(self, response) -> None:
+        self._response = response
+        self.status = response.status
+        self.headers = {key.lower(): value for key, value in response.headers.items()}
+
+    def iter_chunks(self, chunk_size: int = 64 * 1024) -> Iterator[bytes]:
+        read = getattr(self._response, "read1", self._response.read)
+        while chunk := read(chunk_size):
+            yield chunk
+
+    def close(self) -> None:
+        self._response.close()
 
 
 class UrllibHttpClient:
@@ -62,6 +96,29 @@ class UrllibHttpClient:
             )
         except URLError as exc:
             raise ConnectionError(f"HTTP request failed for {url}: {exc}") from exc
+
+    def stream(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: dict[str, str] | None = None,
+        body: bytes | None = None,
+        timeout: float | None = None,
+    ) -> HttpStream:
+        req = Request(url, data=body, method=method.upper())
+        for key, value in (headers or {}).items():
+            req.add_header(key, value)
+        try:
+            response = urlopen(  # noqa: S310 - operator-configured local endpoints
+                req,
+                timeout=timeout,
+            )
+        except HTTPError as exc:
+            response = exc
+        except URLError as exc:
+            raise ConnectionError(f"HTTP request failed for {url}: {exc}") from exc
+        return UrllibHttpStream(response)
 
 
 def sleep_until(predicate, *, timeout_s: float, interval_s: float) -> bool:
