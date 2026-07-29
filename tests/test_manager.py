@@ -84,6 +84,25 @@ class SwitchingHttp(FakeHttp):
         raise AssertionError(f"unexpected request: {method} {url}")
 
 
+class PerModelSleepHttp(FakeHttp):
+    def __init__(self, states: dict[str, bool | None]) -> None:
+        super().__init__()
+        self.states = states
+
+    def request(self, method, url, *, headers=None, body=None, timeout=None):
+        self.calls.append((method, url, body))
+        model = "vision" if url.startswith("http://vision") else "embedding"
+        if url.endswith("/is_sleeping"):
+            state = self.states[model]
+            if state is None:
+                return HttpResponse(200, {}, b'{"status":"unknown"}')
+            return HttpResponse(200, {}, json.dumps({"is_sleeping": state}).encode())
+        if "/sleep?" in url:
+            self.states[model] = True
+            return HttpResponse(200, {}, b"{}")
+        raise AssertionError(f"unexpected request: {method} {url}")
+
+
 class ModelManagerTests(unittest.TestCase):
     def test_openai_model_list_is_logical_and_stable(self) -> None:
         manager = ModelManager([qwen_model()], FakeHttp())
@@ -113,6 +132,104 @@ class ModelManagerTests(unittest.TestCase):
         self.assertIn("http://vllm:8888/is_sleeping", urls)
         self.assertNotIn("http://vllm:8888/wake_up?tags=weights", urls)
         self.assertNotIn("http://vllm:8888/collective_rpc", urls)
+
+    def test_startup_reconciliation_sleeps_every_awake_model(self) -> None:
+        http = PerModelSleepHttp({"embedding": False, "vision": False})
+        manager = ModelManager(
+            [qwen_model(), vision_model()],
+            http,
+            poll_interval_s=0,
+            wake_timeout_s=1,
+        )
+
+        manager.reconcile_startup_state()
+
+        self.assertEqual(http.states, {"embedding": True, "vision": True})
+        self.assertIsNone(manager.active_model_name)
+        sleep_urls = [url for method, url, _ in http.calls if method == "POST"]
+        self.assertEqual(
+            sleep_urls,
+            [
+                "http://vllm:8888/sleep?level=2",
+                "http://vision:8000/sleep?level=2",
+            ],
+        )
+
+    def test_startup_reconciliation_leaves_sleeping_models_untouched(self) -> None:
+        http = PerModelSleepHttp({"embedding": True, "vision": True})
+        manager = ModelManager([qwen_model(), vision_model()], http)
+
+        manager.reconcile_startup_state()
+
+        self.assertIsNone(manager.active_model_name)
+        self.assertFalse(any(method == "POST" for method, _, _ in http.calls))
+
+    def test_startup_reconciliation_fails_when_sleep_state_is_unknown(self) -> None:
+        http = PerModelSleepHttp({"embedding": True, "vision": None})
+        manager = ModelManager([qwen_model(), vision_model()], http)
+
+        with self.assertRaisesRegex(
+            WakeError,
+            "cannot verify startup sleep state for chess-vlm-bootstrap",
+        ):
+            manager.reconcile_startup_state()
+
+        self.assertIsNone(manager.active_model_name)
+
+    def test_startup_reconciliation_fails_when_engine_stays_awake(self) -> None:
+        class RefusesToSleep(PerModelSleepHttp):
+            def request(self, method, url, *, headers=None, body=None, timeout=None):
+                if "/sleep?" in url:
+                    self.calls.append((method, url, body))
+                    return HttpResponse(200, {}, b"{}")
+                return super().request(
+                    method,
+                    url,
+                    headers=headers,
+                    body=body,
+                    timeout=timeout,
+                )
+
+        http = RefusesToSleep({"embedding": False, "vision": True})
+        manager = ModelManager(
+            [qwen_model(), vision_model()],
+            http,
+            poll_interval_s=0,
+            wake_timeout_s=0,
+        )
+
+        with self.assertRaisesRegex(
+            WakeError,
+            "timed out waiting for Qwen3-Embedding-8B to enter sleep state",
+        ):
+            manager.reconcile_startup_state()
+
+        self.assertIsNone(manager.active_model_name)
+
+    def test_startup_reconciliation_fails_on_sleep_state_http_error(self) -> None:
+        class SleepStateError(PerModelSleepHttp):
+            def request(self, method, url, *, headers=None, body=None, timeout=None):
+                if url.endswith("/is_sleeping"):
+                    self.calls.append((method, url, body))
+                    return HttpResponse(503, {}, b"engine unavailable")
+                return super().request(
+                    method,
+                    url,
+                    headers=headers,
+                    body=body,
+                    timeout=timeout,
+                )
+
+        manager = ModelManager(
+            [qwen_model()],
+            SleepStateError({"embedding": True}),
+        )
+
+        with self.assertRaisesRegex(
+            WakeError,
+            "sleep-state check failed for Qwen3-Embedding-8B: HTTP 503",
+        ):
+            manager.reconcile_startup_state()
 
     def test_aliases_resolve_to_model(self) -> None:
         model = ModelConfig(

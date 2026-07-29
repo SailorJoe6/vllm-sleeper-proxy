@@ -50,6 +50,21 @@ Relevant proxy settings are:
 | `SLEEPER_MAX_REQUEST_BODY_BYTES` | `10485760` | Maximum buffered client request body |
 | `SLEEPER_SLEEP_LEVEL` | `2` | vLLM sleep level used before a model switch |
 
+## Startup reconciliation
+
+The proxy does not treat an empty in-process active-model field as proof that
+engines are asleep. Before it binds its HTTP listener, it queries
+`/is_sleeping` for every configured engine, sends level-2 `/sleep` to every
+awake engine, and verifies that all engines report sleeping. The initial
+`/healthz` state is therefore `active_model: null` only after the physical
+engine state matches it.
+
+Reconciliation is mandatory and fail-closed. If an engine is unreachable,
+returns an error or an ambiguous sleep-state payload, rejects `/sleep`, or does
+not enter sleep before the wake timeout, the proxy process exits without
+opening its listening port. The service supervisor may retry after the engine
+control endpoints become ready.
+
 The request limit includes inline base64 media. Increase it deliberately when
 larger local images are required.
 

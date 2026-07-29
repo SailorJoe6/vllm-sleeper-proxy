@@ -228,6 +228,11 @@ def build_server(
     *,
     max_request_body_bytes: int = 10 * 1024 * 1024,
 ) -> ThreadingHTTPServer:
+    # Reconcile before ThreadingHTTPServer binds its listening socket. If any
+    # engine cannot be verified asleep, startup fails closed and no request can
+    # observe an incorrect active_model=None state.
+    manager.reconcile_startup_state()
+
     class Handler(SleeperProxyHandler):
         pass
 

@@ -85,6 +85,27 @@ class ModelManager:
         with self._condition:
             return self._inflight_requests
 
+    def reconcile_startup_state(self) -> None:
+        """Put every configured engine to sleep before the proxy serves traffic."""
+
+        with self._condition:
+            if self._inflight_requests or self._pending_switch_name is not None:
+                raise WakeError("cannot reconcile startup state while requests are active")
+
+            for model in self.models:
+                sleeping = self._is_sleeping(model)
+                if sleeping is None:
+                    raise WakeError(
+                        f"cannot verify startup sleep state for {model.name}: "
+                        "/is_sleeping did not return a boolean state"
+                    )
+                if not sleeping:
+                    self._sleep(model)
+                    self._wait_until_sleeping(model)
+
+            self._active_model_name = None
+            self._active_model_ready = False
+
     def find_model(self, requested: str) -> ModelConfig:
         for model in self.models:
             if model.matches(requested):
@@ -272,13 +293,30 @@ class ModelManager:
             # check remains authoritative for inference readiness.
             return None
         if resp.status >= 400:
-            return True
+            raise WakeError(
+                f"sleep-state check failed for {model.name}: "
+                f"HTTP {resp.status}: {resp.body[:300]!r}"
+            )
         parsed = resp.json()
         if isinstance(parsed, bool):
             return parsed
         if isinstance(parsed, dict):
-            return bool(parsed.get("is_sleeping", parsed.get("sleeping", False)))
+            for key in ("is_sleeping", "sleeping"):
+                value = parsed.get(key)
+                if isinstance(value, bool):
+                    return value
         return None
+
+    def _wait_until_sleeping(self, model: ModelConfig) -> None:
+        def sleeping() -> bool:
+            return self._is_sleeping(model) is True
+
+        if not sleep_until(
+            sleeping,
+            timeout_s=self.wake_timeout_s,
+            interval_s=self.poll_interval_s,
+        ):
+            raise WakeError(f"timed out waiting for {model.name} to enter sleep state")
 
     def _wait_until_not_sleeping(self, model: ModelConfig) -> None:
         def ready() -> bool:

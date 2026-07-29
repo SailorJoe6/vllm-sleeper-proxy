@@ -10,7 +10,7 @@ from urllib.request import Request, urlopen
 
 from vllm_sleeper_proxy.client import HttpResponse
 from vllm_sleeper_proxy.config import ModelConfig
-from vllm_sleeper_proxy.manager import ModelManager
+from vllm_sleeper_proxy.manager import ModelManager, WakeError
 from vllm_sleeper_proxy.server import build_server
 
 
@@ -174,6 +174,21 @@ class ServerTests(unittest.TestCase):
     def test_v1_models(self) -> None:
         payload = self.get_json("/v1/models")
         self.assertEqual(payload["data"][0]["id"], "Qwen3-Embedding-8B")
+
+    def test_server_does_not_bind_when_startup_reconciliation_fails(self) -> None:
+        class FailedStartupManager(ModelManager):
+            def reconcile_startup_state(self) -> None:
+                raise WakeError("vision sleep state unavailable")
+
+        model = ModelConfig(
+            name="Qwen3-Embedding-8B",
+            upstream_model="Qwen/Qwen3-Embedding-8B",
+            upstream_base_url="http://vllm:8888/v1",
+            control_base_url="http://vllm:8888",
+        )
+        manager = FailedStartupManager([model], ProxyHttp())
+        with self.assertRaisesRegex(WakeError, "vision sleep state unavailable"):
+            build_server("127.0.0.1", 0, manager)
 
     def test_embedding_request_wakes_and_forwards(self) -> None:
         status, payload = self.post_json(

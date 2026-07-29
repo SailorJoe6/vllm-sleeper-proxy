@@ -8,6 +8,13 @@ At any given time, the proxy enforces an **at-most-one awake model invariant**, 
 
 This allows individual models to consume **nearly all available GPU / unified memory** (for example, very large context windows) while still supporting fast, request-driven switching between models such as *coding*, *reasoning*, or *planning* LLMs—without full cold restarts.
 
+Before binding its HTTP listener, the proxy queries every configured engine,
+puts each awake engine into level-2 sleep, and verifies that every engine
+reports sleeping. Only then does it begin serving with `active_model: null`.
+Startup fails closed if any engine is unavailable, rejects the sleep request,
+or cannot provide a boolean `/is_sleeping` state. This startup reconciliation
+repairs model state lost across proxy, container, Docker, or host restarts.
+
 ---
 
 ## Current implementation
