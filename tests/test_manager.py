@@ -261,6 +261,36 @@ class ModelManagerTests(unittest.TestCase):
         with self.assertRaises(UnknownModelError):
             manager.ensure_awake("not-a-model")
 
+    def test_admission_denial_happens_before_wake(self) -> None:
+        http = FakeHttp()
+
+        def deny(model) -> None:
+            raise RuntimeError(f"denied {model.name}")
+
+        manager = ModelManager([qwen_model()], http, admission_check=deny)
+        with self.assertRaisesRegex(RuntimeError, "denied Qwen3-Embedding-8B"):
+            manager.acquire("Qwen3-Embedding-8B")
+        self.assertFalse(
+            any("/wake_up" in url for _, url, _ in http.calls)
+        )
+
+    def test_resource_backoff_sleeps_active_model(self) -> None:
+        http = FakeHttp()
+        manager = ModelManager(
+            [qwen_model()],
+            http,
+            poll_interval_s=0,
+            wake_timeout_s=1,
+        )
+        manager.ensure_awake("Qwen3-Embedding-8B")
+
+        self.assertEqual("Qwen3-Embedding-8B", manager.sleep_active_model())
+        self.assertIsNone(manager.active_model_name)
+        self.assertIn(
+            "http://vllm:8888/sleep?level=2",
+            [url for _, url, _ in http.calls],
+        )
+
     def test_request_body_is_rewritten_to_upstream_model(self) -> None:
         manager = ModelManager([qwen_model()], FakeHttp())
         rewritten = manager.rewrite_request_body(

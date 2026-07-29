@@ -22,7 +22,8 @@ repairs model state lost across proxy, container, Docker, or host restarts.
 This repo now includes a minimal, dependency-light Python sleeper proxy plus a
 GBrain embedding Compose integration:
 
-* `vllm_sleeper_proxy/` exposes `/v1/models`, `/api/tags`, `/healthz`, and
+* `vllm_sleeper_proxy/` exposes `/v1/models`, `/api/tags`, `/healthz`, a
+  lifecycle-safe `POST /sleep` control, and
   OpenAI-compatible request forwarding for `/v1/embeddings` and
   `/v1/chat/completions`.
 * Before forwarding a request, the proxy calls vLLM `/wake_up`, waits for
@@ -34,6 +35,10 @@ GBrain embedding Compose integration:
 * Each request owns its active model until its buffered or streaming response
   ends. A request for another model waits before sleeping the current engine,
   preventing an in-flight response from being evicted.
+* An optional file-backed admission guard fails closed before wake when the
+  host resource monitor is missing, stale, or denies the requested model.
+  The bundled memory monitor polls total-host `MemAvailable` and asks the
+  proxy to quiesce and sleep the active model at the configured ceiling.
 * `services/gbrain-embeddings/` wires GBrain → LiteLLM → sleeper proxy → vLLM
   for `Qwen/Qwen3-Embedding-8B`.
 * `scripts/sleep-gbrain-embeddings.sh` intentionally sleeps Qwen so GPU memory
@@ -56,6 +61,7 @@ GBrain embedding Compose integration:
 | --- | --- | --- |
 | `POST /v1/embeddings` | OpenAI-compatible JSON | Buffered upstream response |
 | `POST /v1/chat/completions` | OpenAI-compatible text or inline multimodal JSON | Buffered JSON, or SSE when `"stream": true` |
+| `POST /sleep` | Empty body | Quiesces new inference, drains ownership, then sleeps the active model |
 
 The proxy rewrites only the top-level `model` field. It does not transform
 `messages`, inline `data:` image URLs, generation parameters, or response

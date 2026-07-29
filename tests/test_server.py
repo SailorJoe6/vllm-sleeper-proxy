@@ -79,6 +79,9 @@ class ProxyHttp:
             return HttpResponse(200, {}, b"{}")
         if url.endswith("/collective_rpc"):
             return HttpResponse(200, {}, b"{}")
+        if "/sleep?" in url:
+            self.sleeping = True
+            return HttpResponse(200, {}, b"{}")
         if url.endswith("/is_sleeping"):
             return HttpResponse(
                 200,
@@ -174,6 +177,17 @@ class ServerTests(unittest.TestCase):
     def test_v1_models(self) -> None:
         payload = self.get_json("/v1/models")
         self.assertEqual(payload["data"][0]["id"], "Qwen3-Embedding-8B")
+
+    def test_sleep_endpoint_quiesces_active_model(self) -> None:
+        self.post_json(
+            "/v1/embeddings",
+            {"model": "Qwen3-Embedding-8B", "input": "hello"},
+        )
+        status, payload = self.post_json("/sleep", {})
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["slept_model"], "Qwen3-Embedding-8B")
+        self.assertIsNone(self.manager.active_model_name)
 
     def test_server_does_not_bind_when_startup_reconciliation_fails(self) -> None:
         class FailedStartupManager(ModelManager):

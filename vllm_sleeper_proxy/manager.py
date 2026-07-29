@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import threading
 import time
-from typing import Iterable
+from typing import Callable, Iterable
 from urllib.parse import urlencode
 
 from .client import HttpClient, sleep_until
@@ -58,6 +58,7 @@ class ModelManager:
         poll_interval_s: float = 1.0,
         always_wake: bool = True,
         wake_strategy: str = "level2",
+        admission_check: Callable[[ModelConfig], None] | None = None,
     ) -> None:
         self.models = list(models)
         if not self.models:
@@ -70,11 +71,13 @@ class ModelManager:
         self.poll_interval_s = poll_interval_s
         self.always_wake = always_wake
         self.wake_strategy = wake_strategy
+        self.admission_check = admission_check
         self._condition = threading.Condition()
         self._active_model_name: str | None = None
         self._active_model_ready = False
         self._inflight_requests = 0
         self._pending_switch_name: str | None = None
+        self._quiescing = False
 
     @property
     def active_model_name(self) -> str | None:
@@ -153,9 +156,36 @@ class ModelManager:
         target = self.find_model(requested)
         with self._condition:
             self._wait_for_switch_safety(target)
+            if self.admission_check is not None:
+                self.admission_check(target)
             self._activate_locked(target)
             self._inflight_requests += 1
         return ModelLease(self, target)
+
+    def sleep_active_model(self) -> str | None:
+        """Quiesce new requests, drain current ownership, and sleep the active model."""
+
+        with self._condition:
+            deadline = time.monotonic() + self.drain_timeout_s
+            self._quiescing = True
+            try:
+                while self._inflight_requests > 0:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise WakeError("timed out draining requests before resource backoff")
+                    self._condition.wait(timeout=remaining)
+                if self._active_model_name is None:
+                    return None
+                current = self.find_model(self._active_model_name)
+                self._sleep(current)
+                self._wait_until_sleeping(current)
+                slept = current.name
+                self._active_model_name = None
+                self._active_model_ready = False
+                return slept
+            finally:
+                self._quiescing = False
+                self._condition.notify_all()
 
     def release(self, target: ModelConfig) -> None:
         with self._condition:
@@ -167,6 +197,9 @@ class ModelManager:
     def _wait_for_switch_safety(self, target: ModelConfig) -> None:
         deadline = time.monotonic() + self.drain_timeout_s
         while True:
+            if self._quiescing:
+                self._wait_for_drain(deadline, target)
+                continue
             if (
                 self._pending_switch_name is not None
                 and self._pending_switch_name != target.name

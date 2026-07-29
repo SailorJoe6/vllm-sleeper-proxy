@@ -49,6 +49,7 @@ Relevant proxy settings are:
 | `SLEEPER_DRAIN_TIMEOUT_SECONDS` | `300` | Deadline for in-flight requests to drain before switching |
 | `SLEEPER_MAX_REQUEST_BODY_BYTES` | `10485760` | Maximum buffered client request body |
 | `SLEEPER_SLEEP_LEVEL` | `2` | vLLM sleep level used before a model switch |
+| `SLEEPER_ADMISSION_STATUS_PATH` | unset | Optional host-monitor JSON status; when set, every model request requires a fresh allowed `model_admission` decision before wake |
 
 ## Startup reconciliation
 
@@ -126,6 +127,18 @@ deadline.
 Exceptions and downstream disconnects close the upstream stream and release
 ownership.
 
+`POST /sleep` provides a bounded resource-backoff path. It stops new model
+acquisitions, waits for existing buffered or streaming ownership to drain,
+sleeps the active engine at level 2, verifies sleep, and returns the logical
+model name. It never evicts an in-flight response.
+
+Deployments may run `python -m vllm_sleeper_proxy.memory_monitor` beside the
+proxy. It samples total-host memory at a short interval and invokes that exact
+sleep control when utilization reaches its configured ceiling (which may not
+exceed 85%). Cold-start safety remains deployment-owned: use a host preflight
+and serialize engine startup so the proxy and monitor do not need to recover
+from an unbudgeted startup overlap.
+
 ## Errors and failure semantics
 
 - Unsupported paths return `404`.
@@ -136,6 +149,9 @@ ownership.
 - Unknown models return `404` with `type=unknown_model`.
 - Oversized bodies return `413` with `type=request_too_large`.
 - Wake failures return `503`, `type=wake_failed`, and `Retry-After: 10`.
+- Missing, stale, or denied model-specific resource admission returns `503`,
+  `type=admission_denied`, before any wake request.
+- A failed resource-backoff sleep returns `503`, `type=sleep_failed`.
 - An upstream connection or timeout failure before response headers returns
   `502` with `type=upstream_unavailable`.
 - If an upstream streaming failure occurs after response headers, the proxy
@@ -172,3 +188,5 @@ continue to operate.
   only after the queued handler acquires the model and begins forwarding.
 - Health remains proxy liveness plus active-model reporting. Deployment
   readiness must additionally exercise discovery and an inference request.
+- The file admission guard trusts only the status schema and freshness written
+  by the deployment's host monitor; it does not calculate cold-start peaks.

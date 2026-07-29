@@ -4,10 +4,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 import socket
+from pathlib import Path
 from typing import Iterable
 from urllib.parse import urlsplit
 
 from .client import UrllibHttpClient
+from .admission import AdmissionError, FileAdmissionGuard
 from .config import load_models_from_env
 from .manager import ModelManager, UnknownModelError, WakeError
 
@@ -54,6 +56,14 @@ class SleeperProxyHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802 - stdlib API
         path = urlsplit(self.path).path
+        if path == "/sleep":
+            try:
+                slept_model = self.manager.sleep_active_model()
+            except WakeError as exc:
+                self._send_error(503, str(exc), "sleep_failed", {"retry-after": "10"})
+                return
+            self._send_json(200, {"ok": True, "slept_model": slept_model})
+            return
         if path not in PROXIED_POST_PATHS:
             self._send_json(404, {"error": {"message": f"not found: {path}"}})
             return
@@ -101,6 +111,9 @@ class SleeperProxyHandler(BaseHTTPRequestHandler):
             return
         except WakeError as exc:
             self._send_error(503, str(exc), "wake_failed", {"retry-after": "10"})
+            return
+        except AdmissionError as exc:
+            self._send_error(503, str(exc), "admission_denied", {"retry-after": "10"})
             return
 
         with lease as target:
@@ -244,6 +257,10 @@ def build_server(
 def main(argv: Iterable[str] | None = None) -> int:
     host = os.environ.get("SLEEPER_PROXY_HOST", "0.0.0.0")
     port = int(os.environ.get("SLEEPER_PROXY_PORT", "8889"))
+    admission_path = os.environ.get("SLEEPER_ADMISSION_STATUS_PATH")
+    admission_check = (
+        FileAdmissionGuard(Path(admission_path)) if admission_path else None
+    )
     manager = ModelManager(
         load_models_from_env(),
         UrllibHttpClient(),
@@ -254,6 +271,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         poll_interval_s=float(os.environ.get("SLEEPER_POLL_INTERVAL_SECONDS", "1")),
         always_wake=os.environ.get("SLEEPER_ALWAYS_WAKE", "1") != "0",
         wake_strategy=os.environ.get("SLEEPER_WAKE_STRATEGY", "level2"),
+        admission_check=admission_check,
     )
     httpd = build_server(
         host,
