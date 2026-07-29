@@ -38,12 +38,27 @@ def monitor(
     timeout_s: float,
 ) -> None:
     backoff_requested = False
+    peak_percent = 0.0
     while True:
         utilization = memory_utilization()
+        if utilization > peak_percent:
+            peak_percent = utilization
+            print(f"total_host_memory_peak_percent={peak_percent:.2f}", flush=True)
         if utilization >= critical_percent and not backoff_requested:
-            request_sleep(control_url, timeout_s)
+            result = request_sleep(control_url, timeout_s)
+            print(
+                "resource_backoff="
+                f"{result.get('slept_model') or 'no_active_model'} "
+                f"utilization_percent={utilization:.2f}",
+                flush=True,
+            )
             backoff_requested = True
         elif utilization < critical_percent:
+            if backoff_requested:
+                print(
+                    f"resource_recovered utilization_percent={utilization:.2f}",
+                    flush=True,
+                )
             backoff_requested = False
         time.sleep(poll_seconds)
 
