@@ -25,6 +25,8 @@ class FakeHttp:
             return HttpResponse(200, {}, b"{}")
         if url.endswith("/collective_rpc"):
             return HttpResponse(200, {}, b"{}")
+        if url.endswith("/reset_mm_cache"):
+            return HttpResponse(200, {}, b"{}")
         if "/sleep?" in url:
             self.sleeping = True
             return HttpResponse(200, {}, b"{}")
@@ -66,7 +68,11 @@ class SwitchingHttp(FakeHttp):
         if url.endswith("/wake_up?tags=weights"):
             self.sleeping = False
             return HttpResponse(200, {}, b"{}")
-        if url.endswith("/wake_up?tags=kv_cache") or url.endswith("/collective_rpc"):
+        if (
+            url.endswith("/wake_up?tags=kv_cache")
+            or url.endswith("/collective_rpc")
+            or url.endswith("/reset_mm_cache")
+        ):
             return HttpResponse(200, {}, b"{}")
         if url.endswith("/is_sleeping"):
             return HttpResponse(200, {}, json.dumps({"is_sleeping": self.sleeping}).encode())
@@ -120,8 +126,13 @@ class ModelManagerTests(unittest.TestCase):
         self.assertIn("http://vllm:8888/wake_up?tags=weights", urls)
         self.assertIn("http://vllm:8888/collective_rpc", urls)
         self.assertIn("http://vllm:8888/wake_up?tags=kv_cache", urls)
+        self.assertIn("http://vllm:8888/reset_mm_cache", urls)
         self.assertIn("http://vllm:8888/is_sleeping", urls)
         self.assertIn("http://vllm:8888/v1/models", urls)
+        self.assertLess(
+            urls.index("http://vllm:8888/wake_up?tags=kv_cache"),
+            urls.index("http://vllm:8888/reset_mm_cache"),
+        )
 
     def test_unknown_active_state_does_not_wake_when_already_awake(self) -> None:
         http = FakeHttp()

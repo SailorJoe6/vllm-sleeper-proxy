@@ -113,7 +113,8 @@ Before inference, the proxy:
 1. resolves the logical model or alias;
 2. waits for requests using another active model to finish;
 3. sleeps the old engine at level 2;
-4. wakes the requested engine and checks sleep state and model discovery;
+4. wakes the requested engine, resets its multimodal cache after the level-2
+   reload, and checks sleep state and model discovery;
 5. acquires request ownership;
 6. forwards the request;
 7. releases ownership on every exit from forwarding.

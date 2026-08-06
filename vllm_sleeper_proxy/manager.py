@@ -302,6 +302,11 @@ class ModelManager:
                 "reload_weights",
             ),
             (f"{model.control_base_url}/wake_up?tags=kv_cache", None, "wake_up kv_cache"),
+            (
+                f"{model.control_base_url}/reset_mm_cache",
+                None,
+                "reset multimodal cache",
+            ),
         ):
             resp = self.http.request(
                 "POST",

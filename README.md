@@ -27,7 +27,8 @@ GBrain embedding Compose integration:
   OpenAI-compatible request forwarding for `/v1/embeddings` and
   `/v1/chat/completions`.
 * Before forwarding a request, the proxy calls vLLM `/wake_up`, waits for
-  `/is_sleeping` and `/v1/models` readiness, rewrites the logical model alias
+  `/is_sleeping` and `/v1/models` readiness, resets vLLM's multimodal cache
+  after every level-2 reload, rewrites the logical model alias
   or LiteLLM/vLLM model id to the upstream vLLM model id, then forwards the
   request.
 * Chat completions preserve image-and-text message content and support both

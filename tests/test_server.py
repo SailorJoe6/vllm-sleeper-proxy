@@ -79,6 +79,8 @@ class ProxyHttp:
             return HttpResponse(200, {}, b"{}")
         if url.endswith("/collective_rpc"):
             return HttpResponse(200, {}, b"{}")
+        if url.endswith("/reset_mm_cache"):
+            return HttpResponse(200, {}, b"{}")
         if "/sleep?" in url:
             self.sleeping = True
             return HttpResponse(200, {}, b"{}")
@@ -215,6 +217,7 @@ class ServerTests(unittest.TestCase):
         self.assertIn("http://vllm:8888/wake_up?tags=weights", urls)
         self.assertIn("http://vllm:8888/collective_rpc", urls)
         self.assertIn("http://vllm:8888/wake_up?tags=kv_cache", urls)
+        self.assertIn("http://vllm:8888/reset_mm_cache", urls)
         self.assertIn("http://vllm:8888/v1/embeddings", urls)
 
     def test_embedding_request_accepts_upstream_model_id(self) -> None:
