@@ -302,6 +302,33 @@ class ModelManagerTests(unittest.TestCase):
             [url for _, url, _ in http.calls],
         )
 
+    def test_admission_is_rechecked_after_switch_sleep_before_wake(self) -> None:
+        http = SwitchingHttp()
+        manager = ModelManager(
+            [qwen_model(), vision_model()],
+            http,
+            poll_interval_s=0,
+            wake_timeout_s=1,
+        )
+        lease = manager.acquire("Qwen3-Embedding-8B")
+        lease.release()
+        checks = 0
+
+        def admission(model) -> None:
+            nonlocal checks
+            checks += 1
+            if checks == 2:
+                raise RuntimeError("fresh admission denied")
+
+        manager.admission_check = admission
+        with self.assertRaisesRegex(RuntimeError, "fresh admission denied"):
+            manager.acquire("chess-vlm-bootstrap")
+        self.assertFalse(
+            any(url.endswith("/wake_up?tags=weights") and url.startswith("http://vision")
+                for _, url, _ in http.calls)
+        )
+        self.assertIsNone(manager.active_model_name)
+
     def test_request_body_is_rewritten_to_upstream_model(self) -> None:
         manager = ModelManager([qwen_model()], FakeHttp())
         rewritten = manager.rewrite_request_body(

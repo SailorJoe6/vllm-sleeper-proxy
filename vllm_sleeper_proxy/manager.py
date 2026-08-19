@@ -256,6 +256,11 @@ class ModelManager:
             should_wake = sleeping is not False
 
         if should_wake:
+            # Recheck after any previous engine has been slept. Sleeping is an
+            # asynchronous memory transition, so an admission decision made
+            # before the drain can be stale by the time this engine allocates.
+            if self.admission_check is not None:
+                self.admission_check(target)
             # Conservatively remember the target before wake begins. A partial
             # wake failure can leave weights resident; the next model switch
             # must sleep this engine even when readiness never completed.
@@ -285,6 +290,8 @@ class ModelManager:
             self._wake_level2(model)
             return
 
+        if self.admission_check is not None:
+            self.admission_check(model)
         resp = self.http.request(
             "POST",
             f"{model.control_base_url}/wake_up",
@@ -308,6 +315,10 @@ class ModelManager:
                 "reset multimodal cache",
             ),
         ):
+            # Check before each allocation phase. The host monitor may have
+            # crossed its boundary during an earlier phase of level-2 wake.
+            if self.admission_check is not None:
+                self.admission_check(model)
             resp = self.http.request(
                 "POST",
                 url,
