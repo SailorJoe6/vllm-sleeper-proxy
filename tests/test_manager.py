@@ -368,6 +368,9 @@ class ModelManagerTests(unittest.TestCase):
         self.assertEqual(manager.inflight_requests, 0)
         self.assertEqual(manager.active_model_name, "chess-vlm-bootstrap")
         self.assertTrue(any("/sleep?" in url for _, url, _ in http.calls))
+        urls = [url for _, url, _ in http.calls]
+        self.assertLess(urls.index("http://vllm:8888/is_sleeping"),
+                        urls.index("http://vision:8000/wake_up?tags=weights"))
 
     def test_request_ownership_releases_on_exception(self) -> None:
         manager = ModelManager(
