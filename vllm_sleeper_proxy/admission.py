@@ -23,6 +23,9 @@ class FileAdmissionGuard:
             status = json.loads(self.status_path.read_text(encoding="utf-8"))
             generated_at = float(status["generated_at_epoch"])
             max_age = float(status["max_age_seconds"])
+            dependencies = status["workload_policy"]["model_dependencies"]
+            if model.name not in dependencies:
+                raise KeyError(model.name)
             admissions = status["model_admission"]
             decision = admissions[model.name]
             allowed = decision["allowed"] is True

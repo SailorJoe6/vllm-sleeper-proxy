@@ -30,6 +30,7 @@ class AdmissionTests(unittest.TestCase):
             "model_admission": {
                 MODEL.name: {"allowed": allowed, "reason": "measured_headroom"}
             },
+            "workload_policy": {"model_dependencies": [MODEL.name]},
         }
 
     def test_allows_fresh_model_specific_decision(self) -> None:
@@ -41,6 +42,14 @@ class AdmissionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = self.write_status(Path(directory), self.status(allowed=False))
             with self.assertRaisesRegex(AdmissionError, "measured_headroom"):
+                FileAdmissionGuard(path, now=lambda: 110.0)(MODEL)
+
+    def test_fails_closed_when_dependency_metadata_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            status = self.status()
+            del status["workload_policy"]
+            path = self.write_status(Path(directory), status)
+            with self.assertRaisesRegex(AdmissionError, "unavailable"):
                 FileAdmissionGuard(path, now=lambda: 110.0)(MODEL)
 
     def test_fails_closed_for_stale_missing_or_invalid_status(self) -> None:
