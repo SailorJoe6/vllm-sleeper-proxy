@@ -369,8 +369,12 @@ class ModelManagerTests(unittest.TestCase):
         self.assertEqual(manager.active_model_name, "chess-vlm-bootstrap")
         self.assertTrue(any("/sleep?" in url for _, url, _ in http.calls))
         urls = [url for _, url, _ in http.calls]
-        self.assertLess(urls.index("http://vllm:8888/is_sleeping"),
-                        urls.index("http://vision:8000/wake_up?tags=weights"))
+        sleep_index = next(index for index, url in enumerate(urls)
+                           if url.startswith("http://vllm:8888/sleep?"))
+        sleep_state_index = next(index for index, url in enumerate(urls[sleep_index + 1:], sleep_index + 1)
+                                 if url == "http://vllm:8888/is_sleeping")
+        vision_wake_index = urls.index("http://vision:8000/wake_up?tags=weights")
+        self.assertLess(sleep_state_index, vision_wake_index)
 
     def test_request_ownership_releases_on_exception(self) -> None:
         manager = ModelManager(
