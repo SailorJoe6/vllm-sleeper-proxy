@@ -26,6 +26,10 @@ class FileAdmissionGuard:
             dependencies = status["workload_policy"]["model_dependencies"]
             if model.name not in dependencies:
                 raise KeyError(model.name)
+            if model.upstream_model == "unsloth/Qwen3.8-27B-NVFP4":
+                sample = status["sample"]
+                if not isinstance(sample.get("gpu_memory_free_bytes"), (int, float)):
+                    raise KeyError("gpu_memory_free_bytes")
             admissions = status["model_admission"]
             decision = admissions[model.name]
             allowed = decision["allowed"] is True

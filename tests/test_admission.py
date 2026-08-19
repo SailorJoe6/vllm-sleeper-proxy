@@ -44,6 +44,22 @@ class AdmissionTests(unittest.TestCase):
             with self.assertRaisesRegex(AdmissionError, "measured_headroom"):
                 FileAdmissionGuard(path, now=lambda: 110.0)(MODEL)
 
+    def test_qwen_fails_closed_without_gpu_telemetry(self) -> None:
+        qwen = ModelConfig(
+            name="qwen38-27b-nvfp4",
+            upstream_model="unsloth/Qwen3.8-27B-NVFP4",
+            upstream_base_url="http://qwen:8000/v1",
+            control_base_url="http://qwen:8000",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.write_status(Path(directory), self.status())
+            status = json.loads(path.read_text())
+            status["workload_policy"]["model_dependencies"].append(qwen.name)
+            status["model_admission"][qwen.name] = {"allowed": True}
+            path.write_text(json.dumps(status))
+            with self.assertRaisesRegex(AdmissionError, "unavailable"):
+                FileAdmissionGuard(path, now=lambda: 110.0)(qwen)
+
     def test_fails_closed_when_dependency_metadata_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             status = self.status()
