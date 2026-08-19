@@ -13,6 +13,11 @@ from .admission import AdmissionError, FileAdmissionGuard
 from .config import load_models_from_env
 from .manager import ModelManager, UnknownModelError, WakeError
 
+def require_qwen_admission(models, admission_path: str | None) -> None:
+    if any(model.upstream_model == "unsloth/Qwen3.8-27B-NVFP4" for model in models) and not admission_path:
+        raise RuntimeError("Qwen3.8 requires SLEEPER_ADMISSION_STATUS_PATH")
+
+
 HOP_BY_HOP_HEADERS = {
     "connection",
     "keep-alive",
@@ -258,11 +263,13 @@ def main(argv: Iterable[str] | None = None) -> int:
     host = os.environ.get("SLEEPER_PROXY_HOST", "0.0.0.0")
     port = int(os.environ.get("SLEEPER_PROXY_PORT", "8889"))
     admission_path = os.environ.get("SLEEPER_ADMISSION_STATUS_PATH")
+    models = load_models_from_env()
+    require_qwen_admission(models, admission_path)
     admission_check = (
         FileAdmissionGuard(Path(admission_path)) if admission_path else None
     )
     manager = ModelManager(
-        load_models_from_env(),
+        models,
         UrllibHttpClient(),
         sleep_level=int(os.environ.get("SLEEPER_SLEEP_LEVEL", "2")),
         request_timeout_s=float(os.environ.get("SLEEPER_REQUEST_TIMEOUT_SECONDS", "30")),

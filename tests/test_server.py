@@ -11,7 +11,20 @@ from urllib.request import Request, urlopen
 from vllm_sleeper_proxy.client import HttpResponse
 from vllm_sleeper_proxy.config import ModelConfig
 from vllm_sleeper_proxy.manager import ModelManager, WakeError
-from vllm_sleeper_proxy.server import build_server
+from vllm_sleeper_proxy.server import build_server, require_qwen_admission
+
+
+class AdmissionWiringTests(unittest.TestCase):
+    def test_qwen_requires_status_path(self):
+        model = ModelConfig(
+            name="qwen38-27b-nvfp4",
+            upstream_model="unsloth/Qwen3.8-27B-NVFP4",
+            upstream_base_url="http://qwen:8000/v1",
+            control_base_url="http://qwen:8000",
+        )
+        with self.assertRaisesRegex(RuntimeError, "SLEEPER_ADMISSION_STATUS_PATH"):
+            require_qwen_admission([model], None)
+        require_qwen_admission([model], "/run/status.json")
 
 
 class FakeStream:
