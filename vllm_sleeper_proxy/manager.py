@@ -241,6 +241,10 @@ class ModelManager:
         if self._active_model_name and self._active_model_name != target.name:
             current = self.find_model(self._active_model_name)
             self._sleep(current)
+            # Do not sample admission while the previous engine is still
+            # asynchronously reclaiming memory. Switching admission is only
+            # valid after the proxy verifies the engine's sleep state.
+            self._wait_until_sleeping(current)
             self._active_model_name = None
             self._active_model_ready = False
 
