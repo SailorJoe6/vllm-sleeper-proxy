@@ -10,7 +10,7 @@ from dataclasses import replace
 
 from vllm_sleeper_proxy.client import HttpResponse
 from vllm_sleeper_proxy.config import ModelConfig
-from vllm_sleeper_proxy.manager import ModelManager, UnknownModelError, WakeError
+from vllm_sleeper_proxy.manager import ModelManager, UnknownModelError, WakeError, startup_lease
 
 
 class FakeHttp:
@@ -475,6 +475,35 @@ class ModelManagerTests(unittest.TestCase):
             urls.index("http://vision:8000/sleep?level=2"),
             urls.index("http://vllm:8888/wake_up?tags=weights"),
         )
+
+    def test_startup_lease_serializes_instances_and_recovers_stale_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            lease_path = Path(directory) / "startup.lock"
+            lease_path.write_text("pid=stale\n", encoding="utf-8")
+            entered = threading.Event()
+            release = threading.Event()
+
+            def holder() -> None:
+                with startup_lease(str(lease_path)):
+                    entered.set()
+                    release.wait(timeout=2)
+
+            thread = threading.Thread(target=holder)
+            thread.start()
+            self.assertTrue(entered.wait(timeout=1))
+            contender_entered = threading.Event()
+
+            def contender() -> None:
+                with startup_lease(str(lease_path)):
+                    contender_entered.set()
+
+            contender_thread = threading.Thread(target=contender)
+            contender_thread.start()
+            self.assertFalse(contender_entered.wait(timeout=0.05))
+            release.set()
+            contender_thread.join(timeout=1)
+            thread.join(timeout=1)
+            self.assertTrue(contender_entered.is_set())
 
     def test_startup_lease_is_created_and_startup_state_clears_after_readiness(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
