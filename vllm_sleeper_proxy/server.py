@@ -51,7 +51,11 @@ class SleeperProxyHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802 - stdlib API
         path = urlsplit(self.path).path
         if path == "/healthz":
-            self._send_json(200, {"ok": True, "active_model": self.manager.active_model_name})
+            self._send_json(200, {
+                "ok": True,
+                "active_model": self.manager.active_model_name,
+                "starting_model": self.manager.starting_model_name,
+            })
         elif path == "/v1/models":
             self._send_json(200, self.manager.list_openai_models())
         elif path == "/api/tags":
@@ -279,6 +283,9 @@ def main(argv: Iterable[str] | None = None) -> int:
         always_wake=os.environ.get("SLEEPER_ALWAYS_WAKE", "1") != "0",
         wake_strategy=os.environ.get("SLEEPER_WAKE_STRATEGY", "level2"),
         admission_check=admission_check,
+        startup_lease_path=os.environ.get(
+            "SLEEPER_STARTUP_LEASE_PATH", "/tmp/vllm-sleeper-proxy-startup.lock"
+        ),
     )
     httpd = build_server(
         host,

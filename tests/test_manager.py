@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import threading
 import time
+import tempfile
 import unittest
+from pathlib import Path
 
 from vllm_sleeper_proxy.client import HttpResponse
 from vllm_sleeper_proxy.config import ModelConfig
@@ -106,6 +108,17 @@ class PerModelSleepHttp(FakeHttp):
         if "/sleep?" in url:
             self.states[model] = True
             return HttpResponse(200, {}, b"{}")
+        if "wake_up" in url:
+            self.states[model] = False
+            return HttpResponse(200, {}, b"{}")
+        if url.endswith("/collective_rpc") or url.endswith("/reset_mm_cache"):
+            return HttpResponse(200, {}, b"{}")
+        if url.endswith("/v1/models"):
+            upstream = (
+                "Qwen/Qwen3-VL-4B-Instruct" if model == "vision"
+                else "Qwen3-Embedding-8B"
+            )
+            return HttpResponse(200, {}, json.dumps({"data": [{"id": upstream}]}).encode())
         raise AssertionError(f"unexpected request: {method} {url}")
 
 
@@ -442,6 +455,75 @@ class ModelManagerTests(unittest.TestCase):
                 manager.acquire("chess-vlm-bootstrap")
         finally:
             lease.release()
+
+    def test_start_reconciles_other_configured_models_even_with_separate_proxy_state(self) -> None:
+        http = PerModelSleepHttp({"embedding": True, "vision": False})
+        with tempfile.TemporaryDirectory() as directory:
+            manager = ModelManager(
+                [qwen_model(), vision_model()],
+                http,
+                startup_lease_path=f"{directory}/startup.lock",
+                poll_interval_s=0,
+                wake_timeout_s=1,
+            )
+            manager.acquire("Qwen3-Embedding-8B").release()
+        urls = [url for _, url, _ in http.calls]
+        self.assertLess(
+            urls.index("http://vision:8000/sleep?level=2"),
+            urls.index("http://vllm:8888/wake_up?tags=weights"),
+        )
+
+    def test_startup_lease_is_created_and_startup_state_clears_after_readiness(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            lease_path = f"{directory}/startup.lock"
+            manager = ModelManager(
+                [qwen_model()],
+                FakeHttp(),
+                startup_lease_path=lease_path,
+                poll_interval_s=0,
+                wake_timeout_s=1,
+            )
+            self.assertIsNone(manager.starting_model_name)
+            manager.acquire("Qwen3-Embedding-8B").release()
+            self.assertIsNone(manager.starting_model_name)
+            self.assertTrue(Path(lease_path).exists())
+
+    def test_startup_reconciliation_holds_and_releases_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            lease_path = f"{directory}/startup.lock"
+            manager = ModelManager(
+                [qwen_model()],
+                FakeHttp(),
+                startup_lease_path=lease_path,
+                poll_interval_s=0,
+                wake_timeout_s=1,
+            )
+            manager.reconcile_startup_state()
+            self.assertIsNone(manager.starting_model_name)
+            self.assertIsNone(manager.active_model_name)
+            self.assertTrue(Path(lease_path).exists())
+
+    def test_startup_state_is_held_until_readiness_validation(self) -> None:
+        http = FakeHttp()
+        with tempfile.TemporaryDirectory() as directory:
+            manager = ModelManager(
+                [qwen_model()],
+                http,
+                startup_lease_path=f"{directory}/startup.lock",
+                poll_interval_s=0,
+                wake_timeout_s=1,
+            )
+            seen: list[str | None] = []
+            original_wait = manager._wait_until_model_listed
+
+            def observe_readiness(model: ModelConfig) -> None:
+                seen.append(manager.starting_model_name)
+                original_wait(model)
+
+            manager._wait_until_model_listed = observe_readiness  # type: ignore[method-assign]
+            manager.acquire("Qwen3-Embedding-8B").release()
+            self.assertEqual(seen, ["Qwen3-Embedding-8B"])
+            self.assertIsNone(manager.starting_model_name)
 
     def test_lifecycle_transport_failure_becomes_wake_error(self) -> None:
         class BrokenLifecycle(FakeHttp):

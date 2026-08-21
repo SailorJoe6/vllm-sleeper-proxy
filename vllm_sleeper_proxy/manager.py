@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import fcntl
 import json
+import os
 import threading
 import time
-from typing import Callable, Iterable
+from contextlib import contextmanager
+from typing import Callable, Iterable, Iterator
 from urllib.parse import urlencode
 
 from .client import HttpClient, sleep_until
@@ -16,6 +19,29 @@ class UnknownModelError(ValueError):
 
 class WakeError(RuntimeError):
     pass
+
+
+@contextmanager
+def startup_lease(path: str) -> Iterator[None]:
+    """Hold an OS lease across model startup and readiness validation.
+
+    The lock is released automatically if the proxy process crashes. Deployments
+    spanning containers should mount the same host path into every proxy and set
+    ``SLEEPER_STARTUP_LEASE_PATH`` accordingly.
+    """
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(path, "a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        handle.seek(0)
+        handle.truncate()
+        handle.write(f"pid={os.getpid()}\n")
+        handle.flush()
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 class ModelLease:
@@ -59,6 +85,7 @@ class ModelManager:
         always_wake: bool = True,
         wake_strategy: str = "level2",
         admission_check: Callable[[ModelConfig], None] | None = None,
+        startup_lease_path: str | None = None,
     ) -> None:
         self.models = list(models)
         if not self.models:
@@ -72,8 +99,12 @@ class ModelManager:
         self.always_wake = always_wake
         self.wake_strategy = wake_strategy
         self.admission_check = admission_check
+        self.startup_lease_path = startup_lease_path or os.environ.get(
+            "SLEEPER_STARTUP_LEASE_PATH", "/tmp/vllm-sleeper-proxy-startup.lock"
+        )
         self._condition = threading.Condition()
         self._active_model_name: str | None = None
+        self._starting_model_name: str | None = None
         self._active_model_ready = False
         self._inflight_requests = 0
         self._pending_switch_name: str | None = None
@@ -84,6 +115,12 @@ class ModelManager:
         return self._active_model_name
 
     @property
+    def starting_model_name(self) -> str | None:
+        """Model that owns the startup lease until readiness is verified."""
+        with self._condition:
+            return self._starting_model_name
+
+    @property
     def inflight_requests(self) -> int:
         with self._condition:
             return self._inflight_requests
@@ -91,23 +128,29 @@ class ModelManager:
     def reconcile_startup_state(self) -> None:
         """Put every configured engine to sleep before the proxy serves traffic."""
 
-        with self._condition:
-            if self._inflight_requests or self._pending_switch_name is not None:
-                raise WakeError("cannot reconcile startup state while requests are active")
+        with startup_lease(self.startup_lease_path):
+            with self._condition:
+                self._starting_model_name = "__system_startup__"
+                try:
+                    if self._inflight_requests or self._pending_switch_name is not None:
+                        raise WakeError("cannot reconcile startup state while requests are active")
 
-            for model in self.models:
-                sleeping = self._is_sleeping(model)
-                if sleeping is None:
-                    raise WakeError(
-                        f"cannot verify startup sleep state for {model.name}: "
-                        "/is_sleeping did not return a boolean state"
-                    )
-                if not sleeping:
-                    self._sleep(model)
-                    self._wait_until_sleeping(model)
+                    for model in self.models:
+                        sleeping = self._is_sleeping(model)
+                        if sleeping is None:
+                            raise WakeError(
+                                f"cannot verify startup sleep state for {model.name}: "
+                                "/is_sleeping did not return a boolean state"
+                            )
+                        if not sleeping:
+                            self._sleep(model)
+                            self._wait_until_sleeping(model)
 
-            self._active_model_name = None
-            self._active_model_ready = False
+                    self._active_model_name = None
+                    self._active_model_ready = False
+                finally:
+                    self._starting_model_name = None
+                    self._condition.notify_all()
 
     def find_model(self, requested: str) -> ModelConfig:
         for model in self.models:
@@ -163,29 +206,35 @@ class ModelManager:
         return ModelLease(self, target)
 
     def sleep_active_model(self) -> str | None:
-        """Quiesce new requests, drain current ownership, and sleep the active model."""
+        """Quiesce new requests, drain ownership, and sleep the active model.
 
-        with self._condition:
-            deadline = time.monotonic() + self.drain_timeout_s
-            self._quiescing = True
-            try:
-                while self._inflight_requests > 0:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        raise WakeError("timed out draining requests before resource backoff")
-                    self._condition.wait(timeout=remaining)
-                if self._active_model_name is None:
-                    return None
-                current = self.find_model(self._active_model_name)
-                self._sleep(current)
-                self._wait_until_sleeping(current)
-                slept = current.name
-                self._active_model_name = None
-                self._active_model_ready = False
-                return slept
-            finally:
-                self._quiescing = False
-                self._condition.notify_all()
+        The same host-wide lease used for startup prevents another proxy
+        instance from sleeping an engine while a different instance is still
+        starting it.
+        """
+
+        with startup_lease(self.startup_lease_path):
+            with self._condition:
+                deadline = time.monotonic() + self.drain_timeout_s
+                self._quiescing = True
+                try:
+                    while self._inflight_requests > 0:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise WakeError("timed out draining requests before resource backoff")
+                        self._condition.wait(timeout=remaining)
+                    if self._active_model_name is None:
+                        return None
+                    current = self.find_model(self._active_model_name)
+                    self._sleep(current)
+                    self._wait_until_sleeping(current)
+                    slept = current.name
+                    self._active_model_name = None
+                    self._active_model_ready = False
+                    return slept
+                finally:
+                    self._quiescing = False
+                    self._condition.notify_all()
 
     def release(self, target: ModelConfig) -> None:
         with self._condition:
@@ -227,7 +276,8 @@ class ModelManager:
 
     def _activate_locked(self, target: ModelConfig) -> ModelConfig:
         try:
-            return self._ensure_awake_locked(target)
+            with startup_lease(self.startup_lease_path):
+                return self._ensure_awake_locked(target)
         except WakeError:
             raise
         except (ConnectionError, OSError, TimeoutError, TypeError, ValueError) as exc:
@@ -238,6 +288,17 @@ class ModelManager:
                 self._condition.notify_all()
 
     def _ensure_awake_locked(self, target: ModelConfig) -> ModelConfig:
+        needs_startup = self._active_model_name != target.name or not self._active_model_ready
+        if not needs_startup:
+            return target
+        self._starting_model_name = target.name
+        try:
+            return self._ensure_awake_startup_locked(target)
+        finally:
+            self._starting_model_name = None
+            self._condition.notify_all()
+
+    def _ensure_awake_startup_locked(self, target: ModelConfig) -> ModelConfig:
         if self._active_model_name and self._active_model_name != target.name:
             current = self.find_model(self._active_model_name)
             self._sleep(current)
@@ -247,6 +308,22 @@ class ModelManager:
             self._wait_until_sleeping(current)
             self._active_model_name = None
             self._active_model_ready = False
+
+        # The lease is host-wide, so do not trust another proxy instance's
+        # in-process active-model bookkeeping. Reconcile every other configured
+        # engine before allocating the target.
+        for model in self.models:
+            if model.name == target.name:
+                continue
+            sleeping = self._is_sleeping(model)
+            if sleeping is None:
+                raise WakeError(
+                    f"cannot verify that {model.name} is asleep before starting "
+                    f"{target.name}"
+                )
+            if not sleeping:
+                self._sleep(model)
+                self._wait_until_sleeping(model)
 
         should_wake = self._active_model_name != target.name
         if self._active_model_name is None:

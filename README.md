@@ -17,6 +17,26 @@ repairs model state lost across proxy, container, Docker, or host restarts.
 
 ---
 
+## Lifecycle safety lease
+
+The proxy treats model startup as an exclusive lifecycle state, not as an
+ordinary wake request. A startup lease is acquired before the first wake or
+model switch and is held until the target engine has passed `/is_sleeping`,
+`/v1/models` readiness, and configured smoke/resource checks. While that lease
+is held:
+
+* all other models remain hibernated;
+* competing wake requests wait behind the lease;
+* the starting model cannot be hibernated by another request; and
+* `/healthz` reports the `starting_model` separately from `active_model`.
+
+The lease is an OS file lock. Set `SLEEPER_STARTUP_LEASE_PATH` to a path shared
+by all proxy instances on the host (for example a mounted `/run` directory).
+The operating system releases the lock if the proxy crashes, so recovery does
+not leave a permanent lease. Recovery still fails closed: it never wakes more
+than one model automatically. Whole-system startup uses the same lease while
+reconciling every configured engine to level-2 sleep.
+
 ## Current implementation
 
 This repo now includes a minimal, dependency-light Python sleeper proxy plus a
