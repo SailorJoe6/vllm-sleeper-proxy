@@ -558,6 +558,52 @@ class ModelManagerTests(unittest.TestCase):
         self.assertGreaterEqual(len(admissions), 2)
         self.assertTrue(all(item == model.name for item in admissions))
 
+    def test_sleep_waits_until_startup_readiness_finishes(self) -> None:
+        class BlockingReadinessHttp(FakeHttp):
+            def __init__(self) -> None:
+                super().__init__()
+                self.readiness_started = threading.Event()
+                self.allow_readiness = threading.Event()
+
+            def request(self, method, url, *, headers=None, body=None, timeout=None):
+                if url.endswith("/v1/models"):
+                    self.readiness_started.set()
+                    self.allow_readiness.wait(timeout=2)
+                return super().request(method, url, headers=headers, body=body, timeout=timeout)
+
+        http = BlockingReadinessHttp()
+        with tempfile.TemporaryDirectory() as directory:
+            manager = ModelManager(
+                [qwen_model()],
+                http,
+                startup_lease_path=f"{directory}/startup.lock",
+                poll_interval_s=0,
+                wake_timeout_s=1,
+            )
+            startup_done = threading.Event()
+            sleeper_done = threading.Event()
+
+            def start() -> None:
+                manager.acquire("Qwen3-Embedding-8B").release()
+                startup_done.set()
+
+            def sleep() -> None:
+                manager.sleep_active_model()
+                sleeper_done.set()
+
+            startup_thread = threading.Thread(target=start)
+            startup_thread.start()
+            self.assertTrue(http.readiness_started.wait(timeout=1))
+            sleep_thread = threading.Thread(target=sleep)
+            sleep_thread.start()
+            self.assertFalse(sleeper_done.wait(timeout=0.05))
+            self.assertFalse(any(url.endswith("/sleep?level=2") for _, url, _ in http.calls))
+            http.allow_readiness.set()
+            startup_thread.join(timeout=2)
+            sleep_thread.join(timeout=2)
+            self.assertTrue(startup_done.is_set())
+            self.assertTrue(sleeper_done.is_set())
+
     def test_startup_state_is_held_until_readiness_validation(self) -> None:
         http = FakeHttp()
         with tempfile.TemporaryDirectory() as directory:
