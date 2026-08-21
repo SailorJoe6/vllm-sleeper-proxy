@@ -208,33 +208,44 @@ class ModelManager:
     def sleep_active_model(self) -> str | None:
         """Quiesce new requests, drain ownership, and sleep the active model.
 
-        The same host-wide lease used for startup prevents another proxy
-        instance from sleeping an engine while a different instance is still
-        starting it.
+        Local request state is acquired before the host-wide lease. This keeps
+        lock ordering identical to startup and avoids a condition/lease
+        deadlock when another proxy instance is starting a model.
         """
 
-        with startup_lease(self.startup_lease_path):
+        with self._condition:
+            deadline = time.monotonic() + self.drain_timeout_s
+            self._quiescing = True
+            try:
+                while self._inflight_requests > 0:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise WakeError("timed out draining requests before resource backoff")
+                    self._condition.wait(timeout=remaining)
+                if self._active_model_name is None:
+                    return None
+                current = self.find_model(self._active_model_name)
+            except Exception:
+                self._quiescing = False
+                self._condition.notify_all()
+                raise
+
+        try:
+            with startup_lease(self.startup_lease_path):
+                self._sleep(current)
+                self._wait_until_sleeping(current)
+        except Exception:
             with self._condition:
-                deadline = time.monotonic() + self.drain_timeout_s
-                self._quiescing = True
-                try:
-                    while self._inflight_requests > 0:
-                        remaining = deadline - time.monotonic()
-                        if remaining <= 0:
-                            raise WakeError("timed out draining requests before resource backoff")
-                        self._condition.wait(timeout=remaining)
-                    if self._active_model_name is None:
-                        return None
-                    current = self.find_model(self._active_model_name)
-                    self._sleep(current)
-                    self._wait_until_sleeping(current)
-                    slept = current.name
-                    self._active_model_name = None
-                    self._active_model_ready = False
-                    return slept
-                finally:
-                    self._quiescing = False
-                    self._condition.notify_all()
+                self._quiescing = False
+                self._condition.notify_all()
+            raise
+
+        with self._condition:
+            self._active_model_name = None
+            self._active_model_ready = False
+            self._quiescing = False
+            self._condition.notify_all()
+        return current.name
 
     def release(self, target: ModelConfig) -> None:
         with self._condition:
