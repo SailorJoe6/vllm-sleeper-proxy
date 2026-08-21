@@ -32,6 +32,11 @@ is held:
 
 The lease is an OS file lock. Set `SLEEPER_STARTUP_LEASE_PATH` to a path shared
 by all proxy instances on the host (for example a mounted `/run` directory).
+For each model that needs an explicit startup smoke request, add
+`startup_smoke_path` and `startup_smoke_body` to its `SLEEPER_MODELS` entry.
+The proxy runs that request and re-runs the admission check before releasing
+the startup lease. A smoke failure leaves the model unmarked and attempts to
+put it back to sleep.
 The operating system releases the lock if the proxy crashes, so recovery does
 not leave a permanent lease. Recovery still fails closed: it never wakes more
 than one model automatically. Whole-system startup uses the same lease while

@@ -294,6 +294,18 @@ class ModelManager:
         self._starting_model_name = target.name
         try:
             return self._ensure_awake_startup_locked(target)
+        except Exception:
+            # A failed startup must not leave a partially resident model marked
+            # active. Best-effort sleep keeps recovery conservative; preserve
+            # the original failure if cleanup itself fails.
+            try:
+                if self._active_model_name == target.name and self._is_sleeping(target) is False:
+                    self._sleep(target)
+                    self._wait_until_sleeping(target)
+            finally:
+                self._active_model_name = None
+                self._active_model_ready = False
+            raise
         finally:
             self._starting_model_name = None
             self._condition.notify_all()
@@ -352,6 +364,11 @@ class ModelManager:
 
         if not self._active_model_ready:
             self._wait_until_model_listed(target)
+            self._run_startup_smoke(target)
+            if self.admission_check is not None:
+                # Revalidate after startup allocations and warmup, not only
+                # before wake, so the lease is released only from a safe state.
+                self.admission_check(target)
             self._active_model_ready = True
 
         return target
@@ -455,6 +472,24 @@ class ModelManager:
 
         if not sleep_until(ready, timeout_s=self.wake_timeout_s, interval_s=self.poll_interval_s):
             raise WakeError(f"timed out waiting for {model.name} to leave sleep state")
+
+    def _run_startup_smoke(self, model: ModelConfig) -> None:
+        if not model.startup_smoke_path:
+            return
+        body = dict(model.startup_smoke_body or {})
+        body.setdefault("model", model.upstream_model)
+        resp = self.http.request(
+            "POST",
+            f"{model.upstream_base_url}{model.startup_smoke_path}",
+            headers={"content-type": "application/json"},
+            body=json.dumps(body, separators=(",", ":")).encode(),
+            timeout=self.request_timeout_s,
+        )
+        if resp.status >= 400:
+            raise WakeError(
+                f"startup smoke failed for {model.name}: "
+                f"HTTP {resp.status}: {resp.body[:300]!r}"
+            )
 
     def _wait_until_model_listed(self, model: ModelConfig) -> None:
         def listed() -> bool:

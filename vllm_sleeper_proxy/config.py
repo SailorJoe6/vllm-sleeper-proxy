@@ -16,6 +16,8 @@ class ModelConfig:
     control_base_url: str
     aliases: tuple[str, ...] = field(default_factory=tuple)
     owned_by: str = "vllm-sleeper-proxy"
+    startup_smoke_path: str | None = None
+    startup_smoke_body: dict[str, Any] | None = None
 
     @property
     def all_names(self) -> tuple[str, ...]:
@@ -41,6 +43,12 @@ def _model_from_mapping(raw: dict[str, Any]) -> ModelConfig:
     )
     aliases = tuple(str(a) for a in raw.get("aliases", ()))
     owned_by = str(raw.get("owned_by") or "vllm-sleeper-proxy")
+    smoke_path = raw.get("startup_smoke_path")
+    smoke_body = raw.get("startup_smoke_body")
+    if smoke_path is not None and not isinstance(smoke_path, str):
+        raise ValueError("startup_smoke_path must be a string")
+    if smoke_body is not None and not isinstance(smoke_body, dict):
+        raise ValueError("startup_smoke_body must be an object")
     return ModelConfig(
         name=name,
         upstream_model=upstream_model,
@@ -48,6 +56,8 @@ def _model_from_mapping(raw: dict[str, Any]) -> ModelConfig:
         control_base_url=control_base_url,
         aliases=aliases,
         owned_by=owned_by,
+        startup_smoke_path=smoke_path,
+        startup_smoke_body=smoke_body,
     )
 
 

@@ -6,6 +6,7 @@ import time
 import tempfile
 import unittest
 from pathlib import Path
+from dataclasses import replace
 
 from vllm_sleeper_proxy.client import HttpResponse
 from vllm_sleeper_proxy.config import ModelConfig
@@ -40,6 +41,8 @@ class FakeHttp:
                 {},
                 b'{"object":"list","data":[{"id":"Qwen/Qwen3-Embedding-8B"}]}',
             )
+        if url.endswith("/v1/embeddings"):
+            return HttpResponse(200, {}, b'{"object":"list","data":[]}')
         raise AssertionError(f"unexpected request: {method} {url}")
 
 
@@ -503,6 +506,29 @@ class ModelManagerTests(unittest.TestCase):
             self.assertIsNone(manager.active_model_name)
             self.assertTrue(Path(lease_path).exists())
 
+    def test_startup_smoke_and_post_start_admission_run_before_lease_release(self) -> None:
+        http = FakeHttp()
+        model = replace(
+            qwen_model(),
+            startup_smoke_path="/embeddings",
+            startup_smoke_body={"input": "startup"},
+        )
+        admissions: list[str] = []
+        with tempfile.TemporaryDirectory() as directory:
+            manager = ModelManager(
+                [model],
+                http,
+                startup_lease_path=f"{directory}/startup.lock",
+                admission_check=lambda target: admissions.append(target.name),
+                poll_interval_s=0,
+                wake_timeout_s=1,
+            )
+            manager.acquire(model.name).release()
+        smoke_urls = [url for _, url, _ in http.calls if url.endswith("/v1/embeddings")]
+        self.assertEqual(smoke_urls, ["http://vllm:8888/v1/embeddings"])
+        self.assertGreaterEqual(len(admissions), 2)
+        self.assertTrue(all(item == model.name for item in admissions))
+
     def test_startup_state_is_held_until_readiness_validation(self) -> None:
         http = FakeHttp()
         with tempfile.TemporaryDirectory() as directory:
@@ -566,14 +592,14 @@ class ModelManagerTests(unittest.TestCase):
         manager.acquire("Qwen3-Embedding-8B").release()
         with self.assertRaisesRegex(WakeError, "vision discovery unavailable"):
             manager.acquire("chess-vlm-bootstrap")
-        self.assertEqual(manager.active_model_name, "chess-vlm-bootstrap")
+        self.assertIsNone(manager.active_model_name)
 
+        all_urls = [url for _, url, _ in http.calls]
         before_retry = len(http.calls)
         manager.acquire("Qwen3-Embedding-8B").release()
         retry_urls = [url for _, url, _ in http.calls[before_retry:]]
-        vision_sleep = retry_urls.index("http://vision:8000/sleep?level=2")
-        embedding_wake = retry_urls.index("http://vllm:8888/wake_up?tags=weights")
-        self.assertLess(vision_sleep, embedding_wake)
+        self.assertIn("http://vision:8000/sleep?level=2", all_urls)
+        self.assertIn("http://vllm:8888/wake_up?tags=weights", retry_urls)
 
 
 if __name__ == "__main__":
