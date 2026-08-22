@@ -286,6 +286,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         startup_lease_path=os.environ.get(
             "SLEEPER_STARTUP_LEASE_PATH", "/tmp/vllm-sleeper-proxy-startup.lock"
         ),
+        transition_state_path=os.environ.get("SLEEPER_TRANSITION_STATE_PATH"),
     )
     httpd = build_server(
         host,

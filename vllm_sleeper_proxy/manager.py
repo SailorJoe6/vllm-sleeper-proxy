@@ -86,6 +86,7 @@ class ModelManager:
         wake_strategy: str = "level2",
         admission_check: Callable[[ModelConfig], None] | None = None,
         startup_lease_path: str | None = None,
+        transition_state_path: str | None = None,
     ) -> None:
         self.models = list(models)
         if not self.models:
@@ -102,6 +103,7 @@ class ModelManager:
         self.startup_lease_path = startup_lease_path or os.environ.get(
             "SLEEPER_STARTUP_LEASE_PATH", "/tmp/vllm-sleeper-proxy-startup.lock"
         )
+        self.transition_state_path = transition_state_path or os.environ.get("SLEEPER_TRANSITION_STATE_PATH")
         self._condition = threading.Condition()
         self._active_model_name: str | None = None
         self._starting_model_name: str | None = None
@@ -125,12 +127,38 @@ class ModelManager:
         with self._condition:
             return self._inflight_requests
 
+    def _publish_transition(self, phase: str, model_name: str | None = None) -> None:
+        """Atomically publish lifecycle ownership for the host guard.
+
+        The file is advisory only; the guard still fails closed for stale,
+        malformed, or mismatched records. Atomic replacement prevents readers
+        from observing a partially written transition.
+        """
+        if not self.transition_state_path:
+            return
+        path = self.transition_state_path
+        parent = os.path.dirname(path) or "."
+        os.makedirs(parent, exist_ok=True)
+        payload = {
+            "phase": phase,
+            "model": model_name,
+            "updated_at_epoch": time.time(),
+            "pid": os.getpid(),
+        }
+        temporary = f"{path}.tmp.{os.getpid()}.{threading.get_ident()}"
+        with open(temporary, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, separators=(",", ":"))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+
     def reconcile_startup_state(self) -> None:
         """Put every configured engine to sleep before the proxy serves traffic."""
 
         with startup_lease(self.startup_lease_path):
             with self._condition:
                 self._starting_model_name = "__system_startup__"
+                self._publish_transition("starting", "__system_startup__")
                 try:
                     if self._inflight_requests or self._pending_switch_name is not None:
                         raise WakeError("cannot reconcile startup state while requests are active")
@@ -150,6 +178,7 @@ class ModelManager:
                     self._active_model_ready = False
                 finally:
                     self._starting_model_name = None
+                    self._publish_transition("idle")
                     self._condition.notify_all()
 
     def find_model(self, requested: str) -> ModelConfig:
@@ -231,6 +260,7 @@ class ModelManager:
                 raise
 
         try:
+            self._publish_transition("sleeping", current.name)
             with startup_lease(self.startup_lease_path):
                 self._sleep(current)
                 self._wait_until_sleeping(current)
@@ -243,6 +273,7 @@ class ModelManager:
         with self._condition:
             self._active_model_name = None
             self._active_model_ready = False
+            self._publish_transition("idle")
             self._quiescing = False
             self._condition.notify_all()
         return current.name
@@ -303,6 +334,7 @@ class ModelManager:
         if not needs_startup:
             return target
         self._starting_model_name = target.name
+        self._publish_transition("starting", target.name)
         try:
             return self._ensure_awake_startup_locked(target)
         except Exception:
@@ -319,6 +351,7 @@ class ModelManager:
             raise
         finally:
             self._starting_model_name = None
+            self._publish_transition("idle")
             self._condition.notify_all()
 
     def _ensure_awake_startup_locked(self, target: ModelConfig) -> ModelConfig:
@@ -381,6 +414,7 @@ class ModelManager:
                 # before wake, so the lease is released only from a safe state.
                 self.admission_check(target)
             self._active_model_ready = True
+            self._publish_transition("ready", target.name)
 
         return target
 
