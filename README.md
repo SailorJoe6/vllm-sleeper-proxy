@@ -17,6 +17,8 @@ repairs model state lost across proxy, container, Docker, or host restarts.
 
 ---
 
+See [Proxy requirements](docs/requirements.md) for normative lifecycle ownership and deployment traceability.
+
 ## Lifecycle safety lease
 
 The proxy treats model startup as an exclusive lifecycle state, not as an
