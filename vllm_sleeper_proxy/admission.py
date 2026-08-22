@@ -20,7 +20,7 @@ class FileAdmissionGuard:
         *,
         now=time.time,
         sleep=time.sleep,
-        unknown_state_refreshes: int = 3,
+        unknown_state_refreshes: int = 35,
         unknown_state_refresh_delay_seconds: float = 2.0,
     ) -> None:
         self.status_path = status_path
