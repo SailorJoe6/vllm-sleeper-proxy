@@ -38,6 +38,24 @@ class AdmissionTests(unittest.TestCase):
             path = self.write_status(Path(directory), self.status())
             FileAdmissionGuard(path, now=lambda: 110.0)(MODEL)
 
+    def test_refreshes_transient_unknown_model_state_once(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            denied = self.status(allowed=False)
+            denied["model_admission"][MODEL.name]["reason"] = "unknown_model_state"
+            path = self.write_status(root, denied)
+            def refresh(_: float) -> None:
+                path.write_text(json.dumps(self.status(allowed=True)), encoding="utf-8")
+            FileAdmissionGuard(path, now=lambda: 110.0, sleep=refresh)(MODEL)
+
+    def test_unknown_model_state_remains_fail_closed_after_refresh(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            denied = self.status(allowed=False)
+            denied["model_admission"][MODEL.name]["reason"] = "unknown_model_state"
+            path = self.write_status(Path(directory), denied)
+            with self.assertRaisesRegex(AdmissionError, "unknown_model_state"):
+                FileAdmissionGuard(path, now=lambda: 110.0, sleep=lambda _: None)(MODEL)
+
     def test_denies_explicit_model_decision(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = self.write_status(Path(directory), self.status(allowed=False))
