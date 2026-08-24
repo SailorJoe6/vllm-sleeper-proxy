@@ -19,6 +19,22 @@ repairs model state lost across proxy, container, Docker, or host restarts.
 
 See [Proxy requirements](docs/requirements.md) for normative lifecycle ownership and deployment traceability.
 
+A deployment must declare its required engine lineup. Startup/readiness fails if
+any required engine is absent or cannot be reconciled. For a request, the proxy
+routes directly when the requested model is already the sole awake and ready
+model; otherwise it drains and sleeps the current model, rechecks admission,
+wakes the requested model, waits for full readiness, and only then forwards the
+request. An optional model is a deployment-specific exception and must never be
+used to describe a required lineup member.
+
+## Documentation map
+
+- [Requirements](docs/requirements.md): normative lifecycle and deployment rules.
+- [Multimodal chat transport](docs/multimodal-chat.md): request formats, streaming,
+  image handling, and transport limits.
+- [Design notes](docs/design%20ideas.md): exploratory implementation notes; the
+  requirements document takes precedence when they differ.
+
 ## Lifecycle safety lease
 
 The proxy treats model startup as an exclusive lifecycle state, not as an
