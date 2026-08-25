@@ -50,9 +50,20 @@ class SleeperProxyHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802 - stdlib API
         path = urlsplit(self.path).path
+        if path == "/startup/state" and self.manager.bootstrap_mode:
+            try:
+                model = urlsplit(self.path).query
+                from urllib.parse import parse_qs
+                requested = parse_qs(model).get("model", [None])[0]
+                self._send_json(200, self.manager.startup_state(requested))
+            except (UnknownModelError, WakeError) as exc:
+                self._send_error(503, str(exc), "startup_unavailable")
+            return
         if path == "/healthz":
-            self._send_json(200, {
-                "ok": True,
+            finalized = self.manager.startup_finalized
+            self._send_json(200 if finalized else 503, {
+                "ok": finalized,
+                "ready": finalized,
                 "active_model": self.manager.active_model_name,
                 "starting_model": self.manager.starting_model_name,
             })
@@ -65,6 +76,25 @@ class SleeperProxyHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802 - stdlib API
         path = urlsplit(self.path).path
+        if self.manager.bootstrap_mode and path == "/startup/sleep":
+            from urllib.parse import parse_qs
+            requested = parse_qs(urlsplit(self.path).query).get("model", [None])[0]
+            if not requested:
+                self._send_error(400, "startup sleep requires model", "invalid_request")
+                return
+            try:
+                slept = self.manager.startup_sleep_model(requested)
+                self._send_json(200, {"ok": True, "slept_model": slept})
+            except (UnknownModelError, WakeError) as exc:
+                self._send_error(503, str(exc), "startup_sleep_failed")
+            return
+        if self.manager.bootstrap_mode and path == "/startup/finalize":
+            try:
+                self.manager.finalize_startup()
+                self._send_json(200, {"ok": True, "finalized": True})
+            except WakeError as exc:
+                self._send_error(503, str(exc), "startup_finalize_failed")
+            return
         if path == "/sleep":
             try:
                 slept_model = self.manager.sleep_active_model()
@@ -72,6 +102,9 @@ class SleeperProxyHandler(BaseHTTPRequestHandler):
                 self._send_error(503, str(exc), "sleep_failed", {"retry-after": "10"})
                 return
             self._send_json(200, {"ok": True, "slept_model": slept_model})
+            return
+        if self.manager.bootstrap_mode and not self.manager.startup_finalized and path in PROXIED_POST_PATHS:
+            self._send_error(503, "required lineup startup is not finalized", "startup_not_finalized")
             return
         if path not in PROXIED_POST_PATHS:
             self._send_json(404, {"error": {"message": f"not found: {path}"}})
@@ -253,7 +286,8 @@ def build_server(
     # Reconcile before ThreadingHTTPServer binds its listening socket. If any
     # engine cannot be verified asleep, startup fails closed and no request can
     # observe an incorrect active_model=None state.
-    manager.reconcile_startup_state()
+    if not manager.bootstrap_mode:
+        manager.reconcile_startup_state()
 
     class Handler(SleeperProxyHandler):
         pass
@@ -287,6 +321,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             "SLEEPER_STARTUP_LEASE_PATH", "/tmp/vllm-sleeper-proxy-startup.lock"
         ),
         transition_state_path=os.environ.get("SLEEPER_TRANSITION_STATE_PATH"),
+        bootstrap_mode=os.environ.get("SLEEPER_PROXY_BOOTSTRAP", "0") == "1",
     )
     httpd = build_server(
         host,

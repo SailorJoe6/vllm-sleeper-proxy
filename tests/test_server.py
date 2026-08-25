@@ -420,5 +420,69 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, 404)
 
 
+class BootstrapServerTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.http = ProxyHttp()
+        model = ModelConfig(
+            name="Qwen3-Embedding-8B",
+            upstream_model="Qwen/Qwen3-Embedding-8B",
+            upstream_base_url="http://vllm:8888/v1",
+            control_base_url="http://vllm:8888",
+        )
+        self.manager = ModelManager(
+            [model], self.http, poll_interval_s=0, wake_timeout_s=1, bootstrap_mode=True
+        )
+        self.server = build_server("127.0.0.1", 0, self.manager)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.base_url = f"http://127.0.0.1:{self.server.server_address[1]}"
+
+    def tearDown(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+
+    def test_bootstrap_state_and_explicit_sleep(self) -> None:
+        with urlopen(f"{self.base_url}/startup/state?model=Qwen3-Embedding-8B", timeout=2) as response:
+            state = json.loads(response.read().decode())
+        self.assertFalse(state["finalized"])
+        self.assertTrue(state["models"][0]["is_sleeping"])
+        req = Request(
+            f"{self.base_url}/startup/sleep?model=Qwen3-Embedding-8B",
+            data=b"",
+            method="POST",
+        )
+        with urlopen(req, timeout=2) as response:
+            payload = json.loads(response.read().decode())
+        self.assertEqual(payload["slept_model"], "Qwen3-Embedding-8B")
+
+    def test_inference_is_denied_until_finalize(self) -> None:
+        req = Request(
+            f"{self.base_url}/v1/embeddings",
+            data=b'{"model":"Qwen3-Embedding-8B","input":"hello"}',
+            headers={"content-type": "application/json"},
+            method="POST",
+        )
+        with self.assertRaises(HTTPError) as caught:
+            urlopen(req, timeout=2)
+        self.assertEqual(caught.exception.code, 503)
+        self.assertEqual(json.loads(caught.exception.read())["error"]["type"], "startup_not_finalized")
+
+    def test_finalize_unlocks_inference_and_readiness(self) -> None:
+        req = Request(f"{self.base_url}/startup/finalize", data=b"", method="POST")
+        with urlopen(req, timeout=2) as response:
+            self.assertTrue(json.loads(response.read().decode())["finalized"])
+        with urlopen(f"{self.base_url}/healthz", timeout=2) as response:
+            self.assertTrue(json.loads(response.read().decode())["ready"])
+        req = Request(
+            f"{self.base_url}/v1/embeddings",
+            data=b'{"model":"Qwen3-Embedding-8B","input":"hello"}',
+            headers={"content-type": "application/json"},
+            method="POST",
+        )
+        with urlopen(req, timeout=2) as response:
+            self.assertEqual(response.status, 200)
+
+
 if __name__ == "__main__":
     unittest.main()

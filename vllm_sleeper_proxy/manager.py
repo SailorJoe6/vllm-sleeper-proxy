@@ -87,6 +87,7 @@ class ModelManager:
         admission_check: Callable[[ModelConfig], None] | None = None,
         startup_lease_path: str | None = None,
         transition_state_path: str | None = None,
+        bootstrap_mode: bool = False,
     ) -> None:
         self.models = list(models)
         if not self.models:
@@ -104,6 +105,8 @@ class ModelManager:
             "SLEEPER_STARTUP_LEASE_PATH", "/tmp/vllm-sleeper-proxy-startup.lock"
         )
         self.transition_state_path = transition_state_path or os.environ.get("SLEEPER_TRANSITION_STATE_PATH")
+        self.bootstrap_mode = bootstrap_mode
+        self._startup_finalized = not bootstrap_mode
         self._condition = threading.Condition()
         self._active_model_name: str | None = None
         self._starting_model_name: str | None = None
@@ -111,6 +114,70 @@ class ModelManager:
         self._inflight_requests = 0
         self._pending_switch_name: str | None = None
         self._quiescing = False
+
+    @property
+    def startup_finalized(self) -> bool:
+        with self._condition:
+            return self._startup_finalized
+
+    def startup_sleep_model(self, requested: str) -> str:
+        """Sleep one engine during serialized bootstrap, without waking any engine."""
+        target = self.find_model(requested)
+        with startup_lease(self.startup_lease_path):
+            with self._condition:
+                if self._inflight_requests or self._pending_switch_name is not None:
+                    raise WakeError("cannot bootstrap sleep while requests are active")
+                self._starting_model_name = target.name
+                self._publish_transition("bootstrap_sleep", target.name)
+            try:
+                sleeping = self._is_sleeping(target)
+                if sleeping is None:
+                    raise WakeError(f"cannot verify bootstrap sleep state for {target.name}")
+                if not sleeping:
+                    self._sleep(target)
+                self._wait_until_sleeping(target)
+                with self._condition:
+                    if self._active_model_name == target.name:
+                        self._active_model_name = None
+                        self._active_model_ready = False
+                return target.name
+            finally:
+                with self._condition:
+                    self._starting_model_name = None
+                    self._publish_transition("idle")
+                    self._condition.notify_all()
+
+    def startup_state(self, requested: str | None = None) -> dict[str, object]:
+        models = [self.find_model(requested)] if requested else self.models
+        states: list[dict[str, object]] = []
+        for model in models:
+            sleeping = self._is_sleeping(model)
+            states.append({"model": model.name, "is_sleeping": sleeping})
+        return {"bootstrap": self.bootstrap_mode, "finalized": self.startup_finalized, "models": states}
+
+    def finalize_startup(self) -> None:
+        """Reconcile the complete required lineup and unlock inference."""
+        with startup_lease(self.startup_lease_path):
+            with self._condition:
+                self._starting_model_name = "__system_startup__"
+                self._publish_transition("finalizing", "__system_startup__")
+            try:
+                for model in self.models:
+                    sleeping = self._is_sleeping(model)
+                    if sleeping is None:
+                        raise WakeError(f"cannot verify startup sleep state for {model.name}")
+                    if not sleeping:
+                        self._sleep(model)
+                    self._wait_until_sleeping(model)
+                with self._condition:
+                    self._active_model_name = None
+                    self._active_model_ready = False
+                    self._startup_finalized = True
+            finally:
+                with self._condition:
+                    self._starting_model_name = None
+                    self._publish_transition("idle")
+                    self._condition.notify_all()
 
     @property
     def active_model_name(self) -> str | None:
