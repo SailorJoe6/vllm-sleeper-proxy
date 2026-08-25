@@ -22,10 +22,10 @@ but must not weaken these invariants.
 
 Every deployment must explicitly declare its required engine lineup. The shared
 Sleeper Proxy owns every engine in that lineup, and startup/readiness fails if a
-required engine is absent or cannot be reconciled. A deployment may separately
-define an optional model boundary only when that model is explicitly excluded
-from the required lineup; optional models must not be used to describe a
-required engine.
+required engine is absent or cannot be reconciled. Optional-model lifecycle control is intentionally not defined here. Any
+future model that is not part of the required lineup needs a separate design
+sprint covering container presence, startup, admission, sleep/reclaim, readiness,
+and recovery before it may be added to a deployment.
 
 A second proxy is not an acceptable substitute for shared lifecycle ownership.
 If process isolation is required, it must be implemented behind one

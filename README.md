@@ -24,8 +24,8 @@ any required engine is absent or cannot be reconciled. For a request, the proxy
 routes directly when the requested model is already the sole awake and ready
 model; otherwise it drains and sleeps the current model, rechecks admission,
 wakes the requested model, waits for full readiness, and only then forwards the
-request. An optional model is a deployment-specific exception and must never be
-used to describe a required lineup member.
+request. Lifecycle control for models outside the required lineup is deferred pending a
+separate design sprint; no such model is defined by this deployment contract.
 
 ## Documentation map
 
@@ -79,7 +79,7 @@ GBrain embedding Compose integration:
 * Each request owns its active model until its buffered or streaming response
   ends. A request for another model waits before sleeping the current engine,
   preventing an in-flight response from being evicted.
-* An optional file-backed admission guard fails closed before wake when the
+* A file-backed admission guard can be enabled to fail closed before wake when the
   host resource monitor is missing, stale, or denies the requested model.
   The bundled memory monitor polls total-host `MemAvailable` and asks the
   proxy to quiesce and sleep the active model at the configured ceiling.
