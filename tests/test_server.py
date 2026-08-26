@@ -442,6 +442,13 @@ class BootstrapServerTests(unittest.TestCase):
         self.server.server_close()
         self.thread.join(timeout=2)
 
+    def test_bootstrap_liveness_does_not_probe_absent_upstreams(self) -> None:
+        with urlopen(f"{self.base_url}/startup/state", timeout=2) as response:
+            state = json.loads(response.read().decode())
+        self.assertFalse(state["finalized"])
+        self.assertEqual(state["models"], [{"model": "Qwen3-Embedding-8B", "is_sleeping": None}])
+        self.assertEqual(self.http.requests, [])
+
     def test_bootstrap_state_and_explicit_sleep(self) -> None:
         with urlopen(f"{self.base_url}/startup/state?model=Qwen3-Embedding-8B", timeout=2) as response:
             state = json.loads(response.read().decode())

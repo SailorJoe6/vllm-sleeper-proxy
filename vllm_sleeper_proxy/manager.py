@@ -148,10 +148,14 @@ class ModelManager:
                     self._condition.notify_all()
 
     def startup_state(self, requested: str | None = None) -> dict[str, object]:
+        # The unqualified bootstrap probe is a control-plane liveness check.
+        # Before the first engine starts, probing every upstream would turn a
+        # missing engine DNS name into a 503/empty reply and deadlock startup.
+        # Per-model callers still get a fail-closed sleep-state probe.
         models = [self.find_model(requested)] if requested else self.models
         states: list[dict[str, object]] = []
         for model in models:
-            sleeping = self._is_sleeping(model)
+            sleeping = None if requested is None else self._is_sleeping(model)
             states.append({"model": model.name, "is_sleeping": sleeping})
         return {"bootstrap": self.bootstrap_mode, "finalized": self.startup_finalized, "models": states}
 
