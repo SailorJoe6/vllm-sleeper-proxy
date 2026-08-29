@@ -135,8 +135,8 @@ model name. It never evicts an in-flight response.
 
 Deployments may run `python -m vllm_sleeper_proxy.memory_monitor` beside the
 proxy. It samples total-host memory at a short interval and invokes that exact
-sleep control when utilization reaches its configured ceiling (which may not
-exceed 85%). Cold-start safety remains deployment-owned: use a host preflight
+sleep control when utilization reaches its configured ceiling. The default is
+95%, and values above 95% are rejected. Cold-start safety remains deployment-owned: use a host preflight
 and serialize engine startup so the proxy and monitor do not need to recover
 from an unbudgeted startup overlap.
 

@@ -66,12 +66,12 @@ def monitor(
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--control-url", default="http://sleeper-proxy:8889/sleep")
-    parser.add_argument("--critical-percent", type=float, default=85.0)
+    parser.add_argument("--critical-percent", type=float, default=95.0)
     parser.add_argument("--poll-seconds", type=float, default=2.0)
     parser.add_argument("--timeout-seconds", type=float, default=620.0)
     args = parser.parse_args()
-    if not 0 < args.critical_percent <= 85:
-        parser.error("--critical-percent must be greater than zero and at most 85")
+    if not 0 < args.critical_percent <= 95:
+        parser.error("--critical-percent must be greater than zero and at most 95")
     if args.poll_seconds <= 0 or args.timeout_seconds <= 0:
         parser.error("poll and timeout values must be greater than zero")
     monitor(
