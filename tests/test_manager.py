@@ -318,6 +318,79 @@ class ModelManagerTests(unittest.TestCase):
             [url for _, url, _ in http.calls],
         )
 
+    def test_idempotent_sleep_does_not_block_next_request(self) -> None:
+        http = FakeHttp()
+        manager = ModelManager(
+            [qwen_model()],
+            http,
+            poll_interval_s=0,
+            wake_timeout_s=1,
+            drain_timeout_s=0.05,
+        )
+
+        self.assertIsNone(manager.sleep_active_model())
+        lease = manager.acquire("Qwen3-Embedding-8B")
+        lease.release()
+
+        self.assertEqual("Qwen3-Embedding-8B", manager.active_model_name)
+        self.assertTrue(any("/wake_up?tags=weights" in url for _, url, _ in http.calls))
+
+    def test_lifecycle_status_remains_observable_during_weight_reload(self) -> None:
+        class BlockingReloadHttp(FakeHttp):
+            def __init__(self) -> None:
+                super().__init__()
+                self.reload_started = threading.Event()
+                self.allow_reload = threading.Event()
+
+            def request(self, method, url, *, headers=None, body=None, timeout=None):
+                if url.endswith("/collective_rpc"):
+                    self.reload_started.set()
+                    self.allow_reload.wait(timeout=2)
+                return super().request(method, url, headers=headers, body=body, timeout=timeout)
+
+        http = BlockingReloadHttp()
+        manager = ModelManager(
+            [qwen_model()],
+            http,
+            poll_interval_s=0,
+            wake_timeout_s=1,
+        )
+        startup_done = threading.Event()
+
+        def start() -> None:
+            manager.acquire("Qwen3-Embedding-8B").release()
+            startup_done.set()
+
+        startup_thread = threading.Thread(target=start)
+        startup_thread.start()
+        self.assertTrue(http.reload_started.wait(timeout=1))
+
+        observed: list[tuple[bool, str | None, str | None]] = []
+        status_done = threading.Event()
+
+        def read_status() -> None:
+            observed.append(
+                (
+                    manager.startup_finalized,
+                    manager.active_model_name,
+                    manager.starting_model_name,
+                )
+            )
+            status_done.set()
+
+        status_thread = threading.Thread(target=read_status)
+        status_thread.start()
+        self.assertTrue(status_done.wait(timeout=0.1))
+        self.assertEqual(
+            [(True, "Qwen3-Embedding-8B", "Qwen3-Embedding-8B")],
+            observed,
+        )
+
+        http.allow_reload.set()
+        startup_thread.join(timeout=2)
+        status_thread.join(timeout=2)
+        self.assertTrue(startup_done.is_set())
+
     def test_admission_is_rechecked_after_switch_sleep_before_wake(self) -> None:
         http = SwitchingHttp()
         manager = ModelManager(

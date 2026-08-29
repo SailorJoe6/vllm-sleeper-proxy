@@ -117,8 +117,9 @@ class ModelManager:
 
     @property
     def startup_finalized(self) -> bool:
-        with self._condition:
-            return self._startup_finalized
+        # Health/status requests must remain observable while a lifecycle
+        # transition holds the condition lock for a long weight reload.
+        return self._startup_finalized
 
     def startup_sleep_model(self, requested: str) -> str:
         """Sleep one engine during serialized bootstrap, without waking any engine."""
@@ -189,9 +190,13 @@ class ModelManager:
 
     @property
     def starting_model_name(self) -> str | None:
-        """Model that owns the startup lease until readiness is verified."""
-        with self._condition:
-            return self._starting_model_name
+        """Model that owns the startup lease until readiness is verified.
+
+        This read is intentionally non-blocking so the host guard can observe
+        an in-progress wake while the transition thread owns the condition.
+        Writers still serialize all state changes under that condition.
+        """
+        return self._starting_model_name
 
     @property
     def inflight_requests(self) -> int:
@@ -323,6 +328,9 @@ class ModelManager:
                         raise WakeError("timed out draining requests before resource backoff")
                     self._condition.wait(timeout=remaining)
                 if self._active_model_name is None:
+                    self._quiescing = False
+                    self._publish_transition("idle")
+                    self._condition.notify_all()
                     return None
                 current = self.find_model(self._active_model_name)
             except Exception:
