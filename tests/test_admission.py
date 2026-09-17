@@ -5,7 +5,12 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from vllm_sleeper_proxy.admission import AdmissionError, FileAdmissionGuard
+from vllm_sleeper_proxy.admission import (
+    AdmissionError,
+    FileAdmissionGuard,
+    FileThermalAdmissionGuard,
+    ThermalCooldownError,
+)
 from vllm_sleeper_proxy.config import ModelConfig
 
 
@@ -32,6 +37,62 @@ class AdmissionTests(unittest.TestCase):
             },
             "workload_policy": {"model_dependencies": [MODEL.name]},
         }
+
+    def thermal_status(
+        self, *, state: str = "healthy", allowed: bool = True,
+        generated_at: float = 100.0, retry_after: int = 60,
+    ) -> dict:
+        return {
+            "schema_version": 1,
+            "generated_at_epoch": generated_at,
+            "max_age_seconds": 5,
+            "allowed": allowed,
+            "state": state,
+            "reason": "allowed" if allowed else "thermal_cooldown",
+            "reason_codes": [] if allowed else ["acpi_temperature_denies_new_wake"],
+            "retry_after_seconds": retry_after,
+            "sequence": 1,
+        }
+
+    def test_fast_thermal_guard_allows_only_fresh_consistent_healthy(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.write_status(Path(directory), self.thermal_status())
+            FileThermalAdmissionGuard(path, now=lambda: 104.0)(MODEL)
+            for state in ("warning", "sleep", "recovering", "cutoff", "telemetry_failure"):
+                with self.subTest(state=state):
+                    path.write_text(json.dumps(self.thermal_status(state=state, allowed=False)))
+                    with self.assertRaises(ThermalCooldownError) as caught:
+                        FileThermalAdmissionGuard(path, now=lambda: 104.0)(MODEL)
+                    self.assertEqual(state, caught.exception.state)
+                    self.assertEqual(60, caught.exception.retry_after_seconds)
+                    self.assertIn("thermal_cooldown", str(caught.exception))
+
+    def test_fast_thermal_guard_fails_closed_for_missing_stale_future_and_malformed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            missing = root / "missing.json"
+            with self.assertRaises(ThermalCooldownError):
+                FileThermalAdmissionGuard(missing, now=lambda: 100.0)(MODEL)
+            cases = [
+                self.thermal_status(generated_at=90.0),
+                self.thermal_status(generated_at=103.0),
+                {**self.thermal_status(), "schema_version": 2},
+                {**self.thermal_status(), "schema_version": True},
+                {**self.thermal_status(), "allowed": "true"},
+                {**self.thermal_status(), "reason": "thermal_cooldown"},
+                {**self.thermal_status(), "state": "healthy", "allowed": False},
+                {**self.thermal_status(), "reason_codes": ["unsafe reason"]},
+                {**self.thermal_status(), "retry_after_seconds": True},
+            ]
+            for index, payload in enumerate(cases):
+                with self.subTest(index=index):
+                    path = self.write_status(root, payload)
+                    with self.assertRaises(ThermalCooldownError):
+                        FileThermalAdmissionGuard(path, now=lambda: 100.0)(MODEL)
+            for malformed in ("not json", "[]", "null", '"string"'):
+                path.write_text(malformed)
+                with self.assertRaises(ThermalCooldownError):
+                    FileThermalAdmissionGuard(path, now=lambda: 100.0)(MODEL)
 
     def test_allows_fresh_model_specific_decision(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

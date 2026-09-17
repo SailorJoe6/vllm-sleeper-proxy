@@ -85,6 +85,7 @@ class ModelManager:
         always_wake: bool = True,
         wake_strategy: str = "level2",
         admission_check: Callable[[ModelConfig], None] | None = None,
+        pre_admission_check: Callable[[ModelConfig], None] | None = None,
         startup_lease_path: str | None = None,
         transition_state_path: str | None = None,
         bootstrap_mode: bool = False,
@@ -101,6 +102,7 @@ class ModelManager:
         self.always_wake = always_wake
         self.wake_strategy = wake_strategy
         self.admission_check = admission_check
+        self.pre_admission_check = pre_admission_check
         self.startup_lease_path = startup_lease_path or os.environ.get(
             "SLEEPER_STARTUP_LEASE_PATH", "/tmp/vllm-sleeper-proxy-startup.lock"
         )
@@ -298,11 +300,27 @@ class ModelManager:
             self._wait_for_switch_safety(target)
             return self._activate_locked(target)
 
+    def check_fast_admission(self) -> None:
+        """Check the host-wide fast gate before reading a new request body."""
+        if self.pre_admission_check is not None:
+            self.pre_admission_check(self.models[0])
+
     def acquire(self, requested: str) -> ModelLease:
         """Wake a model and hold it awake for one buffered or streaming request."""
 
         target = self.find_model(requested)
+        # Check before contending on lifecycle state so a cooldown response is
+        # prompt even while another request is draining or switching.
+        if self.pre_admission_check is not None:
+            self.pre_admission_check(target)
         with self._condition:
+            # Recheck under the condition to close the race between the first
+            # fast read and lifecycle ownership.
+            # The fast thermal projection is checked before waiting for any
+            # switch/drain. Cooldown requests must fail promptly instead of
+            # joining a queue behind the active request that is draining.
+            if self.pre_admission_check is not None:
+                self.pre_admission_check(target)
             self._wait_for_switch_safety(target)
             if self.admission_check is not None:
                 self.admission_check(target)

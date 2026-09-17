@@ -9,13 +9,30 @@ from typing import Iterable
 from urllib.parse import urlsplit
 
 from .client import UrllibHttpClient
-from .admission import AdmissionError, FileAdmissionGuard
+from .admission import (
+    AdmissionError,
+    FileAdmissionGuard,
+    FileThermalAdmissionGuard,
+    ThermalCooldownError,
+)
 from .config import load_models_from_env
 from .manager import ModelManager, UnknownModelError, WakeError
 
 def require_qwen_admission(models, admission_path: str | None) -> None:
     if any(model.upstream_model == "unsloth/Qwen3.8-27B-NVFP4" for model in models) and not admission_path:
         raise RuntimeError("Qwen3.8 requires SLEEPER_ADMISSION_STATUS_PATH")
+
+
+def compose_admission_checks(*checks):
+    configured = [check for check in checks if check is not None]
+    if not configured:
+        return None
+
+    def check(model) -> None:
+        for item in configured:
+            item(model)
+
+    return check
 
 
 HOP_BY_HOP_HEADERS = {
@@ -103,6 +120,12 @@ class SleeperProxyHandler(BaseHTTPRequestHandler):
                 return
             self._send_json(200, {"ok": True, "slept_model": slept_model})
             return
+        if path in PROXIED_POST_PATHS:
+            try:
+                self.manager.check_fast_admission()
+            except ThermalCooldownError as exc:
+                self._send_thermal_cooldown(exc)
+                return
         if self.manager.bootstrap_mode and not self.manager.startup_finalized and path in PROXIED_POST_PATHS:
             self._send_error(503, "required lineup startup is not finalized", "startup_not_finalized")
             return
@@ -154,8 +177,11 @@ class SleeperProxyHandler(BaseHTTPRequestHandler):
         except WakeError as exc:
             self._send_error(503, str(exc), "wake_failed", {"retry-after": "10"})
             return
+        except ThermalCooldownError as exc:
+            self._send_thermal_cooldown(exc)
+            return
         except AdmissionError as exc:
-            self._send_error(503, str(exc), "admission_denied", {"retry-after": "10"})
+            self._send_error(503, str(exc), "admission_denied", {"Retry-After": "10"})
             return
 
         with lease as target:
@@ -248,15 +274,30 @@ class SleeperProxyHandler(BaseHTTPRequestHandler):
             return None
         return decoded if isinstance(decoded, dict) else None
 
+    def _send_thermal_cooldown(self, exc: ThermalCooldownError) -> None:
+        self._send_error(
+            503,
+            str(exc),
+            "thermal_cooldown",
+            {"Retry-After": str(exc.retry_after_seconds)},
+            {
+                "thermal_state": exc.state,
+                "retry_after_seconds": exc.retry_after_seconds,
+            },
+        )
+
     def _send_error(
         self,
         status: int,
         message: str,
         error_type: str,
         headers: dict[str, str] | None = None,
+        error_fields: dict[str, object] | None = None,
     ) -> None:
+        error = {"message": message, "type": error_type}
+        error.update(error_fields or {})
         encoded = json.dumps(
-            {"error": {"message": message, "type": error_type}},
+            {"error": error},
             separators=(",", ":"),
         ).encode("utf-8")
         self.send_response(status)
@@ -301,11 +342,23 @@ def main(argv: Iterable[str] | None = None) -> int:
     host = os.environ.get("SLEEPER_PROXY_HOST", "0.0.0.0")
     port = int(os.environ.get("SLEEPER_PROXY_PORT", "8889"))
     admission_path = os.environ.get("SLEEPER_ADMISSION_STATUS_PATH")
+    thermal_status_path = os.environ.get("SLEEPER_THERMAL_ADMISSION_STATUS_PATH")
     models = load_models_from_env()
     require_qwen_admission(models, admission_path)
-    admission_check = (
+    resource_admission = (
         FileAdmissionGuard(Path(admission_path)) if admission_path else None
     )
+    thermal_admission = (
+        FileThermalAdmissionGuard(
+            Path(thermal_status_path),
+            maximum_age_seconds=float(
+                os.environ.get("SLEEPER_THERMAL_MAX_AGE_SECONDS", "5")
+            ),
+        )
+        if thermal_status_path
+        else None
+    )
+    admission_check = compose_admission_checks(thermal_admission, resource_admission)
     manager = ModelManager(
         models,
         UrllibHttpClient(),
@@ -317,6 +370,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         always_wake=os.environ.get("SLEEPER_ALWAYS_WAKE", "1") != "0",
         wake_strategy=os.environ.get("SLEEPER_WAKE_STRATEGY", "level2"),
         admission_check=admission_check,
+        pre_admission_check=thermal_admission,
         startup_lease_path=os.environ.get(
             "SLEEPER_STARTUP_LEASE_PATH", "/tmp/vllm-sleeper-proxy-startup.lock"
         ),

@@ -301,6 +301,48 @@ class ModelManagerTests(unittest.TestCase):
             any("/wake_up" in url for _, url, _ in http.calls)
         )
 
+    def test_fast_admission_denial_happens_before_lifecycle_or_inflight(self) -> None:
+        http = FakeHttp()
+        calls = []
+        def deny(model) -> None:
+            calls.append(model.name)
+            raise RuntimeError("thermal cooldown")
+        manager = ModelManager([qwen_model()], http, pre_admission_check=deny)
+        with self.assertRaisesRegex(RuntimeError, "thermal cooldown"):
+            manager.acquire("Qwen3-Embedding-8B")
+        self.assertEqual(["Qwen3-Embedding-8B"], calls)
+        self.assertEqual(0, manager.inflight_requests)
+        self.assertEqual([], http.calls)
+
+    def test_fast_admission_rechecks_under_condition_before_wake(self) -> None:
+        http = FakeHttp()
+        calls = []
+        def changes_hot(model) -> None:
+            calls.append(model.name)
+            if len(calls) == 2:
+                raise RuntimeError("thermal cooldown")
+        manager = ModelManager([qwen_model()], http, pre_admission_check=changes_hot)
+        with self.assertRaisesRegex(RuntimeError, "thermal cooldown"):
+            manager.acquire("Qwen3-Embedding-8B")
+        self.assertEqual(2, len(calls))
+        self.assertEqual([], http.calls)
+
+    def test_fast_admission_denies_promptly_while_quiescing(self) -> None:
+        http = FakeHttp()
+        manager = ModelManager(
+            [qwen_model()], http, drain_timeout_s=30,
+            pre_admission_check=lambda model: (_ for _ in ()).throw(
+                RuntimeError("thermal cooldown")
+            ),
+        )
+        with manager._condition:
+            manager._quiescing = True
+        started = time.monotonic()
+        with self.assertRaisesRegex(RuntimeError, "thermal cooldown"):
+            manager.acquire("Qwen3-Embedding-8B")
+        self.assertLess(time.monotonic() - started, 0.1)
+        self.assertEqual([], http.calls)
+
     def test_resource_backoff_sleeps_active_model(self) -> None:
         http = FakeHttp()
         manager = ModelManager(
@@ -317,6 +359,32 @@ class ModelManagerTests(unittest.TestCase):
             "http://vllm:8888/sleep?level=2",
             [url for _, url, _ in http.calls],
         )
+
+    def test_thermal_sleep_drains_active_lease_and_denies_late_request(self) -> None:
+        http = FakeHttp()
+        manager = ModelManager(
+            [qwen_model()], http, poll_interval_s=0,
+            wake_timeout_s=1, drain_timeout_s=1,
+        )
+        lease = manager.acquire("Qwen3-Embedding-8B")
+        manager.pre_admission_check = lambda model: (_ for _ in ()).throw(
+            RuntimeError("thermal cooldown")
+        )
+        result = []
+        thread = threading.Thread(target=lambda: result.append(manager.sleep_active_model()))
+        thread.start()
+        deadline = time.monotonic() + 1
+        while not manager._quiescing and time.monotonic() < deadline:
+            time.sleep(0.005)
+        self.assertTrue(manager._quiescing)
+        self.assertTrue(thread.is_alive())
+        with self.assertRaisesRegex(RuntimeError, "thermal cooldown"):
+            manager.acquire("Qwen3-Embedding-8B")
+        lease.release()
+        thread.join(timeout=2)
+        self.assertEqual(["Qwen3-Embedding-8B"], result)
+        self.assertIsNone(manager.active_model_name)
+        self.assertIn("http://vllm:8888/sleep?level=2", [url for _, url, _ in http.calls])
 
     def test_idempotent_sleep_does_not_block_next_request(self) -> None:
         http = FakeHttp()

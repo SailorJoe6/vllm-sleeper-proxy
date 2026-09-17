@@ -8,6 +8,7 @@ import unittest
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
+from vllm_sleeper_proxy.admission import FileThermalAdmissionGuard, ThermalCooldownError
 from vllm_sleeper_proxy.client import HttpResponse
 from vllm_sleeper_proxy.config import ModelConfig
 from vllm_sleeper_proxy.manager import ModelManager, WakeError
@@ -45,6 +46,19 @@ class FailingStream(FakeStream):
     def iter_chunks(self, chunk_size=64 * 1024):
         yield b'data: {"choices":[{"delta":{"content":"e2"}}]}\n\n'
         raise TimeoutError("upstream stream timed out")
+
+
+class ControlledDrainStream(FakeStream):
+    def __init__(self) -> None:
+        super().__init__([])
+        self.started = threading.Event()
+        self.resume = threading.Event()
+
+    def iter_chunks(self, chunk_size=64 * 1024):
+        self.started.set()
+        yield b"data: first\n\n"
+        self.resume.wait(timeout=2)
+        yield b"data: [DONE]\n\n"
 
 
 class ControlledDisconnectStream(FakeStream):
@@ -219,6 +233,111 @@ class ServerTests(unittest.TestCase):
         with self.assertRaisesRegex(WakeError, "vision sleep state unavailable"):
             build_server("127.0.0.1", 0, manager)
 
+    def test_thermal_cooldown_returns_503_retry_after_without_wake(self) -> None:
+        self.http.requests.clear()
+        def deny(model) -> None:
+            raise ThermalCooldownError(
+                "thermal_cooldown: temperatures are recovering; state=warning",
+                state="warning",
+                retry_after_seconds=60,
+            )
+        self.manager.pre_admission_check = deny
+        self.manager.admission_check = deny
+        for path, payload in (
+            ("/v1/embeddings", {"model": "Qwen3-Embedding-8B", "input": "hello"}),
+            ("/v1/chat/completions", {"model": "Qwen3-Embedding-8B", "messages": []}),
+        ):
+            with self.subTest(path=path):
+                req = Request(
+                    f"{self.base_url}{path}",
+                    data=json.dumps(payload).encode(),
+                    headers={"content-type": "application/json"},
+                    method="POST",
+                )
+                with self.assertRaises(HTTPError) as caught:
+                    urlopen(req, timeout=2)
+                self.assertEqual(503, caught.exception.code)
+                self.assertEqual("60", caught.exception.headers["Retry-After"])
+                body = json.loads(caught.exception.read().decode())
+                self.assertEqual("thermal_cooldown", body["error"]["type"])
+                self.assertEqual("warning", body["error"]["thermal_state"])
+                self.assertEqual(60, body["error"]["retry_after_seconds"])
+                self.assertIn("thermal_cooldown", body["error"]["message"])
+        self.assertEqual([], self.http.requests)
+        self.assertEqual(0, self.manager.inflight_requests)
+
+    def test_thermal_cooldown_wins_before_request_body_validation(self) -> None:
+        def deny(model) -> None:
+            raise ThermalCooldownError(
+                "thermal_cooldown: status is stale",
+                state="stale",
+                retry_after_seconds=10,
+            )
+        self.manager.pre_admission_check = deny
+        req = Request(f"{self.base_url}/v1/embeddings", method="POST")
+        with self.assertRaises(HTTPError) as caught:
+            urlopen(req, timeout=2)
+        self.assertEqual(503, caught.exception.code)
+        self.assertEqual("10", caught.exception.headers["Retry-After"])
+        self.assertEqual(
+            "thermal_cooldown",
+            json.loads(caught.exception.read())["error"]["type"],
+        )
+
+    def test_missing_fast_thermal_status_is_user_facing_cooldown(self) -> None:
+        from pathlib import Path
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            self.manager.pre_admission_check = FileThermalAdmissionGuard(
+                Path(directory) / "missing.json"
+            )
+            req = Request(
+                f"{self.base_url}/v1/embeddings",
+                data=json.dumps({"model": "Qwen3-Embedding-8B", "input": "late"}).encode(),
+                headers={"content-type": "application/json"},
+                method="POST",
+            )
+            with self.assertRaises(HTTPError) as caught:
+                urlopen(req, timeout=2)
+            self.assertEqual(503, caught.exception.code)
+            self.assertEqual("10", caught.exception.headers["Retry-After"])
+            body = json.loads(caught.exception.read())
+            self.assertEqual("thermal_cooldown", body["error"]["type"])
+            self.assertEqual("unavailable", body["error"]["thermal_state"])
+            (Path(directory) / "missing.json").write_text("[]")
+            with self.assertRaises(HTTPError) as malformed:
+                urlopen(req, timeout=2)
+            self.assertEqual(503, malformed.exception.code)
+            self.assertEqual(
+                "thermal_cooldown",
+                json.loads(malformed.exception.read())["error"]["type"],
+            )
+
+    def test_thermal_cooldown_denies_same_model_already_awake(self) -> None:
+        self.post_json(
+            "/v1/embeddings",
+            {"model": "Qwen3-Embedding-8B", "input": "warm"},
+        )
+        self.http.requests.clear()
+        def deny(model) -> None:
+            raise ThermalCooldownError(
+                "thermal_cooldown: recovery hold active",
+                state="recovering",
+                retry_after_seconds=60,
+            )
+        self.manager.pre_admission_check = deny
+        req = Request(
+            f"{self.base_url}/v1/embeddings",
+            data=json.dumps({"model": "Qwen3-Embedding-8B", "input": "late"}).encode(),
+            headers={"content-type": "application/json"},
+            method="POST",
+        )
+        with self.assertRaises(HTTPError) as caught:
+            urlopen(req, timeout=2)
+        self.assertEqual(503, caught.exception.code)
+        self.assertEqual("thermal_cooldown", json.loads(caught.exception.read())["error"]["type"])
+        self.assertEqual([], self.http.requests)
+
     def test_embedding_request_wakes_and_forwards(self) -> None:
         status, payload = self.post_json(
             "/v1/embeddings",
@@ -285,6 +404,73 @@ class ServerTests(unittest.TestCase):
         self.assertTrue(body.endswith(b"data: [DONE]\n\n"))
         self.assertTrue(self.http.last_stream.closed)
         self.assert_request_ownership_released()
+
+    def test_thermal_sleep_drains_active_stream_and_late_request_gets_503(self) -> None:
+        controlled = ControlledDrainStream()
+        self.http.stream_factory = lambda: controlled
+        stream_result = []
+        def run_stream() -> None:
+            req = Request(
+                f"{self.base_url}/v1/chat/completions",
+                data=json.dumps({
+                    "model": "Qwen3-Embedding-8B", "messages": [], "stream": True,
+                }).encode(),
+                headers={"content-type": "application/json"},
+                method="POST",
+            )
+            with urlopen(req, timeout=3) as response:
+                stream_result.append((response.status, response.read()))
+        stream_thread = threading.Thread(target=run_stream)
+        stream_thread.start()
+        self.assertTrue(controlled.started.wait(timeout=1))
+
+        def deny(model) -> None:
+            raise ThermalCooldownError(
+                "thermal_cooldown: sleep threshold active",
+                state="sleep",
+                retry_after_seconds=60,
+            )
+        self.manager.pre_admission_check = deny
+        sleep_result = []
+        sleep_thread = threading.Thread(
+            target=lambda: sleep_result.append(self.post_json("/sleep", {}))
+        )
+        sleep_thread.start()
+        deadline = time.monotonic() + 1
+        while not self.manager._quiescing and time.monotonic() < deadline:
+            time.sleep(0.005)
+        self.assertTrue(self.manager._quiescing)
+        self.assertTrue(sleep_thread.is_alive())
+
+        late = Request(
+            f"{self.base_url}/v1/embeddings",
+            data=json.dumps({"model": "Qwen3-Embedding-8B", "input": "late"}).encode(),
+            headers={"content-type": "application/json"},
+            method="POST",
+        )
+        started = time.monotonic()
+        with self.assertRaises(HTTPError) as caught:
+            urlopen(late, timeout=2)
+        self.assertEqual(503, caught.exception.code)
+        self.assertLess(time.monotonic() - started, 0.5)
+
+        controlled.resume.set()
+        stream_thread.join(timeout=2)
+        sleep_thread.join(timeout=2)
+        self.assertFalse(stream_thread.is_alive())
+        self.assertFalse(sleep_thread.is_alive())
+        self.assertEqual(200, stream_result[0][0])
+        self.assertIn(b"[DONE]", stream_result[0][1])
+        self.assertEqual(200, sleep_result[0][0])
+        self.assertEqual("Qwen3-Embedding-8B", sleep_result[0][1]["slept_model"])
+        wake_count = sum("/wake_up" in url for _, url, _ in self.http.requests)
+        with self.assertRaises(HTTPError) as after_sleep:
+            urlopen(late, timeout=2)
+        self.assertEqual(503, after_sleep.exception.code)
+        self.assertEqual(
+            wake_count,
+            sum("/wake_up" in url for _, url, _ in self.http.requests),
+        )
 
     def test_midstream_timeout_closes_upstream_and_releases(self) -> None:
         self.http.stream_factory = lambda: FailingStream([])

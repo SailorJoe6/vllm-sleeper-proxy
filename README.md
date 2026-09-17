@@ -81,6 +81,14 @@ GBrain embedding Compose integration:
   preventing an in-flight response from being evicted.
 * A file-backed admission guard can be enabled to fail closed before wake when the
   host resource monitor is missing, stale, or denies the requested model.
+* A separate optional `SLEEPER_THERMAL_ADMISSION_STATUS_PATH` fast projection
+  rejects every new embeddings or chat acquisition before request-body handling
+  when thermal state is warning, sleep, cutoff, recovering, stale, malformed,
+  or unavailable. The response is HTTP 503 with `Retry-After` and
+  `error.type=thermal_cooldown`. Existing buffered or streaming leases may
+  drain; `POST /sleep` quiesces later acquisitions before sleeping the engine.
+  The consumer hard-caps status freshness at five seconds and does not own the
+  deployment's temperature thresholds.
   The bundled memory monitor polls total-host `MemAvailable` and asks the
   proxy to quiesce and sleep the active model at the configured ceiling.
 * `services/gbrain-embeddings/` wires GBrain → LiteLLM → sleeper proxy → vLLM
