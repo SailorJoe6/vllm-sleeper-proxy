@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from vllm_sleeper_proxy.admission import (
     AdmissionError,
@@ -11,7 +13,7 @@ from vllm_sleeper_proxy.admission import (
     FileThermalAdmissionGuard,
     ThermalCooldownError,
 )
-from vllm_sleeper_proxy.config import ModelConfig
+from vllm_sleeper_proxy.config import ModelConfig, load_models_from_env
 
 
 MODEL = ModelConfig(
@@ -20,9 +22,30 @@ MODEL = ModelConfig(
     upstream_base_url="http://vision:8000/v1",
     control_base_url="http://vision:8000",
 )
+REQUIRED_MODEL = ModelConfig(
+    name=MODEL.name,
+    upstream_model=MODEL.upstream_model,
+    upstream_base_url=MODEL.upstream_base_url,
+    control_base_url=MODEL.control_base_url,
+    required=True,
+)
 
 
 class AdmissionTests(unittest.TestCase):
+    def test_required_flag_is_explicitly_parsed_and_type_checked(self) -> None:
+        payload = [{
+            "name": "required-model",
+            "upstream_base_url": "http://engine:8000/v1",
+            "control_base_url": "http://engine:8000",
+            "required": True,
+        }]
+        with patch.dict(os.environ, {"SLEEPER_MODELS": json.dumps(payload)}):
+            self.assertTrue(load_models_from_env()[0].required)
+        payload[0]["required"] = "true"
+        with patch.dict(os.environ, {"SLEEPER_MODELS": json.dumps(payload)}):
+            with self.assertRaisesRegex(ValueError, "required must be boolean"):
+                load_models_from_env()
+
     def write_status(self, root: Path, payload: dict) -> Path:
         path = root / "status.json"
         path.write_text(json.dumps(payload), encoding="utf-8")
@@ -48,7 +71,11 @@ class AdmissionTests(unittest.TestCase):
             "max_age_seconds": 5,
             "allowed": allowed,
             "state": state,
-            "reason": "allowed" if allowed else "thermal_cooldown",
+            "reason": (
+                "observability_degraded"
+                if state == "telemetry_failure" and allowed
+                else "allowed" if allowed else "thermal_cooldown"
+            ),
             "reason_codes": [] if allowed else ["acpi_temperature_denies_new_wake"],
             "retry_after_seconds": retry_after,
             "sequence": 1,
@@ -60,7 +87,8 @@ class AdmissionTests(unittest.TestCase):
             FileThermalAdmissionGuard(path, now=lambda: 104.0)(MODEL)
             for state in ("warning", "sleep", "recovering", "cutoff", "telemetry_failure"):
                 with self.subTest(state=state):
-                    path.write_text(json.dumps(self.thermal_status(state=state, allowed=False)))
+                    allowed = state in {"warning", "telemetry_failure"}
+                    path.write_text(json.dumps(self.thermal_status(state=state, allowed=allowed)))
                     with self.assertRaises(ThermalCooldownError) as caught:
                         FileThermalAdmissionGuard(path, now=lambda: 104.0)(MODEL)
                     self.assertEqual(state, caught.exception.state)
@@ -93,6 +121,73 @@ class AdmissionTests(unittest.TestCase):
                 path.write_text(malformed)
                 with self.assertRaises(ThermalCooldownError):
                     FileThermalAdmissionGuard(path, now=lambda: 100.0)(MODEL)
+
+    def test_required_thermal_guard_allows_monitor_uncertainty_and_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            missing = root / "missing.json"
+            FileThermalAdmissionGuard(missing, now=lambda: 100.0)(REQUIRED_MODEL)
+            containment = root / "containment.json"
+            containment.write_text(json.dumps({"active": True, "state": "cutoff"}))
+            with self.assertRaises(ThermalCooldownError):
+                FileThermalAdmissionGuard(
+                    missing,
+                    containment_path=containment,
+                    now=lambda: 100.0,
+                )(REQUIRED_MODEL)
+            containment.write_text(json.dumps({"active": False, "state": "none"}))
+            path = self.write_status(root, self.thermal_status(generated_at=1.0))
+            FileThermalAdmissionGuard(path, now=lambda: 100.0)(REQUIRED_MODEL)
+            path.write_text("not json", encoding="utf-8")
+            FileThermalAdmissionGuard(path, now=lambda: 100.0)(REQUIRED_MODEL)
+            for state, reason_codes in (
+                ("warning", ["acpi_temperature_denies_new_wake"]),
+                ("telemetry_failure", ["thermal_telemetry_unavailable"]),
+            ):
+                payload = self.thermal_status(state=state, allowed=True)
+                payload["reason_codes"] = reason_codes
+                path.write_text(json.dumps(payload), encoding="utf-8")
+                FileThermalAdmissionGuard(path, now=lambda: 104.0)(REQUIRED_MODEL)
+
+    def test_required_thermal_guard_still_denies_affirmative_containment(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for state in ("sleep", "recovering", "cutoff"):
+                path = self.write_status(
+                    root, self.thermal_status(state=state, allowed=False)
+                )
+                with self.assertRaises(ThermalCooldownError):
+                    FileThermalAdmissionGuard(path, now=lambda: 104.0)(
+                        REQUIRED_MODEL
+                    )
+            stale_cutoff = self.thermal_status(
+                state="cutoff", allowed=False, generated_at=1.0
+            )
+            path.write_text(json.dumps(stale_cutoff), encoding="utf-8")
+            with self.assertRaises(ThermalCooldownError):
+                FileThermalAdmissionGuard(path, now=lambda: 104.0)(REQUIRED_MODEL)
+
+    def test_required_resource_guard_allows_uncertainty_but_not_explicit_danger(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            FileAdmissionGuard(root / "missing.json", now=lambda: 100.0)(
+                REQUIRED_MODEL
+            )
+            path = self.write_status(root, self.status(generated_at=1.0))
+            FileAdmissionGuard(path, now=lambda: 100.0)(REQUIRED_MODEL)
+            uncertain = self.status(allowed=False)
+            uncertain["model_admission"][MODEL.name]["reason"] = "unknown_model_state"
+            path.write_text(json.dumps(uncertain), encoding="utf-8")
+            FileAdmissionGuard(path, now=lambda: 110.0)(REQUIRED_MODEL)
+            danger = self.status(allowed=False)
+            danger["model_admission"][MODEL.name]["reason"] = "host_state_critical"
+            path.write_text(json.dumps(danger), encoding="utf-8")
+            with self.assertRaisesRegex(AdmissionError, "host_state_critical"):
+                FileAdmissionGuard(path, now=lambda: 110.0)(REQUIRED_MODEL)
+            danger["generated_at_epoch"] = 1.0
+            path.write_text(json.dumps(danger), encoding="utf-8")
+            with self.assertRaisesRegex(AdmissionError, "stale"):
+                FileAdmissionGuard(path, now=lambda: 110.0)(REQUIRED_MODEL)
 
     def test_allows_fresh_model_specific_decision(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

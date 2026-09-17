@@ -5,6 +5,7 @@ import socket
 import threading
 import time
 import unittest
+from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -660,6 +661,44 @@ class BootstrapServerTests(unittest.TestCase):
             urlopen(req, timeout=2)
         self.assertEqual(caught.exception.code, 503)
         self.assertEqual(json.loads(caught.exception.read())["error"]["type"], "startup_not_finalized")
+
+    def test_adopt_preserves_one_awake_engine_without_sleeping_it(self) -> None:
+        self.http.sleeping = False
+        before = len(self.http.requests)
+        req = Request(f"{self.base_url}/startup/adopt", data=b"", method="POST")
+        with urlopen(req, timeout=2) as response:
+            payload = json.loads(response.read().decode())
+        self.assertTrue(payload["finalized"])
+        self.assertEqual("Qwen3-Embedding-8B", payload["active_model"])
+        lifecycle = [url for _, url, _ in self.http.requests[before:]]
+        self.assertTrue(any(url.endswith("/is_sleeping") for url in lifecycle))
+        self.assertFalse(any("/sleep?" in url for url in lifecycle))
+        with urlopen(f"{self.base_url}/healthz", timeout=2) as response:
+            self.assertTrue(json.loads(response.read().decode())["ready"])
+
+    def test_adopt_rejects_ambiguous_awake_state_without_sleeping(self) -> None:
+        second = ModelConfig(
+            name="vision-vla",
+            upstream_model="Qwen/Qwen3-VL-4B-Instruct",
+            upstream_base_url="http://vision:8888/v1",
+            control_base_url="http://vision:8888",
+        )
+        manager = ModelManager(
+            [self.manager.models[0], second], self.http,
+            poll_interval_s=0, wake_timeout_s=1, bootstrap_mode=True,
+        )
+        with patch.object(manager, "_is_sleeping", return_value=False), \
+             patch.object(manager, "_sleep", side_effect=AssertionError("sleep called")):
+            with self.assertRaisesRegex(WakeError, "multiple awake"):
+                manager.adopt_startup_state()
+        self.assertFalse(manager.startup_finalized)
+
+    def test_adopt_rejects_unknown_state_without_sleeping(self) -> None:
+        with patch.object(self.manager, "_is_sleeping", return_value=None), \
+             patch.object(self.manager, "_sleep", side_effect=AssertionError("sleep called")):
+            with self.assertRaisesRegex(WakeError, "cannot verify"):
+                self.manager.adopt_startup_state()
+        self.assertFalse(self.manager.startup_finalized)
 
     def test_finalize_unlocks_inference_and_readiness(self) -> None:
         req = Request(f"{self.base_url}/startup/finalize", data=b"", method="POST")

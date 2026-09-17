@@ -13,8 +13,16 @@ class AdmissionError(RuntimeError):
     pass
 
 
+RESOURCE_UNCERTAINTY_REASONS = {
+    "unknown_model_state",
+    "gpu_headroom_unavailable",
+    "monitor_unavailable",
+    "monitor_stale",
+}
+
+
 class FileAdmissionGuard:
-    """Fail closed when the host resource monitor does not admit a model."""
+    """Apply host admission while keeping required models available on uncertainty."""
 
     def __init__(
         self,
@@ -48,16 +56,22 @@ class FileAdmissionGuard:
                 decision = admissions[model.name]
                 allowed = decision["allowed"] is True
             except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                if model.required:
+                    return
                 raise AdmissionError(
                     f"resource admission unavailable for {model.name}"
                 ) from exc
 
             age = self.now() - generated_at
+            reason = str(decision.get("reason", "denied"))
             if age < -5 or age > max_age:
+                if model.required and (allowed or reason in RESOURCE_UNCERTAINTY_REASONS):
+                    return
                 raise AdmissionError(f"resource admission stale for {model.name}")
             if allowed:
                 return
-            reason = str(decision.get("reason", "denied"))
+            if model.required and reason in RESOURCE_UNCERTAINTY_REASONS:
+                return
             if reason != "unknown_model_state" or attempt >= self.unknown_state_refreshes:
                 raise AdmissionError(f"resource admission denied for {model.name}: {reason}")
             self.sleep(self.unknown_state_refresh_delay_seconds)
@@ -79,20 +93,31 @@ class ThermalCooldownError(AdmissionError):
 
 
 class FileThermalAdmissionGuard:
-    """Fail closed from the watchdog's sanitized fast admission projection."""
+    """Deny affirmative danger while tolerating required-model monitor loss."""
 
     def __init__(
         self,
         status_path: Path,
         *,
+        containment_path: Path | None = None,
         now=time.time,
         maximum_age_seconds: float = 5.0,
         default_retry_after_seconds: int = 10,
     ) -> None:
         self.status_path = status_path
+        self.containment_path = containment_path
         self.now = now
         self.maximum_age_seconds = maximum_age_seconds
         self.default_retry_after_seconds = default_retry_after_seconds
+
+    def _containment_active(self) -> bool:
+        if self.containment_path is None:
+            return False
+        try:
+            value = json.loads(self.containment_path.read_text(encoding="utf-8"))
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            return False
+        return isinstance(value, dict) and value.get("active") is True
 
     def _deny(self, state: str, retry_after: int, detail: str) -> None:
         raise ThermalCooldownError(
@@ -103,6 +128,7 @@ class FileThermalAdmissionGuard:
         )
 
     def __call__(self, model: ModelConfig) -> None:
+        containment_active = self._containment_active()
         try:
             status = json.loads(self.status_path.read_text(encoding="utf-8"))
             if not isinstance(status, dict):
@@ -138,12 +164,19 @@ class FileThermalAdmissionGuard:
                 )
             ):
                 raise ValueError("invalid thermal reason codes")
-            expected_reason = "allowed" if state == "healthy" else "thermal_cooldown"
+            required_allowed_states = {"healthy", "warning", "telemetry_failure"}
+            expected_reason = (
+                "observability_degraded"
+                if state == "telemetry_failure" and allowed
+                else "allowed" if allowed else "thermal_cooldown"
+            )
             if status.get("reason") != expected_reason:
                 raise ValueError("inconsistent thermal reason")
-            if allowed != (state == "healthy"):
+            if allowed != (state in required_allowed_states):
                 raise ValueError("inconsistent thermal allowed state")
         except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+            if model.required and not containment_active:
+                return
             self._deny(
                 "unavailable",
                 self.default_retry_after_seconds,
@@ -152,12 +185,22 @@ class FileThermalAdmissionGuard:
             return
         age = self.now() - generated_at
         max_age = min(self.maximum_age_seconds, published_max_age)
+        if containment_active:
+            self._deny(
+                "recovering",
+                retry_after,
+                "positive danger containment latch is active",
+            )
         if age < -2 or age > max_age:
+            if model.required and allowed:
+                return
             self._deny(
                 "stale",
                 self.default_retry_after_seconds,
                 "fast thermal status is stale",
             )
+        if model.required and allowed and state in required_allowed_states:
+            return
         if not allowed or state != "healthy":
             self._deny(
                 state,

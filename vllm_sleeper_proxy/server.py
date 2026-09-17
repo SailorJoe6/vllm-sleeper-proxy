@@ -105,6 +105,17 @@ class SleeperProxyHandler(BaseHTTPRequestHandler):
             except (UnknownModelError, WakeError) as exc:
                 self._send_error(503, str(exc), "startup_sleep_failed")
             return
+        if self.manager.bootstrap_mode and path == "/startup/adopt":
+            try:
+                self.manager.adopt_startup_state()
+                self._send_json(200, {
+                    "ok": True,
+                    "finalized": True,
+                    "active_model": self.manager.active_model_name,
+                })
+            except WakeError as exc:
+                self._send_error(503, str(exc), "startup_adopt_failed")
+            return
         if self.manager.bootstrap_mode and path == "/startup/finalize":
             try:
                 self.manager.finalize_startup()
@@ -343,6 +354,9 @@ def main(argv: Iterable[str] | None = None) -> int:
     port = int(os.environ.get("SLEEPER_PROXY_PORT", "8889"))
     admission_path = os.environ.get("SLEEPER_ADMISSION_STATUS_PATH")
     thermal_status_path = os.environ.get("SLEEPER_THERMAL_ADMISSION_STATUS_PATH")
+    thermal_containment_path = os.environ.get(
+        "SLEEPER_THERMAL_CONTAINMENT_STATUS_PATH"
+    )
     models = load_models_from_env()
     require_qwen_admission(models, admission_path)
     resource_admission = (
@@ -351,6 +365,11 @@ def main(argv: Iterable[str] | None = None) -> int:
     thermal_admission = (
         FileThermalAdmissionGuard(
             Path(thermal_status_path),
+            containment_path=(
+                Path(thermal_containment_path)
+                if thermal_containment_path
+                else None
+            ),
             maximum_age_seconds=float(
                 os.environ.get("SLEEPER_THERMAL_MAX_AGE_SECONDS", "5")
             ),

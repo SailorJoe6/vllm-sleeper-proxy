@@ -186,6 +186,43 @@ class ModelManager:
                     self._publish_transition("idle")
                     self._condition.notify_all()
 
+    def adopt_startup_state(self) -> None:
+        """Adopt one already-awake engine without changing any engine state.
+
+        This is used only when the proxy control plane restarts around an
+        otherwise healthy lineup. Ambiguous state is rejected so recovery can
+        retry without sleeping or stopping a healthy engine.
+        """
+        with startup_lease(self.startup_lease_path):
+            with self._condition:
+                self._starting_model_name = "__proxy_recovery__"
+                self._publish_transition("adopting", "__proxy_recovery__")
+            try:
+                awake: list[ModelConfig] = []
+                for model in self.models:
+                    sleeping = self._is_sleeping(model)
+                    if sleeping is None:
+                        raise WakeError(
+                            f"cannot verify proxy recovery state for {model.name}"
+                        )
+                    if not sleeping:
+                        awake.append(model)
+                if len(awake) > 1:
+                    raise WakeError(
+                        "cannot adopt proxy recovery state with multiple awake models"
+                    )
+                if awake:
+                    self._wait_until_model_listed(awake[0])
+                with self._condition:
+                    self._active_model_name = awake[0].name if awake else None
+                    self._active_model_ready = bool(awake)
+                    self._startup_finalized = True
+            finally:
+                with self._condition:
+                    self._starting_model_name = None
+                    self._publish_transition("idle")
+                    self._condition.notify_all()
+
     @property
     def active_model_name(self) -> str | None:
         return self._active_model_name
@@ -208,9 +245,10 @@ class ModelManager:
     def _publish_transition(self, phase: str, model_name: str | None = None) -> None:
         """Atomically publish lifecycle ownership for the host guard.
 
-        The file is advisory only; the guard still fails closed for stale,
-        malformed, or mismatched records. Atomic replacement prevents readers
-        from observing a partially written transition.
+        The file is advisory only; the host guard validates and reports stale,
+        malformed, or mismatched records. Deployment admission policy decides
+        whether that uncertainty may gate an optional or required model. Atomic
+        replacement prevents readers from observing a partial transition.
         """
         if not self.transition_state_path:
             return

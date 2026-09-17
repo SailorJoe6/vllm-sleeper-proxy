@@ -56,9 +56,11 @@ The proxy runs that request and re-runs the admission check before releasing
 the startup lease. A smoke failure leaves the model unmarked and attempts to
 put it back to sleep.
 The operating system releases the lock if the proxy crashes, so recovery does
-not leave a permanent lease. Recovery still fails closed: it never wakes more
-than one model automatically. Whole-system startup uses the same lease while
-reconciling every configured engine to level-2 sleep.
+not leave a permanent lease. Proxy-only recovery uses `POST /startup/adopt` to
+probe and adopt exactly zero or one already-awake engine without sleeping,
+waking, or stopping any engine. Unknown state or multiple awake engines defer
+recovery without mutation. Whole-system startup instead uses the same lease
+while reconciling every configured engine to level-2 sleep.
 
 ## Current implementation
 
@@ -79,16 +81,18 @@ GBrain embedding Compose integration:
 * Each request owns its active model until its buffered or streaming response
   ends. A request for another model waits before sleeping the current engine,
   preventing an in-flight response from being evicted.
-* A file-backed admission guard can be enabled to fail closed before wake when the
-  host resource monitor is missing, stale, or denies the requested model.
+* Each `SLEEPER_MODELS` entry can declare `"required": true`. File-backed
+  resource admission keeps required models available when the host monitor is
+  missing, stale, malformed, or reports unknown model state, while fresh
+  affirmative pressure still denies. Optional models remain fail-closed.
 * A separate optional `SLEEPER_THERMAL_ADMISSION_STATUS_PATH` fast projection
-  rejects every new embeddings or chat acquisition before request-body handling
-  when thermal state is warning, sleep, cutoff, recovering, stale, malformed,
-  or unavailable. The response is HTTP 503 with `Retry-After` and
-  `error.type=thermal_cooldown`. Existing buffered or streaming leases may
-  drain; `POST /sleep` quiesces later acquisitions before sleeping the engine.
-  The consumer hard-caps status freshness at five seconds and does not own the
-  deployment's temperature thresholds.
+  keeps required acquisitions available during warning or observability-only
+  uncertainty. Fresh sleep, cutoff, or danger-derived recovery state rejects
+  acquisition before request-body handling with HTTP 503, `Retry-After`, and
+  `error.type=thermal_cooldown`. Optional models also reject missing, stale, or
+  malformed projections. Existing leases may drain; `POST /sleep` quiesces
+  later acquisitions. The consumer does not own deployment thresholds or
+  positive-danger provenance.
   The bundled memory monitor polls total-host `MemAvailable` and asks the
   proxy to quiesce and sleep the active model at the configured ceiling.
 * `services/gbrain-embeddings/` wires GBrain → LiteLLM → sleeper proxy → vLLM

@@ -150,8 +150,10 @@ from an unbudgeted startup overlap.
 - Unknown models return `404` with `type=unknown_model`.
 - Oversized bodies return `413` with `type=request_too_large`.
 - Wake failures return `503`, `type=wake_failed`, and `Retry-After: 10`.
-- Missing, stale, or denied model-specific resource admission returns `503`,
-  `type=admission_denied`, before any wake request.
+- A fresh affirmative denied model-specific resource decision returns `503`,
+  `type=admission_denied`, before wake. Required models continue through missing,
+  stale, malformed, or unknown monitor state; optional models return `503` for
+  those uncertainty cases.
 - A failed resource-backoff sleep returns `503`, `type=sleep_failed`.
 - An upstream connection or timeout failure before response headers returns
   `502` with `type=upstream_unavailable`.
