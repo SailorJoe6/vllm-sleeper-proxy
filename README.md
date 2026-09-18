@@ -99,14 +99,17 @@ GBrain embedding Compose integration:
   affirmative pressure still denies. Optional models remain fail-closed.
 * A separate optional `SLEEPER_THERMAL_ADMISSION_STATUS_PATH` fast projection
   keeps required acquisitions available during warning or observability-only
-  uncertainty. Fresh sleep, cutoff, or danger-derived recovery state rejects
-  acquisition before request-body handling with HTTP 503, `Retry-After`, and
-  `error.type=thermal_cooldown`. Optional models also reject missing, stale, or
-  malformed projections. The fast thermal projection owns thermal denial for
-  required models, so a slower resource snapshot cannot extend a cleared
-  thermal warning. Existing leases may drain; `POST /sleep` quiesces later
-  acquisitions. The consumer does not own deployment thresholds or
-  positive-danger provenance.
+  uncertainty. Fresh graceful-hold, urgent-hold, hard-cutoff, or danger-derived
+  recovery state rejects acquisition at the Sleeper Proxy boundary before Proxy
+  request-body handling with HTTP 503, integer `Retry-After`, and stable
+  `error.code=thermal_protection_active`. Optional models also reject missing,
+  stale, or malformed projections. The fast thermal projection owns thermal
+  denial for required models, so a slower resource snapshot cannot extend a
+  cleared thermal warning. Existing leases may drain; action-scoped thermal
+  sleep quiesces later acquisitions. LiteLLM keeps retries disabled and
+  preserves this response; no additional LAN-edge thermal proxy is required.
+  The consumer does not own deployment thresholds or positive-danger
+  provenance.
   The bundled memory monitor polls total-host `MemAvailable` and asks the
   proxy to quiesce and sleep the active model at the configured ceiling.
 * `services/gbrain-embeddings/` wires GBrain → LiteLLM → sleeper proxy → vLLM
