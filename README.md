@@ -66,10 +66,13 @@ while reconciling every configured engine to level-2 sleep.
 
 Startup adoption repairs Proxy restart state. It does not by itself repair a
 still-running Proxy whose owned engine later exits. Until `SLP-LIFE-011` is
-implemented, this is a blocking lifecycle limitation: runtime ownership
-reconciliation must use exact engine identity/generation and sleep/stop
-evidence, and must not clear ownership merely because DNS or the control socket
-is unavailable.
+implemented, this is a blocking lifecycle limitation: the proxy must invalidate
+stale ready fast paths, return intentional 503 while lifecycle state is unknown,
+and use positive vLLM sleep evidence or the supported host lifecycle path to
+establish stopped/all-sleeping state before another model may wake. DNS or
+control-socket failure alone is never sleep proof. Thermal recovery does not
+remember or preemptively resume the prior model; a normal client retry wakes its
+requested model after safe all-sleeping release.
 
 ## Current implementation
 
