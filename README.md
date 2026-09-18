@@ -13,7 +13,9 @@ puts each awake engine into level-2 sleep, and verifies that every engine
 reports sleeping. Only then does it begin serving with `active_model: null`.
 Startup fails closed if any engine is unavailable, rejects the sleep request,
 or cannot provide a boolean `/is_sleeping` state. This startup reconciliation
-repairs model state lost across proxy, container, Docker, or host restarts.
+repairs state when the Proxy itself bootstraps after a proxy, container, Docker,
+or host restart. It does not by itself repair a still-running Proxy whose owned
+engine later exits; that runtime ownership case is governed by `SLP-LIFE-011`.
 
 ---
 
@@ -61,6 +63,13 @@ probe and adopt exactly zero or one already-awake engine without sleeping,
 waking, or stopping any engine. Unknown state or multiple awake engines defer
 recovery without mutation. Whole-system startup instead uses the same lease
 while reconciling every configured engine to level-2 sleep.
+
+Startup adoption repairs Proxy restart state. It does not by itself repair a
+still-running Proxy whose owned engine later exits. Until `SLP-LIFE-011` is
+implemented, this is a blocking lifecycle limitation: runtime ownership
+reconciliation must use exact engine identity/generation and sleep/stop
+evidence, and must not clear ownership merely because DNS or the control socket
+is unavailable.
 
 ## Current implementation
 
