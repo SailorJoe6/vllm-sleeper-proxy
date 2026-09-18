@@ -167,6 +167,150 @@ class AdmissionTests(unittest.TestCase):
             with self.assertRaises(ThermalCooldownError):
                 FileThermalAdmissionGuard(path, now=lambda: 104.0)(REQUIRED_MODEL)
 
+    def test_cooldown_error_sanitizes_public_metadata_and_retry(self) -> None:
+        error = ThermalCooldownError(
+            "private diagnostic",
+            state="sleep\nsecret",
+            action_id="token=should-not-leak",
+            retry_after_seconds=True,
+        )
+        self.assertEqual("unavailable", error.phase)
+        self.assertIsNone(error.action_id)
+        self.assertEqual(10, error.retry_after_seconds)
+        for invalid_phase in ([], {}, None):
+            with self.subTest(invalid_phase=invalid_phase):
+                malformed = ThermalCooldownError(
+                    "private diagnostic",
+                    state=invalid_phase,
+                    retry_after_seconds=10,
+                )
+                self.assertEqual("unavailable", malformed.phase)
+                self.assertIsNone(malformed.action_id)
+        bounded = ThermalCooldownError(
+            "bounded",
+            state="urgent_hold",
+            action_id="thermal-safe",
+            retry_after_seconds=100000,
+        )
+        self.assertEqual("urgent_hold", bounded.phase)
+        self.assertEqual("thermal-safe", bounded.action_id)
+        self.assertEqual(3600, bounded.retry_after_seconds)
+
+    def test_thermal_snapshot_exposes_only_sanitized_hold_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            status_path = self.write_status(
+                root,
+                self.thermal_status(state="recovering", allowed=False),
+            )
+            containment_path = root / "containment.json"
+            containment_path.write_text(json.dumps({
+                "schema_version": 1,
+                "active": True,
+                "state": "sleep",
+                "action_id": "thermal-600-accepted",
+            }))
+            guard = FileThermalAdmissionGuard(
+                status_path,
+                containment_path=containment_path,
+                now=lambda: 104.0,
+            )
+            snapshot = guard.snapshot(REQUIRED_MODEL)
+            self.assertTrue(snapshot.fenced)
+            self.assertEqual("sleep", snapshot.phase)
+            self.assertEqual("thermal-600-accepted", snapshot.action_id)
+            self.assertEqual(60, snapshot.retry_after_seconds)
+
+            containment_path.write_text(json.dumps({
+                "schema_version": 1,
+                "active": True,
+                "state": "sleep\nsecret",
+                "action_id": "token=should-not-leak",
+            }))
+            sanitized = guard.snapshot(REQUIRED_MODEL)
+            self.assertTrue(sanitized.fenced)
+            self.assertEqual("recovering", sanitized.phase)
+            self.assertIsNone(sanitized.action_id)
+
+    def test_malformed_active_phase_and_extreme_times_remain_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            status_path = self.write_status(root, self.thermal_status())
+            containment_path = root / "containment.json"
+            guard = FileThermalAdmissionGuard(
+                status_path,
+                containment_path=containment_path,
+                now=lambda: 104.0,
+            )
+            for invalid_phase in ([], {}, None):
+                with self.subTest(invalid_phase=invalid_phase):
+                    containment_path.write_text(json.dumps({
+                        "schema_version": 1,
+                        "active": True,
+                        "state": invalid_phase,
+                        "action_id": "thermal-corrupt-phase",
+                    }))
+                    snapshot = guard.snapshot(REQUIRED_MODEL)
+                    self.assertTrue(snapshot.fenced)
+                    self.assertEqual("recovering", snapshot.phase)
+                    self.assertEqual("thermal-corrupt-phase", snapshot.action_id)
+
+            extreme = self.thermal_status()
+            extreme["generated_at_epoch"] = 10**400
+            status_path.write_text(json.dumps(extreme))
+            containment_path.write_text(json.dumps({
+                "schema_version": 1,
+                "active": True,
+                "state": "sleep",
+                "action_id": "thermal-extreme-time",
+            }))
+            active = guard.snapshot(REQUIRED_MODEL)
+            self.assertTrue(active.fenced)
+            self.assertEqual("sleep", active.phase)
+            self.assertEqual("thermal-extreme-time", active.action_id)
+
+            containment_path.write_text(json.dumps({"active": False}))
+            required = guard.snapshot(REQUIRED_MODEL)
+            self.assertFalse(required.fenced)
+            self.assertEqual("unavailable", required.phase)
+            optional = guard.snapshot(MODEL)
+            self.assertTrue(optional.fenced)
+            self.assertEqual("unavailable", optional.phase)
+
+    def test_thermal_snapshot_clamps_retry_bounds_and_rejects_boolean(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = self.write_status(
+                root,
+                self.thermal_status(
+                    state="sleep", allowed=False, retry_after=-20
+                ),
+            )
+            guard = FileThermalAdmissionGuard(path, now=lambda: 104.0)
+            self.assertEqual(1, guard.snapshot(REQUIRED_MODEL).retry_after_seconds)
+            payload = self.thermal_status(
+                state="sleep", allowed=False, retry_after=100000
+            )
+            path.write_text(json.dumps(payload))
+            self.assertEqual(3600, guard.snapshot(REQUIRED_MODEL).retry_after_seconds)
+            payload["retry_after_seconds"] = True
+            path.write_text(json.dumps(payload))
+            boolean = guard.snapshot(REQUIRED_MODEL)
+            self.assertFalse(boolean.fenced)
+            self.assertEqual("unavailable", boolean.phase)
+
+    def test_required_thermal_snapshot_allows_monitor_uncertainty(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            snapshot = FileThermalAdmissionGuard(
+                root / "missing.json",
+                containment_path=root / "missing-containment.json",
+                now=lambda: 100.0,
+            ).snapshot(REQUIRED_MODEL)
+            self.assertFalse(snapshot.fenced)
+            self.assertEqual("unavailable", snapshot.phase)
+            self.assertIsNone(snapshot.action_id)
+
     def test_required_resource_guard_allows_uncertainty_but_not_explicit_danger(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

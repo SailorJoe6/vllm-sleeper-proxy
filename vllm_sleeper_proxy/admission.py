@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 import json
 import math
 import re
@@ -84,16 +85,63 @@ class FileAdmissionGuard:
 THERMAL_STATES = {
     "healthy", "warning", "sleep", "recovering", "cutoff", "telemetry_failure",
 }
+PUBLIC_THERMAL_PHASES = THERMAL_STATES | {
+    "graceful_hold",
+    "urgent_hold",
+    "held",
+    "hard_cutoff",
+    "release_authorized",
+    "releasing",
+    "stale",
+    "unavailable",
+}
 THERMAL_REASON = re.compile(r"^[a-z0-9_]{1,128}$")
+THERMAL_ACTION_ID = re.compile(r"^[A-Za-z0-9_.:@-]{1,128}$")
+
+
+@dataclass(frozen=True)
+class ThermalAdmissionSnapshot:
+    """Sanitized, non-mutating view of the fast thermal admission state."""
+
+    fenced: bool
+    phase: str
+    action_id: str | None
+    retry_after_seconds: int
+    detail: str
 
 
 class ThermalCooldownError(AdmissionError):
     """New inference is paused by the independent fast thermal watchdog."""
 
-    def __init__(self, message: str, *, state: str, retry_after_seconds: int) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        state: str,
+        retry_after_seconds: int,
+        action_id: str | None = None,
+    ) -> None:
         super().__init__(message)
-        self.state = state
-        self.retry_after_seconds = retry_after_seconds
+        phase = (
+            state
+            if isinstance(state, str) and state in PUBLIC_THERMAL_PHASES
+            else "unavailable"
+        )
+        sanitized_action_id = (
+            action_id
+            if isinstance(action_id, str) and THERMAL_ACTION_ID.fullmatch(action_id)
+            else None
+        )
+        sanitized_retry = (
+            retry_after_seconds
+            if isinstance(retry_after_seconds, int)
+            and not isinstance(retry_after_seconds, bool)
+            else 10
+        )
+        self.state = phase
+        self.phase = phase
+        self.action_id = sanitized_action_id
+        self.retry_after_seconds = max(1, min(3600, sanitized_retry))
 
 
 class FileThermalAdmissionGuard:
@@ -112,27 +160,46 @@ class FileThermalAdmissionGuard:
         self.containment_path = containment_path
         self.now = now
         self.maximum_age_seconds = maximum_age_seconds
-        self.default_retry_after_seconds = default_retry_after_seconds
+        normalized_default_retry = (
+            default_retry_after_seconds
+            if isinstance(default_retry_after_seconds, int)
+            and not isinstance(default_retry_after_seconds, bool)
+            else 10
+        )
+        self.default_retry_after_seconds = max(
+            1, min(3600, normalized_default_retry)
+        )
 
-    def _containment_active(self) -> bool:
+    def _containment_snapshot(self) -> tuple[bool, str | None, str | None]:
         if self.containment_path is None:
-            return False
+            return False, None, None
         try:
             value = json.loads(self.containment_path.read_text(encoding="utf-8"))
         except (OSError, TypeError, ValueError, json.JSONDecodeError):
-            return False
-        return isinstance(value, dict) and value.get("active") is True
-
-    def _deny(self, state: str, retry_after: int, detail: str) -> None:
-        raise ThermalCooldownError(
-            "thermal_cooldown: new inference requests are paused while DGX "
-            f"temperatures recover; state={state}; {detail}",
-            state=state,
-            retry_after_seconds=max(1, min(3600, retry_after)),
+            return False, None, None
+        if not isinstance(value, dict) or value.get("active") is not True:
+            return False, None, None
+        raw_phase = value.get("phase", value.get("state"))
+        phase = (
+            raw_phase
+            if isinstance(raw_phase, str) and raw_phase in PUBLIC_THERMAL_PHASES
+            else "recovering"
         )
+        raw_action_id = value.get("action_id")
+        action_id = (
+            raw_action_id
+            if isinstance(raw_action_id, str)
+            and THERMAL_ACTION_ID.fullmatch(raw_action_id)
+            else None
+        )
+        return True, phase, action_id
 
-    def __call__(self, model: ModelConfig) -> None:
-        containment_active = self._containment_active()
+    def snapshot(self, model: ModelConfig) -> ThermalAdmissionSnapshot:
+        """Read one bounded sanitized decision for request and health paths."""
+
+        containment_active, containment_phase, action_id = (
+            self._containment_snapshot()
+        )
         try:
             status = json.loads(self.status_path.read_text(encoding="utf-8"))
             if not isinstance(status, dict):
@@ -157,7 +224,7 @@ class FileThermalAdmissionGuard:
             )
             if not isinstance(raw_retry, int) or isinstance(raw_retry, bool):
                 raise ValueError("invalid retry-after")
-            retry_after = raw_retry
+            retry_after = max(1, min(3600, raw_retry))
             reason_codes = status.get("reason_codes", [])
             if (
                 not isinstance(reason_codes, list)
@@ -178,36 +245,91 @@ class FileThermalAdmissionGuard:
                 raise ValueError("inconsistent thermal reason")
             if allowed != (state in required_allowed_states):
                 raise ValueError("inconsistent thermal allowed state")
-        except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+        except (
+            KeyError,
+            OSError,
+            OverflowError,
+            TypeError,
+            ValueError,
+            json.JSONDecodeError,
+        ):
             if model.required and not containment_active:
-                return
-            self._deny(
-                "unavailable",
+                return ThermalAdmissionSnapshot(
+                    False,
+                    "unavailable",
+                    None,
+                    self.default_retry_after_seconds,
+                    "fast thermal status is unavailable",
+                )
+            return ThermalAdmissionSnapshot(
+                True,
+                containment_phase or "unavailable",
+                action_id,
                 self.default_retry_after_seconds,
                 "fast thermal status is unavailable",
             )
-            return
-        age = self.now() - generated_at
-        max_age = min(self.maximum_age_seconds, published_max_age)
+
         if containment_active:
-            self._deny(
-                "recovering",
+            return ThermalAdmissionSnapshot(
+                True,
+                containment_phase or "recovering",
+                action_id,
                 retry_after,
                 "positive danger containment latch is active",
             )
+
+        age = self.now() - generated_at
+        max_age = min(self.maximum_age_seconds, published_max_age)
         if age < -2 or age > max_age:
             if model.required and allowed:
-                return
-            self._deny(
+                return ThermalAdmissionSnapshot(
+                    False,
+                    "stale",
+                    None,
+                    self.default_retry_after_seconds,
+                    "fast thermal status is stale",
+                )
+            return ThermalAdmissionSnapshot(
+                True,
                 "stale",
+                None,
                 self.default_retry_after_seconds,
                 "fast thermal status is stale",
             )
         if model.required and allowed and state in required_allowed_states:
-            return
-        if not allowed or state != "healthy":
-            self._deny(
+            return ThermalAdmissionSnapshot(
+                False,
                 state,
+                None,
+                retry_after,
+                "required model remains available",
+            )
+        if not allowed or state != "healthy":
+            return ThermalAdmissionSnapshot(
+                True,
+                state,
+                None,
                 retry_after,
                 "retry after the watchdog completes its cool recovery hold",
             )
+        return ThermalAdmissionSnapshot(
+            False,
+            state,
+            None,
+            retry_after,
+            "thermal admission allowed",
+        )
+
+    def _deny(self, snapshot: ThermalAdmissionSnapshot) -> None:
+        raise ThermalCooldownError(
+            "thermal_cooldown: new inference requests are paused while DGX "
+            f"temperatures recover; state={snapshot.phase}; {snapshot.detail}",
+            state=snapshot.phase,
+            retry_after_seconds=snapshot.retry_after_seconds,
+            action_id=snapshot.action_id,
+        )
+
+    def __call__(self, model: ModelConfig) -> None:
+        snapshot = self.snapshot(model)
+        if snapshot.fenced:
+            self._deny(snapshot)

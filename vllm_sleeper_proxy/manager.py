@@ -249,6 +249,13 @@ class ModelManager:
             "sleeping",
         }
 
+    def thermal_admission_snapshot(self):
+        """Return a sanitized fast-gate view without lifecycle lock contention."""
+        observer = getattr(self.pre_admission_check, "snapshot", None)
+        if not callable(observer):
+            return None
+        return observer(self.models[0])
+
     @property
     def starting_model_name(self) -> str | None:
         """Model that owns the startup lease until readiness is verified.

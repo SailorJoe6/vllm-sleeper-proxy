@@ -240,6 +240,79 @@ class ServerTests(unittest.TestCase):
         self.assertFalse(request_thread.is_alive())
         self.assertEqual(result[0][0], 200)
 
+    def test_active_thermal_hold_keeps_control_health_and_fences_inference(self) -> None:
+        from pathlib import Path
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            status_path = root / "admission.json"
+            containment_path = root / "containment.json"
+            status_path.write_text(json.dumps({
+                "schema_version": 1,
+                "generated_at_epoch": time.time(),
+                "max_age_seconds": 5,
+                "allowed": False,
+                "state": "recovering",
+                "reason": "thermal_cooldown",
+                "reason_codes": ["acpi_temperature_requires_sleep"],
+                "retry_after_seconds": 60,
+                "sequence": 7,
+            }))
+            containment_path.write_text(json.dumps({
+                "schema_version": 1,
+                "active": True,
+                "state": "sleep",
+                "action_id": "thermal-600-accepted",
+            }))
+            self.manager.pre_admission_check = FileThermalAdmissionGuard(
+                status_path,
+                containment_path=containment_path,
+            )
+            self.http.requests.clear()
+
+            health = self.get_json("/healthz")
+            self.assertTrue(health["ok"])
+            self.assertTrue(health["startup_finalized"])
+            self.assertEqual("finalized", health["startup_state"])
+            self.assertTrue(health["lifecycle_ready"])
+            self.assertFalse(health["ready"])
+            self.assertFalse(health["inference_available"])
+            self.assertEqual("sleep", health["thermal_phase"])
+            self.assertEqual("thermal-600-accepted", health["thermal_action_id"])
+
+            request = Request(f"{self.base_url}/v1/embeddings", method="POST")
+            with self.assertRaises(HTTPError) as caught:
+                urlopen(request, timeout=2)
+            self.assertEqual(503, caught.exception.code)
+            self.assertEqual("60", caught.exception.headers["Retry-After"])
+            error = json.loads(caught.exception.read())["error"]
+            self.assertEqual("thermal_protection_active", error["code"])
+            self.assertEqual("sleep", error["thermal_phase"])
+            self.assertEqual("thermal-600-accepted", error["action_id"])
+            self.assertEqual([], self.http.requests)
+
+            containment_path.write_text(json.dumps({
+                "schema_version": 1,
+                "active": True,
+                "state": [],
+                "action_id": "thermal-corrupt-health",
+            }))
+            corrupt_status = json.loads(status_path.read_text())
+            corrupt_status["generated_at_epoch"] = 10**400
+            status_path.write_text(json.dumps(corrupt_status))
+            health = self.get_json("/healthz")
+            self.assertTrue(health["ok"])
+            self.assertFalse(health["inference_available"])
+            self.assertEqual("recovering", health["thermal_phase"])
+            self.assertEqual("thermal-corrupt-health", health["thermal_action_id"])
+            with self.assertRaises(HTTPError) as corrupt:
+                urlopen(request, timeout=2)
+            corrupt_error = json.loads(corrupt.exception.read())["error"]
+            self.assertEqual("thermal_protection_active", corrupt_error["code"])
+            self.assertEqual("recovering", corrupt_error["thermal_phase"])
+            self.assertEqual("thermal-corrupt-health", corrupt_error["action_id"])
+
     def test_sleep_endpoint_quiesces_active_model(self) -> None:
         self.post_json(
             "/v1/embeddings",
@@ -250,6 +323,18 @@ class ServerTests(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["slept_model"], "Qwen3-Embedding-8B")
         self.assertIsNone(self.manager.active_model_name)
+
+    def test_bodyless_sleep_endpoint_remains_compatible(self) -> None:
+        self.post_json(
+            "/v1/embeddings",
+            {"model": "Qwen3-Embedding-8B", "input": "hello"},
+        )
+        request = Request(f"{self.base_url}/sleep", method="POST")
+        with urlopen(request, timeout=2) as response:
+            self.assertEqual(200, response.status)
+            payload = json.loads(response.read())
+        self.assertTrue(payload["ok"])
+        self.assertEqual("Qwen3-Embedding-8B", payload["slept_model"])
 
     def test_server_does_not_bind_when_startup_reconciliation_fails(self) -> None:
         class FailedStartupManager(ModelManager):
@@ -292,10 +377,14 @@ class ServerTests(unittest.TestCase):
                 self.assertEqual(503, caught.exception.code)
                 self.assertEqual("60", caught.exception.headers["Retry-After"])
                 body = json.loads(caught.exception.read().decode())
-                self.assertEqual("thermal_cooldown", body["error"]["type"])
-                self.assertEqual("warning", body["error"]["thermal_state"])
+                self.assertEqual("service_unavailable", body["error"]["type"])
+                self.assertEqual("thermal_protection_active", body["error"]["code"])
+                self.assertEqual("warning", body["error"]["thermal_phase"])
                 self.assertEqual(60, body["error"]["retry_after_seconds"])
-                self.assertIn("thermal_cooldown", body["error"]["message"])
+                self.assertEqual(
+                    "Inference is temporarily paused for thermal protection. Retry shortly.",
+                    body["error"]["message"],
+                )
         self.assertEqual([], self.http.requests)
         self.assertEqual(0, self.manager.inflight_requests)
 
@@ -307,15 +396,166 @@ class ServerTests(unittest.TestCase):
                 retry_after_seconds=10,
             )
         self.manager.pre_admission_check = deny
-        req = Request(f"{self.base_url}/v1/embeddings", method="POST")
-        with self.assertRaises(HTTPError) as caught:
-            urlopen(req, timeout=2)
-        self.assertEqual(503, caught.exception.code)
-        self.assertEqual("10", caught.exception.headers["Retry-After"])
-        self.assertEqual(
-            "thermal_cooldown",
-            json.loads(caught.exception.read())["error"]["type"],
-        )
+        self.http.requests.clear()
+        for path in ("/v1/embeddings", "/v1/chat/completions"):
+            with self.subTest(path=path):
+                req = Request(f"{self.base_url}{path}", method="POST")
+                with self.assertRaises(HTTPError) as caught:
+                    urlopen(req, timeout=2)
+                self.assertEqual(503, caught.exception.code)
+                self.assertEqual("10", caught.exception.headers["Retry-After"])
+                error = json.loads(caught.exception.read())["error"]
+                self.assertEqual("service_unavailable", error["type"])
+                self.assertEqual("thermal_protection_active", error["code"])
+        self.assertEqual([], self.http.requests)
+
+    def test_thermal_cooldown_precedes_malformed_oversized_and_chunked_bodies(self) -> None:
+        def deny(model) -> None:
+            raise ThermalCooldownError(
+                "must not be exposed",
+                state="urgent_hold",
+                retry_after_seconds=7,
+            )
+
+        self.manager.pre_admission_check = deny
+        self.http.requests.clear()
+        for path, body in (
+            ("/v1/embeddings", b"{"),
+            (
+                "/v1/chat/completions",
+                b'{"model":"alias","messages":[],"stream":true}',
+            ),
+        ):
+            with self.subTest(path=path):
+                request = Request(
+                    f"{self.base_url}{path}",
+                    data=body,
+                    headers={"content-type": "application/json"},
+                    method="POST",
+                )
+                with self.assertRaises(HTTPError) as caught:
+                    urlopen(request, timeout=2)
+                self.assertEqual(503, caught.exception.code)
+                self.assertEqual("7", caught.exception.headers["Retry-After"])
+                self.assertEqual(
+                    "thermal_protection_active",
+                    json.loads(caught.exception.read())["error"]["code"],
+                )
+
+        for extra_headers in (
+            b"Content-Length: 999999999\r\n",
+            b"Transfer-Encoding: chunked\r\n",
+        ):
+            with self.subTest(headers=extra_headers):
+                client = socket.create_connection(
+                    ("127.0.0.1", self.server.server_address[1]),
+                    timeout=1,
+                )
+                client.settimeout(1)
+                client.sendall(
+                    b"POST /v1/embeddings HTTP/1.1\r\n"
+                    b"Host: localhost\r\n"
+                    + extra_headers
+                    + b"Connection: close\r\n\r\n"
+                )
+                response = b""
+                while True:
+                    chunk = client.recv(65536)
+                    if not chunk:
+                        break
+                    response += chunk
+                client.close()
+                self.assertIn(b" 503 ", response.split(b"\r\n", 1)[0])
+                self.assertIn(b"thermal_protection_active", response)
+        self.assertEqual([], self.http.requests)
+        self.assertEqual(0, self.manager.inflight_requests)
+
+    def test_restart_adoption_refences_from_active_v1_latch(self) -> None:
+        from pathlib import Path
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            status_path = root / "admission.json"
+            containment_path = root / "containment.json"
+            status_path.write_text(json.dumps({
+                "schema_version": 1,
+                "generated_at_epoch": time.time(),
+                "max_age_seconds": 5,
+                "allowed": False,
+                "state": "recovering",
+                "reason": "thermal_cooldown",
+                "reason_codes": ["thermal_recovery_hold_pending"],
+                "retry_after_seconds": 60,
+                "sequence": 8,
+            }))
+            containment_path.write_text(json.dumps({
+                "schema_version": 1,
+                "active": True,
+                "state": "sleep",
+                "action_id": "thermal-restart-proof",
+            }))
+            model = ModelConfig(
+                name="Qwen3-Embedding-8B",
+                upstream_model="Qwen/Qwen3-Embedding-8B",
+                upstream_base_url="http://vllm:8888/v1",
+                control_base_url="http://vllm:8888",
+                required=True,
+            )
+            restart_http = ProxyHttp()
+            guard = FileThermalAdmissionGuard(
+                status_path,
+                containment_path=containment_path,
+            )
+            manager = ModelManager(
+                [model],
+                restart_http,
+                bootstrap_mode=True,
+                pre_admission_check=guard,
+                admission_check=guard,
+                poll_interval_s=0,
+                wake_timeout_s=1,
+            )
+            server = build_server("127.0.0.1", 0, manager)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            base_url = f"http://127.0.0.1:{server.server_address[1]}"
+            try:
+                inference = Request(
+                    f"{base_url}/v1/embeddings",
+                    data=b"not-json",
+                    method="POST",
+                )
+                with self.assertRaises(HTTPError) as before_finalize:
+                    urlopen(inference, timeout=2)
+                before = json.loads(before_finalize.exception.read())["error"]
+                self.assertEqual("thermal_protection_active", before["code"])
+                self.assertEqual("thermal-restart-proof", before["action_id"])
+
+                adopt = Request(
+                    f"{base_url}/startup/adopt",
+                    data=b"{}",
+                    method="POST",
+                )
+                with urlopen(adopt, timeout=2) as response:
+                    self.assertEqual(200, response.status)
+                with urlopen(f"{base_url}/healthz", timeout=2) as response:
+                    health = json.loads(response.read())
+                self.assertTrue(health["ok"])
+                self.assertFalse(health["inference_available"])
+                self.assertEqual("thermal-restart-proof", health["thermal_action_id"])
+
+                with self.assertRaises(HTTPError) as after_adopt:
+                    urlopen(inference, timeout=2)
+                self.assertEqual(
+                    "thermal_protection_active",
+                    json.loads(after_adopt.exception.read())["error"]["code"],
+                )
+                self.assertFalse(any("/wake_up" in url for _, url, _ in restart_http.requests))
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
 
     def test_missing_fast_thermal_status_is_user_facing_cooldown(self) -> None:
         from pathlib import Path
@@ -335,15 +575,16 @@ class ServerTests(unittest.TestCase):
             self.assertEqual(503, caught.exception.code)
             self.assertEqual("10", caught.exception.headers["Retry-After"])
             body = json.loads(caught.exception.read())
-            self.assertEqual("thermal_cooldown", body["error"]["type"])
-            self.assertEqual("unavailable", body["error"]["thermal_state"])
+            self.assertEqual("service_unavailable", body["error"]["type"])
+            self.assertEqual("thermal_protection_active", body["error"]["code"])
+            self.assertEqual("unavailable", body["error"]["thermal_phase"])
             (Path(directory) / "missing.json").write_text("[]")
             with self.assertRaises(HTTPError) as malformed:
                 urlopen(req, timeout=2)
             self.assertEqual(503, malformed.exception.code)
             self.assertEqual(
-                "thermal_cooldown",
-                json.loads(malformed.exception.read())["error"]["type"],
+                "thermal_protection_active",
+                json.loads(malformed.exception.read())["error"]["code"],
             )
 
     def test_thermal_cooldown_denies_same_model_already_awake(self) -> None:
@@ -368,7 +609,7 @@ class ServerTests(unittest.TestCase):
         with self.assertRaises(HTTPError) as caught:
             urlopen(req, timeout=2)
         self.assertEqual(503, caught.exception.code)
-        self.assertEqual("thermal_cooldown", json.loads(caught.exception.read())["error"]["type"])
+        self.assertEqual("thermal_protection_active", json.loads(caught.exception.read())["error"]["code"])
         self.assertEqual([], self.http.requests)
 
     def test_embedding_request_wakes_and_forwards(self) -> None:

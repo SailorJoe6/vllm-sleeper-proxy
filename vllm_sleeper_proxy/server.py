@@ -83,10 +83,21 @@ class SleeperProxyHandler(BaseHTTPRequestHandler):
             return
         if path == "/healthz":
             finalized = self.manager.startup_finalized
+            lifecycle_ready = self.manager.inference_ready
+            thermal = self.manager.thermal_admission_snapshot()
+            thermal_fenced = bool(thermal is not None and thermal.fenced)
+            inference_available = lifecycle_ready and not thermal_fenced
             self._send_json(200 if finalized else 503, {
                 "ok": finalized,
-                "ready": self.manager.inference_ready,
+                "control_healthy": finalized,
+                "startup_finalized": finalized,
+                "startup_state": "finalized" if finalized else "initializing",
+                "ready": inference_available,
+                "inference_available": inference_available,
+                "lifecycle_ready": lifecycle_ready,
                 "lifecycle_state": self.manager.lifecycle_state,
+                "thermal_phase": thermal.phase if thermal is not None else "unconfigured",
+                "thermal_action_id": thermal.action_id if thermal is not None else None,
                 "active_model": self.manager.active_model_name,
                 "starting_model": self.manager.starting_model_name,
                 "inflight_requests": self.manager.inflight_requests,
@@ -309,15 +320,19 @@ class SleeperProxyHandler(BaseHTTPRequestHandler):
         return decoded if isinstance(decoded, dict) else None
 
     def _send_thermal_cooldown(self, exc: ThermalCooldownError) -> None:
+        fields: dict[str, object] = {
+            "code": "thermal_protection_active",
+            "thermal_phase": exc.phase,
+            "retry_after_seconds": exc.retry_after_seconds,
+        }
+        if exc.action_id is not None:
+            fields["action_id"] = exc.action_id
         self._send_error(
             503,
-            str(exc),
-            "thermal_cooldown",
+            "Inference is temporarily paused for thermal protection. Retry shortly.",
+            "service_unavailable",
             {"Retry-After": str(exc.retry_after_seconds)},
-            {
-                "thermal_state": exc.state,
-                "retry_after_seconds": exc.retry_after_seconds,
-            },
+            fields,
         )
 
     def _send_error(

@@ -120,7 +120,18 @@ GBrain embedding Compose integration:
   sleep quiesces later acquisitions. LiteLLM keeps retries disabled and
   preserves this response; no additional LAN-edge thermal proxy is required.
   The consumer does not own deployment thresholds or positive-danger
-  provenance.
+  provenance. The denial body uses a constant public message with
+  `error.type=service_unavailable`, `error.code=thermal_protection_active`, a
+  bounded integer `Retry-After`, and only validated phase/action metadata.
+  `/healthz` remains HTTP 200 with `ok=true` for a finalized control plane
+  during an intentional hold, while `ready=false` and
+  `inference_available=false` distinguish the fenced request plane. It also
+  reports startup, lifecycle readiness, selected/starting model, and sanitized
+  thermal phase/action fields without waiting for a lifecycle lease.
+  The schema-v1 root watchdog and memory-pressure monitor may continue using
+  the existing bodyless loopback `POST /sleep`. No action-scoped thermal
+  control endpoint is enabled in this compatibility stage; the deployment must
+  add one only with the matching root action-record/caller migration.
   The bundled memory monitor polls total-host `MemAvailable` and asks the
   proxy to quiesce and sleep the active model at the configured ceiling.
 * `services/gbrain-embeddings/` wires GBrain → LiteLLM → sleeper proxy → vLLM
