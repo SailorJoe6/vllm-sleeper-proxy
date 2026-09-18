@@ -16,7 +16,12 @@ from .admission import (
     ThermalCooldownError,
 )
 from .config import load_models_from_env
-from .manager import ModelManager, UnknownModelError, WakeError
+from .manager import (
+    LifecycleUnavailableError,
+    ModelManager,
+    UnknownModelError,
+    WakeError,
+)
 
 def require_qwen_admission(models, admission_path: str | None) -> None:
     if any(model.upstream_model == "unsloth/Qwen3.8-27B-NVFP4" for model in models) and not admission_path:
@@ -80,9 +85,11 @@ class SleeperProxyHandler(BaseHTTPRequestHandler):
             finalized = self.manager.startup_finalized
             self._send_json(200 if finalized else 503, {
                 "ok": finalized,
-                "ready": finalized,
+                "ready": self.manager.inference_ready,
+                "lifecycle_state": self.manager.lifecycle_state,
                 "active_model": self.manager.active_model_name,
                 "starting_model": self.manager.starting_model_name,
+                "inflight_requests": self.manager.inflight_requests,
             })
         elif path == "/v1/models":
             self._send_json(200, self.manager.list_openai_models())
@@ -185,6 +192,14 @@ class SleeperProxyHandler(BaseHTTPRequestHandler):
         except UnknownModelError as exc:
             self._send_error(404, str(exc), "unknown_model")
             return
+        except LifecycleUnavailableError as exc:
+            self._send_error(
+                503,
+                str(exc),
+                "lifecycle_unavailable",
+                {"retry-after": "10"},
+            )
+            return
         except WakeError as exc:
             self._send_error(503, str(exc), "wake_failed", {"retry-after": "10"})
             return
@@ -200,12 +215,22 @@ class SleeperProxyHandler(BaseHTTPRequestHandler):
             upstream_url = f"{target.upstream_base_url}{path.removeprefix('/v1')}"
             headers = self._forward_headers(extra_content_length=len(upstream_body))
             if stream:
-                self._forward_stream(upstream_url, headers, upstream_body)
+                self._forward_stream(target, upstream_url, headers, upstream_body)
             else:
-                self._forward_buffered(upstream_url, headers, upstream_body)
+                self._forward_buffered(target, upstream_url, headers, upstream_body)
+
+    def _send_lifecycle_unavailable(self, target) -> None:
+        self.manager.mark_owner_unavailable(target)
+        self._send_error(
+            503,
+            f"lifecycle state unavailable for {target.name}; retry later",
+            "lifecycle_unavailable",
+            {"retry-after": "10"},
+        )
 
     def _forward_buffered(
         self,
+        target,
         upstream_url: str,
         headers: dict[str, str],
         upstream_body: bytes,
@@ -218,8 +243,8 @@ class SleeperProxyHandler(BaseHTTPRequestHandler):
                 body=upstream_body,
                 timeout=self.manager.request_timeout_s,
             )
-        except (ConnectionError, TimeoutError, socket.timeout) as exc:
-            self._send_error(502, str(exc), "upstream_unavailable")
+        except (ConnectionError, TimeoutError, socket.timeout):
+            self._send_lifecycle_unavailable(target)
             return
         self.send_response(response.status)
         for key, value in response.headers.items():
@@ -231,6 +256,7 @@ class SleeperProxyHandler(BaseHTTPRequestHandler):
 
     def _forward_stream(
         self,
+        target,
         upstream_url: str,
         headers: dict[str, str],
         upstream_body: bytes,
@@ -243,8 +269,8 @@ class SleeperProxyHandler(BaseHTTPRequestHandler):
                 body=upstream_body,
                 timeout=self.manager.request_timeout_s,
             )
-        except (ConnectionError, TimeoutError, socket.timeout) as exc:
-            self._send_error(502, str(exc), "upstream_unavailable")
+        except (ConnectionError, TimeoutError, socket.timeout):
+            self._send_lifecycle_unavailable(target)
             return
 
         try:
@@ -257,13 +283,10 @@ class SleeperProxyHandler(BaseHTTPRequestHandler):
             for chunk in response.iter_chunks():
                 self.wfile.write(chunk)
                 self.wfile.flush()
-        except (
-            BrokenPipeError,
-            ConnectionError,
-            ConnectionResetError,
-            TimeoutError,
-            socket.timeout,
-        ):
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
+        except (ConnectionError, TimeoutError, socket.timeout):
+            self.manager.mark_owner_unavailable(target)
             self.close_connection = True
         finally:
             response.close()
@@ -383,6 +406,9 @@ def main(argv: Iterable[str] | None = None) -> int:
         UrllibHttpClient(),
         sleep_level=int(os.environ.get("SLEEPER_SLEEP_LEVEL", "2")),
         request_timeout_s=float(os.environ.get("SLEEPER_REQUEST_TIMEOUT_SECONDS", "30")),
+        owner_validation_timeout_s=float(
+            os.environ.get("SLEEPER_OWNER_VALIDATION_TIMEOUT_SECONDS", "2")
+        ),
         wake_timeout_s=float(os.environ.get("SLEEPER_WAKE_TIMEOUT_SECONDS", "300")),
         drain_timeout_s=float(os.environ.get("SLEEPER_DRAIN_TIMEOUT_SECONDS", "300")),
         poll_interval_s=float(os.environ.get("SLEEPER_POLL_INTERVAL_SECONDS", "1")),

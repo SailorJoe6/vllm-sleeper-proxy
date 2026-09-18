@@ -208,6 +208,38 @@ class ServerTests(unittest.TestCase):
         payload = self.get_json("/v1/models")
         self.assertEqual(payload["data"][0]["id"], "Qwen3-Embedding-8B")
 
+    def test_healthz_is_nonblocking_while_lifecycle_holds_condition(self) -> None:
+        readiness_started = threading.Event()
+        release_readiness = threading.Event()
+        original = self.manager._wait_until_model_listed
+
+        def blocked_readiness(model):
+            readiness_started.set()
+            release_readiness.wait(timeout=2)
+            original(model)
+
+        self.manager._wait_until_model_listed = blocked_readiness
+        result = []
+        request_thread = threading.Thread(
+            target=lambda: result.append(self.post_json(
+                "/v1/embeddings",
+                {"model": "Qwen3-Embedding-8B", "input": "health"},
+            ))
+        )
+        request_thread.start()
+        self.assertTrue(readiness_started.wait(timeout=1))
+        started = time.monotonic()
+        health = self.get_json("/healthz")
+        self.assertLess(time.monotonic() - started, 0.5)
+        self.assertTrue(health["ok"])
+        self.assertFalse(health["ready"])
+        self.assertEqual(health["lifecycle_state"], "starting")
+        self.assertEqual(health["inflight_requests"], 0)
+        release_readiness.set()
+        request_thread.join(timeout=2)
+        self.assertFalse(request_thread.is_alive())
+        self.assertEqual(result[0][0], 200)
+
     def test_sleep_endpoint_quiesces_active_model(self) -> None:
         self.post_json(
             "/v1/embeddings",
@@ -484,6 +516,7 @@ class ServerTests(unittest.TestCase):
         with urlopen(req, timeout=2) as response:  # noqa: S310 - local test server
             self.assertIn(b"data:", response.read())
         self.assertTrue(self.http.last_stream.closed)
+        self.assertEqual(self.manager.lifecycle_state, "unknown")
         self.assert_request_ownership_released()
 
     def test_downstream_disconnect_closes_upstream_and_releases(self) -> None:
@@ -509,7 +542,7 @@ class ServerTests(unittest.TestCase):
         self.assertTrue(controlled.closed)
         self.assert_request_ownership_released()
 
-    def test_buffered_upstream_failure_returns_stable_error_and_releases(self) -> None:
+    def test_buffered_forward_open_failure_returns_lifecycle_503_and_releases(self) -> None:
         self.http.buffer_error = ConnectionError("vLLM unavailable")
         req = Request(
             f"{self.base_url}/v1/chat/completions",
@@ -519,9 +552,12 @@ class ServerTests(unittest.TestCase):
         )
         with self.assertRaises(HTTPError) as caught:
             urlopen(req, timeout=2)  # noqa: S310 - local test server
-        self.assertEqual(caught.exception.code, 502)
+        self.assertEqual(caught.exception.code, 503)
+        self.assertEqual(caught.exception.headers["retry-after"], "10")
         payload = json.loads(caught.exception.read().decode())
-        self.assertEqual(payload["error"]["type"], "upstream_unavailable")
+        self.assertEqual(payload["error"]["type"], "lifecycle_unavailable")
+        self.assertNotIn("vLLM unavailable", payload["error"]["message"])
+        self.assertEqual(self.manager.lifecycle_state, "unknown")
         self.assert_request_ownership_released()
 
     def test_stream_open_failure_returns_stable_error_and_releases(self) -> None:
@@ -534,8 +570,10 @@ class ServerTests(unittest.TestCase):
         )
         with self.assertRaises(HTTPError) as caught:
             urlopen(req, timeout=2)  # noqa: S310 - local test server
-        self.assertEqual(caught.exception.code, 502)
-        caught.exception.read()
+        self.assertEqual(caught.exception.code, 503)
+        payload = json.loads(caught.exception.read().decode())
+        self.assertEqual(payload["error"]["type"], "lifecycle_unavailable")
+        self.assertEqual(self.manager.lifecycle_state, "unknown")
         self.assert_request_ownership_released()
 
     def test_lifecycle_transport_failure_returns_wake_error(self) -> None:
@@ -551,6 +589,44 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, 503)
         payload = json.loads(caught.exception.read().decode())
         self.assertEqual(payload["error"]["type"], "wake_failed")
+
+    def test_stale_same_model_owner_returns_503_before_upstream_forward(self) -> None:
+        status, _ = self.post_json(
+            "/v1/embeddings",
+            {"model": "Qwen3-Embedding-8B", "input": "first"},
+        )
+        self.assertEqual(status, 200)
+        before_failure = len(self.http.requests)
+        self.http.lifecycle_error = ConnectionError("owned engine unavailable")
+
+        request = Request(
+            f"{self.base_url}/v1/embeddings",
+            data=b'{"model":"Qwen3-Embedding-8B","input":"retry"}',
+            headers={"content-type": "application/json"},
+            method="POST",
+        )
+        with self.assertRaises(HTTPError) as caught:
+            urlopen(request, timeout=2)  # noqa: S310 - local test server
+        self.assertEqual(caught.exception.code, 503)
+        self.assertEqual(caught.exception.headers["retry-after"], "10")
+        payload = json.loads(caught.exception.read().decode())
+        self.assertEqual(payload["error"]["type"], "lifecycle_unavailable")
+        self.assertEqual(
+            [],
+            [
+                url
+                for _, url, _ in self.http.requests[before_failure:]
+                if url.endswith("/v1/embeddings")
+            ],
+        )
+        self.assertEqual(self.manager.inflight_requests, 0)
+
+        health = self.get_json("/healthz")
+        self.assertTrue(health["ok"])
+        self.assertFalse(health["ready"])
+        self.assertEqual(health["lifecycle_state"], "unknown")
+        self.assertEqual(health["active_model"], "Qwen3-Embedding-8B")
+        self.assertEqual(health["inflight_requests"], 0)
 
     def test_invalid_json_returns_stable_error(self) -> None:
         req = Request(
@@ -674,7 +750,9 @@ class BootstrapServerTests(unittest.TestCase):
         self.assertTrue(any(url.endswith("/is_sleeping") for url in lifecycle))
         self.assertFalse(any("/sleep?" in url for url in lifecycle))
         with urlopen(f"{self.base_url}/healthz", timeout=2) as response:
-            self.assertTrue(json.loads(response.read().decode())["ready"])
+            health = json.loads(response.read().decode())
+        self.assertTrue(health["ready"])
+        self.assertEqual(health["lifecycle_state"], "active")
 
     def test_adopt_rejects_ambiguous_awake_state_without_sleeping(self) -> None:
         second = ModelConfig(
@@ -705,7 +783,9 @@ class BootstrapServerTests(unittest.TestCase):
         with urlopen(req, timeout=2) as response:
             self.assertTrue(json.loads(response.read().decode())["finalized"])
         with urlopen(f"{self.base_url}/healthz", timeout=2) as response:
-            self.assertTrue(json.loads(response.read().decode())["ready"])
+            health = json.loads(response.read().decode())
+        self.assertTrue(health["ready"])
+        self.assertEqual(health["lifecycle_state"], "sleeping")
         req = Request(
             f"{self.base_url}/v1/embeddings",
             data=b'{"model":"Qwen3-Embedding-8B","input":"hello"}',

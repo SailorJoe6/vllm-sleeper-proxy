@@ -14,8 +14,10 @@ reports sleeping. Only then does it begin serving with `active_model: null`.
 Startup fails closed if any engine is unavailable, rejects the sleep request,
 or cannot provide a boolean `/is_sleeping` state. This startup reconciliation
 repairs state when the Proxy itself bootstraps after a proxy, container, Docker,
-or host restart. It does not by itself repair a still-running Proxy whose owned
-engine later exits; that runtime ownership case is governed by `SLP-LIFE-011`.
+or host restart. If a still-running Proxy later loses its owned engine,
+`SLP-LIFE-011` revalidates cached ownership under the same lease and exposes a
+bounded intentional 503 until positive evidence or supported host repair
+converges state.
 
 ---
 
@@ -64,15 +66,24 @@ waking, or stopping any engine. Unknown state or multiple awake engines defer
 recovery without mutation. Whole-system startup instead uses the same lease
 while reconciling every configured engine to level-2 sleep.
 
-Startup adoption repairs Proxy restart state. It does not by itself repair a
-still-running Proxy whose owned engine later exits. Until `SLP-LIFE-011` is
-implemented, this is a blocking lifecycle limitation: the proxy must invalidate
-stale ready fast paths, return intentional 503 while lifecycle state is unknown,
-and use positive vLLM sleep evidence or the supported host lifecycle path to
-establish stopped/all-sleeping state before another model may wake. DNS or
-control-socket failure alone is never sleep proof. Thermal recovery does not
-remember or preemptively resume the prior model; a normal client retry wakes its
-requested model after safe all-sleeping release.
+Startup adoption repairs Proxy restart state. Runtime owner validation implements
+`SLP-LIFE-011`: before reusing a cached same-model ready path, the Proxy uses one
+bounded validation deadline to prove that the owner is awake/listed and every
+peer is sleeping. Unknown, conflicting, DNS, control, or forward-open transport
+state invalidates cached readiness while retaining the owner, returns HTTP 503
+with `error.type=lifecycle_unavailable`, and never wakes a peer. `/healthz`
+remains HTTP 200 for a finalized control plane, reports `ok=true`, `ready=false`,
+and `lifecycle_state=unknown` so the host can route supported repair without a
+restart loop. Health fields are nonblocking observational snapshots so a long
+wake or startup-lease wait cannot fail the control-plane health probe. Positive
+sleeping evidence makes repeated sleep idempotent; the
+supported host lifecycle path owns stopped-engine repair. Thermal recovery does
+not remember or preemptively resume the prior model; a normal client retry wakes
+its requested model after safe all-sleeping release.
+
+`SLEEPER_OWNER_VALIDATION_TIMEOUT_SECONDS` is a finite positive wall-clock
+budget for the complete owner, peer, and readiness validation sequence. It
+defaults to two seconds and is separate from the longer wake/load timeout.
 
 ## Current implementation
 

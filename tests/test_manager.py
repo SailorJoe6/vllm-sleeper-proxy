@@ -64,6 +64,28 @@ def vision_model() -> ModelConfig:
     )
 
 
+class VanishingOwnerHttp(FakeHttp):
+    def __init__(self) -> None:
+        super().__init__()
+        self.owner_unreachable = False
+        self.timeouts: list[float | None] = []
+
+    def request(self, method, url, *, headers=None, body=None, timeout=None):
+        self.timeouts.append(timeout)
+        if self.owner_unreachable and (
+            url.endswith("/is_sleeping") or url.endswith("/v1/models")
+        ):
+            self.calls.append((method, url, body))
+            raise ConnectionError("owned engine unavailable")
+        return super().request(
+            method,
+            url,
+            headers=headers,
+            body=body,
+            timeout=timeout,
+        )
+
+
 class SwitchingHttp(FakeHttp):
     def request(self, method, url, *, headers=None, body=None, timeout=None):
         self.calls.append((method, url, body))
@@ -126,6 +148,16 @@ class PerModelSleepHttp(FakeHttp):
 
 
 class ModelManagerTests(unittest.TestCase):
+    def test_owner_validation_timeout_must_be_finite_and_positive(self) -> None:
+        for value in (0, -1, float("nan"), float("inf")):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "finite and greater than zero"):
+                    ModelManager(
+                        [qwen_model()],
+                        FakeHttp(),
+                        owner_validation_timeout_s=value,
+                    )
+
     def test_openai_model_list_is_logical_and_stable(self) -> None:
         manager = ModelManager([qwen_model()], FakeHttp())
         payload = manager.list_openai_models()
@@ -360,6 +392,47 @@ class ModelManagerTests(unittest.TestCase):
             [url for _, url, _ in http.calls],
         )
 
+    def test_sleep_is_idempotent_after_positive_owned_sleep_evidence(self) -> None:
+        http = FakeHttp()
+        manager = ModelManager(
+            [qwen_model()],
+            http,
+            poll_interval_s=0,
+            wake_timeout_s=1,
+        )
+        manager.acquire("Qwen3-Embedding-8B").release()
+        http.sleeping = True
+        sleep_posts_before = sum("/sleep?" in url for _, url, _ in http.calls)
+
+        self.assertEqual(
+            "Qwen3-Embedding-8B",
+            manager.sleep_active_model(),
+        )
+        self.assertEqual(
+            sleep_posts_before,
+            sum("/sleep?" in url for _, url, _ in http.calls),
+        )
+        self.assertIsNone(manager.active_model_name)
+        self.assertEqual(manager.lifecycle_state, "sleeping")
+
+    def test_sleep_preserves_owned_model_when_sleep_state_is_unknown(self) -> None:
+        http = VanishingOwnerHttp()
+        manager = ModelManager(
+            [qwen_model()],
+            http,
+            poll_interval_s=0,
+            wake_timeout_s=1,
+        )
+        manager.acquire("Qwen3-Embedding-8B").release()
+        http.owner_unreachable = True
+
+        with self.assertRaisesRegex(WakeError, "lifecycle state unavailable"):
+            manager.sleep_active_model()
+
+        self.assertEqual(manager.active_model_name, "Qwen3-Embedding-8B")
+        self.assertEqual(manager.lifecycle_state, "unknown")
+        self.assertFalse(any("/sleep?" in url for _, url, _ in http.calls))
+
     def test_thermal_sleep_drains_active_lease_and_denies_late_request(self) -> None:
         http = FakeHttp()
         manager = ModelManager(
@@ -397,11 +470,34 @@ class ModelManagerTests(unittest.TestCase):
         )
 
         self.assertIsNone(manager.sleep_active_model())
+        self.assertIn(
+            "http://vllm:8888/is_sleeping",
+            [url for _, url, _ in http.calls],
+        )
         lease = manager.acquire("Qwen3-Embedding-8B")
         lease.release()
 
         self.assertEqual("Qwen3-Embedding-8B", manager.active_model_name)
         self.assertTrue(any("/wake_up?tags=weights" in url for _, url, _ in http.calls))
+
+    def test_idempotent_sleep_rejects_unknown_unowned_engine_state(self) -> None:
+        class UnknownSleep(FakeHttp):
+            def request(self, method, url, *, headers=None, body=None, timeout=None):
+                if url.endswith("/is_sleeping"):
+                    self.calls.append((method, url, body))
+                    raise ConnectionError("engine unavailable")
+                return super().request(
+                    method,
+                    url,
+                    headers=headers,
+                    body=body,
+                    timeout=timeout,
+                )
+
+        manager = ModelManager([qwen_model()], UnknownSleep())
+        with self.assertRaisesRegex(WakeError, "all-engine sleep state unavailable"):
+            manager.sleep_active_model()
+        self.assertEqual(manager.lifecycle_state, "unknown")
 
     def test_lifecycle_status_remains_observable_during_weight_reload(self) -> None:
         class BlockingReloadHttp(FakeHttp):
@@ -775,6 +871,134 @@ class ModelManagerTests(unittest.TestCase):
         manager = ModelManager([qwen_model()], BrokenLifecycle())
         with self.assertRaisesRegex(WakeError, "lifecycle check failed"):
             manager.acquire("Qwen3-Embedding-8B")
+
+    def test_cached_ready_owner_is_revalidated_before_same_model_fast_path(self) -> None:
+        http = VanishingOwnerHttp()
+        manager = ModelManager(
+            [qwen_model()],
+            http,
+            poll_interval_s=0,
+            wake_timeout_s=1,
+            owner_validation_timeout_s=0.1,
+        )
+        manager.acquire("Qwen3-Embedding-8B").release()
+        self.assertEqual(manager.active_model_name, "Qwen3-Embedding-8B")
+
+        http.owner_unreachable = True
+        with self.assertRaisesRegex(WakeError, "lifecycle state unavailable"):
+            manager.acquire("Qwen3-Embedding-8B")
+
+        self.assertEqual(manager.active_model_name, "Qwen3-Embedding-8B")
+        self.assertEqual(manager.lifecycle_state, "unknown")
+        self.assertFalse(manager.inference_ready)
+        self.assertEqual(manager.inflight_requests, 0)
+        self.assertGreater(http.timeouts[-1], 0)
+        self.assertLessEqual(http.timeouts[-1], 0.1)
+
+    def test_cached_owner_requires_positive_peer_sleep_evidence(self) -> None:
+        for peer_state in (False, None):
+            with self.subTest(peer_state=peer_state):
+                http = PerModelSleepHttp(
+                    {"embedding": False, "vision": peer_state}
+                )
+                manager = ModelManager(
+                    [qwen_model(), vision_model()],
+                    http,
+                    owner_validation_timeout_s=0.1,
+                )
+                manager._active_model_name = "Qwen3-Embedding-8B"  # noqa: SLF001
+                manager._active_model_ready = True  # noqa: SLF001
+                manager._lifecycle_state = "active"  # noqa: SLF001
+
+                with self.assertRaisesRegex(WakeError, "lifecycle state unavailable"):
+                    manager.acquire("Qwen3-Embedding-8B")
+
+                mutation_urls = [
+                    url
+                    for method, url, _ in http.calls
+                    if method == "POST" or "/wake_up" in url
+                ]
+                self.assertEqual(mutation_urls, [])
+                self.assertEqual(manager.active_model_name, "Qwen3-Embedding-8B")
+                self.assertEqual(manager.lifecycle_state, "unknown")
+
+    def test_unknown_owner_recovers_only_when_every_peer_is_sleeping(self) -> None:
+        http = PerModelSleepHttp({"embedding": False, "vision": True})
+        manager = ModelManager(
+            [qwen_model(), vision_model()],
+            http,
+            owner_validation_timeout_s=0.1,
+        )
+        manager._active_model_name = "Qwen3-Embedding-8B"  # noqa: SLF001
+        manager._active_model_ready = False  # noqa: SLF001
+        manager._lifecycle_state = "unknown"  # noqa: SLF001
+
+        manager.acquire("Qwen3-Embedding-8B").release()
+
+        self.assertEqual(manager.active_model_name, "Qwen3-Embedding-8B")
+        self.assertEqual(manager.lifecycle_state, "active")
+        self.assertEqual(
+            [],
+            [url for method, url, _ in http.calls if method == "POST"],
+        )
+
+    def test_cached_ready_owner_found_sleeping_reenters_guarded_wake(self) -> None:
+        http = FakeHttp()
+        manager = ModelManager(
+            [qwen_model()],
+            http,
+            poll_interval_s=0,
+            wake_timeout_s=1,
+        )
+        manager.acquire("Qwen3-Embedding-8B").release()
+        first_wakes = sum("/wake_up" in url for _, url, _ in http.calls)
+
+        http.sleeping = True
+        manager.acquire("Qwen3-Embedding-8B").release()
+
+        self.assertGreater(
+            sum("/wake_up" in url for _, url, _ in http.calls),
+            first_wakes,
+        )
+        self.assertEqual(manager.lifecycle_state, "active")
+        self.assertTrue(manager.inference_ready)
+
+    def test_unknown_owner_blocks_switch_without_waking_second_model(self) -> None:
+        class VanishedEmbedding(SwitchingHttp):
+            def __init__(self) -> None:
+                super().__init__()
+                self.embedding_unreachable = False
+
+            def request(self, method, url, *, headers=None, body=None, timeout=None):
+                if self.embedding_unreachable and url.startswith("http://vllm"):
+                    self.calls.append((method, url, body))
+                    raise ConnectionError("owned embedding engine unavailable")
+                return super().request(
+                    method,
+                    url,
+                    headers=headers,
+                    body=body,
+                    timeout=timeout,
+                )
+
+        http = VanishedEmbedding()
+        manager = ModelManager(
+            [qwen_model(), vision_model()],
+            http,
+            poll_interval_s=0,
+            wake_timeout_s=1,
+        )
+        manager.acquire("Qwen3-Embedding-8B").release()
+        http.embedding_unreachable = True
+        call_count = len(http.calls)
+
+        with self.assertRaisesRegex(WakeError, "lifecycle state unavailable"):
+            manager.acquire("chess-vlm-bootstrap")
+
+        retry_urls = [url for _, url, _ in http.calls[call_count:]]
+        self.assertFalse(any(url.startswith("http://vision") and "/wake_up" in url for url in retry_urls))
+        self.assertEqual(manager.active_model_name, "Qwen3-Embedding-8B")
+        self.assertEqual(manager.lifecycle_state, "unknown")
 
     def test_partial_wake_failure_is_slept_before_another_model_wakes(self) -> None:
         class FailVisionReadinessOnce(SwitchingHttp):

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import math
 import os
 import threading
 import time
@@ -19,6 +20,10 @@ class UnknownModelError(ValueError):
 
 class WakeError(RuntimeError):
     pass
+
+
+class LifecycleUnavailableError(WakeError):
+    """The cached owner cannot be positively revalidated yet."""
 
 
 @contextmanager
@@ -79,6 +84,7 @@ class ModelManager:
         *,
         sleep_level: int = 2,
         request_timeout_s: float = 30.0,
+        owner_validation_timeout_s: float = 2.0,
         wake_timeout_s: float = 300.0,
         drain_timeout_s: float = 300.0,
         poll_interval_s: float = 1.0,
@@ -96,6 +102,9 @@ class ModelManager:
         self.http = http
         self.sleep_level = sleep_level
         self.request_timeout_s = request_timeout_s
+        if not math.isfinite(owner_validation_timeout_s) or owner_validation_timeout_s <= 0:
+            raise ValueError("owner_validation_timeout_s must be finite and greater than zero")
+        self.owner_validation_timeout_s = owner_validation_timeout_s
         self.wake_timeout_s = wake_timeout_s
         self.drain_timeout_s = drain_timeout_s
         self.poll_interval_s = poll_interval_s
@@ -116,6 +125,7 @@ class ModelManager:
         self._inflight_requests = 0
         self._pending_switch_name: str | None = None
         self._quiescing = False
+        self._lifecycle_state = "unknown"
 
     @property
     def startup_finalized(self) -> bool:
@@ -141,8 +151,7 @@ class ModelManager:
                 self._wait_until_sleeping(target)
                 with self._condition:
                     if self._active_model_name == target.name:
-                        self._active_model_name = None
-                        self._active_model_ready = False
+                        self._clear_owner_locked()
                 return target.name
             finally:
                 with self._condition:
@@ -177,8 +186,7 @@ class ModelManager:
                         self._sleep(model)
                     self._wait_until_sleeping(model)
                 with self._condition:
-                    self._active_model_name = None
-                    self._active_model_ready = False
+                    self._clear_owner_locked()
                     self._startup_finalized = True
             finally:
                 with self._condition:
@@ -216,6 +224,7 @@ class ModelManager:
                 with self._condition:
                     self._active_model_name = awake[0].name if awake else None
                     self._active_model_ready = bool(awake)
+                    self._lifecycle_state = "active" if awake else "sleeping"
                     self._startup_finalized = True
             finally:
                 with self._condition:
@@ -226,6 +235,19 @@ class ModelManager:
     @property
     def active_model_name(self) -> str | None:
         return self._active_model_name
+
+    @property
+    def lifecycle_state(self) -> str:
+        """Sanitized lifecycle state for control-plane health and repair routing."""
+        return self._lifecycle_state
+
+    @property
+    def inference_ready(self) -> bool:
+        """Whether lifecycle ownership is safe for request admission."""
+        return self._startup_finalized and self._lifecycle_state in {
+            "active",
+            "sleeping",
+        }
 
     @property
     def starting_model_name(self) -> str | None:
@@ -239,8 +261,8 @@ class ModelManager:
 
     @property
     def inflight_requests(self) -> int:
-        with self._condition:
-            return self._inflight_requests
+        """Approximate request count for nonblocking health observation."""
+        return self._inflight_requests
 
     def _publish_transition(self, phase: str, model_name: str | None = None) -> None:
         """Atomically publish lifecycle ownership for the host guard.
@@ -290,8 +312,7 @@ class ModelManager:
                             self._sleep(model)
                             self._wait_until_sleeping(model)
 
-                    self._active_model_name = None
-                    self._active_model_ready = False
+                    self._clear_owner_locked()
                 finally:
                     self._starting_model_name = None
                     self._publish_transition("idle")
@@ -384,6 +405,31 @@ class ModelManager:
                         raise WakeError("timed out draining requests before resource backoff")
                     self._condition.wait(timeout=remaining)
                 if self._active_model_name is None:
+                    try:
+                        deadline = time.monotonic() + self.owner_validation_timeout_s
+                        with startup_lease(self.startup_lease_path):
+                            states = [
+                                self._is_sleeping(
+                                    model,
+                                    timeout_s=self._remaining_owner_validation_timeout(deadline),
+                                )
+                                for model in self.models
+                            ]
+                    except Exception as exc:
+                        self._lifecycle_state = "unknown"
+                        self._active_model_ready = False
+                        self._publish_transition("unknown")
+                        raise LifecycleUnavailableError(
+                            "all-engine sleep state unavailable; retry later"
+                        ) from exc
+                    if not states or any(state is not True for state in states):
+                        self._lifecycle_state = "unknown"
+                        self._active_model_ready = False
+                        self._publish_transition("unknown")
+                        raise LifecycleUnavailableError(
+                            "all-engine sleep state unavailable; retry later"
+                        )
+                    self._lifecycle_state = "sleeping"
                     self._quiescing = False
                     self._publish_transition("idle")
                     self._condition.notify_all()
@@ -397,18 +443,28 @@ class ModelManager:
         try:
             self._publish_transition("sleeping", current.name)
             with startup_lease(self.startup_lease_path):
-                self._sleep(current)
-                self._wait_until_sleeping(current)
-        except Exception:
+                sleeping = self._is_sleeping(
+                    current,
+                    timeout_s=self.owner_validation_timeout_s,
+                )
+                if sleeping is None:
+                    raise LifecycleUnavailableError(
+                        f"lifecycle state unavailable for {current.name}; retry later"
+                    )
+                if sleeping is False:
+                    self._sleep(current)
+                    self._wait_until_sleeping(current)
+        except Exception as exc:
             with self._condition:
+                self._mark_lifecycle_unknown_locked(current)
                 self._quiescing = False
                 self._condition.notify_all()
-            raise
+            raise LifecycleUnavailableError(
+                f"lifecycle state unavailable for {current.name}; retry later"
+            ) from exc
 
         with self._condition:
-            self._active_model_name = None
-            self._active_model_ready = False
-            self._publish_transition("idle")
+            self._clear_owner_locked()
             self._quiescing = False
             self._condition.notify_all()
         return current.name
@@ -418,6 +474,13 @@ class ModelManager:
             if self._inflight_requests <= 0:
                 raise RuntimeError(f"no in-flight request to release for {target.name}")
             self._inflight_requests -= 1
+            self._condition.notify_all()
+
+    def mark_owner_unavailable(self, target: ModelConfig) -> None:
+        """Invalidate cached readiness after a forward-open transport failure."""
+        with self._condition:
+            if self._active_model_name == target.name:
+                self._mark_lifecycle_unknown_locked(target)
             self._condition.notify_all()
 
     def _wait_for_switch_safety(self, target: ModelConfig) -> None:
@@ -451,6 +514,84 @@ class ModelManager:
             raise WakeError(f"timed out draining requests before switching to {target.name}")
         self._condition.wait(timeout=remaining)
 
+    def _mark_lifecycle_unknown_locked(self, owner: ModelConfig) -> None:
+        self._active_model_ready = False
+        self._lifecycle_state = "unknown"
+        self._publish_transition("unknown", owner.name)
+
+    def _clear_owner_locked(self) -> None:
+        self._active_model_name = None
+        self._active_model_ready = False
+        self._lifecycle_state = "sleeping"
+        self._publish_transition("idle")
+
+    def _raise_lifecycle_unavailable_locked(
+        self,
+        owner: ModelConfig,
+        cause: BaseException | None = None,
+    ) -> None:
+        self._mark_lifecycle_unknown_locked(owner)
+        error = LifecycleUnavailableError(
+            f"lifecycle state unavailable for {owner.name}; retry later"
+        )
+        if cause is None:
+            raise error
+        raise error from cause
+
+    @staticmethod
+    def _remaining_owner_validation_timeout(deadline: float) -> float:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("owner validation deadline expired")
+        return remaining
+
+    def _revalidate_cached_owner_locked(self, owner: ModelConfig) -> bool:
+        """Positively validate cached same-model ownership under one deadline.
+
+        ``True`` means the existing owner is awake and inference-ready. ``False``
+        means it is positively sleeping and normal guarded startup may proceed.
+        Unknown or unreachable state preserves ownership and returns a typed 503
+        path instead of forwarding to a vanished upstream.
+        """
+        deadline = time.monotonic() + self.owner_validation_timeout_s
+        try:
+            sleeping = self._is_sleeping(
+                owner,
+                timeout_s=self._remaining_owner_validation_timeout(deadline),
+            )
+        except (ConnectionError, OSError, TimeoutError, TypeError, ValueError, WakeError) as exc:
+            self._raise_lifecycle_unavailable_locked(owner, exc)
+        if sleeping is None:
+            self._raise_lifecycle_unavailable_locked(owner)
+        if sleeping is True:
+            self._clear_owner_locked()
+            return False
+        for peer in self.models:
+            if peer.name == owner.name:
+                continue
+            try:
+                peer_sleeping = self._is_sleeping(
+                    peer,
+                    timeout_s=self._remaining_owner_validation_timeout(deadline),
+                )
+            except (ConnectionError, OSError, TimeoutError, TypeError, ValueError, WakeError) as exc:
+                self._raise_lifecycle_unavailable_locked(owner, exc)
+            if peer_sleeping is not True:
+                self._raise_lifecycle_unavailable_locked(owner)
+        try:
+            listed = self._model_is_listed_once(
+                owner,
+                timeout_s=self._remaining_owner_validation_timeout(deadline),
+            )
+        except (ConnectionError, OSError, TimeoutError, TypeError, ValueError, WakeError) as exc:
+            self._raise_lifecycle_unavailable_locked(owner, exc)
+        if not listed:
+            self._raise_lifecycle_unavailable_locked(owner)
+        self._active_model_ready = True
+        self._lifecycle_state = "active"
+        self._publish_transition("ready", owner.name)
+        return True
+
     def _activate_locked(self, target: ModelConfig) -> ModelConfig:
         try:
             with startup_lease(self.startup_lease_path):
@@ -465,28 +606,48 @@ class ModelManager:
                 self._condition.notify_all()
 
     def _ensure_awake_locked(self, target: ModelConfig) -> ModelConfig:
-        needs_startup = self._active_model_name != target.name or not self._active_model_ready
-        if not needs_startup:
-            return target
+        if self._active_model_name == target.name:
+            if self._revalidate_cached_owner_locked(target):
+                return target
         self._starting_model_name = target.name
+        self._lifecycle_state = "starting"
         self._publish_transition("starting", target.name)
         try:
             return self._ensure_awake_startup_locked(target)
-        except Exception:
-            # A failed startup must not leave a partially resident model marked
-            # active. Best-effort sleep keeps recovery conservative; preserve
-            # the original failure if cleanup itself fails.
-            try:
-                if self._active_model_name == target.name and self._is_sleeping(target) is False:
-                    self._sleep(target)
-                    self._wait_until_sleeping(target)
-            finally:
-                self._active_model_name = None
+        except LifecycleUnavailableError:
+            raise
+        except Exception as exc:
+            owner_name = self._active_model_name
+            if owner_name is None:
                 self._active_model_ready = False
+                self._lifecycle_state = "unknown"
+                self._publish_transition("unknown")
+            else:
+                owner = self.find_model(owner_name)
+                if owner.name != target.name:
+                    self._raise_lifecycle_unavailable_locked(owner, exc)
+                try:
+                    sleeping = self._is_sleeping(
+                        owner,
+                        timeout_s=self.owner_validation_timeout_s,
+                    )
+                    if sleeping is False:
+                        self._sleep(owner)
+                        self._wait_until_sleeping(owner)
+                        sleeping = True
+                except (ConnectionError, OSError, TimeoutError, TypeError, ValueError, WakeError) as cleanup_exc:
+                    self._raise_lifecycle_unavailable_locked(owner, cleanup_exc)
+                if sleeping is not True:
+                    self._raise_lifecycle_unavailable_locked(owner, exc)
+                self._clear_owner_locked()
             raise
         finally:
             self._starting_model_name = None
-            self._publish_transition("idle")
+            if self._lifecycle_state != "unknown":
+                self._publish_transition(
+                    "ready" if self._active_model_ready else "idle",
+                    self._active_model_name,
+                )
             self._condition.notify_all()
 
     def _ensure_awake_startup_locked(self, target: ModelConfig) -> ModelConfig:
@@ -497,8 +658,7 @@ class ModelManager:
             # asynchronously reclaiming memory. Switching admission is only
             # valid after the proxy verifies the engine's sleep state.
             self._wait_until_sleeping(current)
-            self._active_model_name = None
-            self._active_model_ready = False
+            self._clear_owner_locked()
 
         # The lease is host-wide, so do not trust another proxy instance's
         # in-process active-model bookkeeping. Reconcile every other configured
@@ -523,6 +683,7 @@ class ModelManager:
                 should_wake = False
                 self._active_model_name = target.name
                 self._active_model_ready = False
+                self._lifecycle_state = "starting"
         elif self.always_wake and self._active_model_name == target.name:
             sleeping = self._is_sleeping(target)
             should_wake = sleeping is not False
@@ -538,6 +699,7 @@ class ModelManager:
             # must sleep this engine even when readiness never completed.
             self._active_model_name = target.name
             self._active_model_ready = False
+            self._lifecycle_state = "starting"
             self._wake(target)
             self._wait_until_not_sleeping(target)
 
@@ -549,6 +711,7 @@ class ModelManager:
                 # before wake, so the lease is released only from a safe state.
                 self.admission_check(target)
             self._active_model_ready = True
+            self._lifecycle_state = "active"
             self._publish_transition("ready", target.name)
 
         return target
@@ -609,11 +772,16 @@ class ModelManager:
                     f"{label} failed for {model.name}: HTTP {resp.status}: {resp.body[:300]!r}"
                 )
 
-    def _is_sleeping(self, model: ModelConfig) -> bool | None:
+    def _is_sleeping(
+        self,
+        model: ModelConfig,
+        *,
+        timeout_s: float | None = None,
+    ) -> bool | None:
         resp = self.http.request(
             "GET",
             f"{model.control_base_url}/is_sleeping",
-            timeout=self.request_timeout_s,
+            timeout=self.request_timeout_s if timeout_s is None else timeout_s,
         )
         if resp.status == 404:
             # Older/alternate builds may not expose this endpoint. The model-list
@@ -671,22 +839,31 @@ class ModelManager:
                 f"HTTP {resp.status}: {resp.body[:300]!r}"
             )
 
-    def _wait_until_model_listed(self, model: ModelConfig) -> None:
-        def listed() -> bool:
-            resp = self.http.request(
-                "GET",
-                f"{model.upstream_base_url}/models",
-                timeout=self.request_timeout_s,
-            )
-            if resp.status >= 400:
-                return False
-            parsed = resp.json()
-            if not isinstance(parsed, dict):
-                return False
-            ids = [item.get("id") for item in parsed.get("data", []) if isinstance(item, dict)]
-            return model.upstream_model in ids or model.name in ids
+    def _model_is_listed_once(
+        self,
+        model: ModelConfig,
+        *,
+        timeout_s: float | None = None,
+    ) -> bool:
+        resp = self.http.request(
+            "GET",
+            f"{model.upstream_base_url}/models",
+            timeout=self.request_timeout_s if timeout_s is None else timeout_s,
+        )
+        if resp.status >= 400:
+            return False
+        parsed = resp.json()
+        if not isinstance(parsed, dict):
+            return False
+        ids = [item.get("id") for item in parsed.get("data", []) if isinstance(item, dict)]
+        return model.upstream_model in ids or model.name in ids
 
-        if not sleep_until(listed, timeout_s=self.wake_timeout_s, interval_s=self.poll_interval_s):
+    def _wait_until_model_listed(self, model: ModelConfig) -> None:
+        if not sleep_until(
+            lambda: self._model_is_listed_once(model),
+            timeout_s=self.wake_timeout_s,
+            interval_s=self.poll_interval_s,
+        ):
             raise WakeError(f"timed out waiting for {model.name} to appear in /v1/models")
 
     def rewrite_request_body(self, body: bytes, target: ModelConfig) -> bytes:
