@@ -179,6 +179,14 @@ class AdmissionTests(unittest.TestCase):
             uncertain["model_admission"][MODEL.name]["reason"] = "unknown_model_state"
             path.write_text(json.dumps(uncertain), encoding="utf-8")
             FileAdmissionGuard(path, now=lambda: 110.0)(REQUIRED_MODEL)
+            thermal_duplicate = self.status(allowed=False)
+            thermal_duplicate["model_admission"][MODEL.name]["reason"] = (
+                "thermal_admission_denied"
+            )
+            path.write_text(json.dumps(thermal_duplicate), encoding="utf-8")
+            FileAdmissionGuard(path, now=lambda: 110.0)(REQUIRED_MODEL)
+            with self.assertRaisesRegex(AdmissionError, "thermal_admission_denied"):
+                FileAdmissionGuard(path, now=lambda: 110.0)(MODEL)
             danger = self.status(allowed=False)
             danger["model_admission"][MODEL.name]["reason"] = "host_state_critical"
             path.write_text(json.dumps(danger), encoding="utf-8")

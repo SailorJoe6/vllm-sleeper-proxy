@@ -90,8 +90,10 @@ GBrain embedding Compose integration:
   uncertainty. Fresh sleep, cutoff, or danger-derived recovery state rejects
   acquisition before request-body handling with HTTP 503, `Retry-After`, and
   `error.type=thermal_cooldown`. Optional models also reject missing, stale, or
-  malformed projections. Existing leases may drain; `POST /sleep` quiesces
-  later acquisitions. The consumer does not own deployment thresholds or
+  malformed projections. The fast thermal projection owns thermal denial for
+  required models, so a slower resource snapshot cannot extend a cleared
+  thermal warning. Existing leases may drain; `POST /sleep` quiesces later
+  acquisitions. The consumer does not own deployment thresholds or
   positive-danger provenance.
   The bundled memory monitor polls total-host `MemAvailable` and asks the
   proxy to quiesce and sleep the active model at the configured ceiling.

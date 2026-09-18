@@ -18,6 +18,10 @@ RESOURCE_UNCERTAINTY_REASONS = {
     "gpu_headroom_unavailable",
     "monitor_unavailable",
     "monitor_stale",
+    # The independent two-second thermal projection owns affirmative thermal
+    # containment. The slower resource snapshot must not extend a cleared
+    # warning into a required-model outage.
+    "thermal_admission_denied",
 }
 
 
