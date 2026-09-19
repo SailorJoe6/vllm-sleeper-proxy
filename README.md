@@ -128,10 +128,21 @@ GBrain embedding Compose integration:
   `inference_available=false` distinguish the fenced request plane. It also
   reports startup, lifecycle readiness, selected/starting model, and sanitized
   thermal phase/action fields without waiting for a lifecycle lease.
-  The schema-v1 root watchdog and memory-pressure monitor may continue using
-  the existing bodyless loopback `POST /sleep`. No action-scoped thermal
-  control endpoint is enabled in this compatibility stage; the deployment must
-  add one only with the matching root action-record/caller migration.
+  The schema-v1 root watchdog and memory-pressure monitor continue using the
+  existing bodyless loopback `POST /sleep`. Dormant action-scoped
+  `/thermal/actions/hold` and `/thermal/actions/release` routes are absent unless
+  both `SLEEPER_THERMAL_ACTION_CONTROL_ENABLED=1` and
+  `SLEEPER_THERMAL_ACTION_STATUS_PATH` are configured. `hold` accepts graceful,
+  urgent, or held verification only inside the immutable root action contract,
+  whose creation time bounds the active window to at most 300 seconds. It drains
+  within the original deadline, serializes on the shared lease, re-fences queued
+  requests before any wake, rejects non-level-2 sleep, requires unique engine
+  identities, and returns exact positive all-engine sleep proof. `release` uses
+  a separate bounded local proof timeout after hold deadlines and never sleeps,
+  wakes, selects a model, or clears root authority. Building
+  this code does not activate those routes. Deployment must enable them only
+  with the matching root durable-record/caller migration and a tested local-only
+  control binding; action IDs are correlation values, not credentials.
   The bundled memory monitor polls total-host `MemAvailable` and asks the
   proxy to quiesce and sleep the active model at the configured ceiling.
 * `services/gbrain-embeddings/` wires GBrain → LiteLLM → sleeper proxy → vLLM
@@ -157,6 +168,8 @@ GBrain embedding Compose integration:
 | `POST /v1/embeddings` | OpenAI-compatible JSON | Buffered upstream response |
 | `POST /v1/chat/completions` | OpenAI-compatible text or inline multimodal JSON | Buffered JSON, or SSE when `"stream": true` |
 | `POST /sleep` | Empty body | Quiesces new inference, drains ownership, then sleeps the active model |
+| `POST /thermal/actions/hold` | Exact schema-v1 action ID and root phase; disabled by default | Sleeps only as root-authorized and returns exact all-engine positive proof |
+| `POST /thermal/actions/release` | Exact schema-v1 action ID and root release phase; disabled by default | Verifies all engines sleeping without sleep, wake, selection, or root-state mutation |
 
 The proxy rewrites only the top-level `model` field. It does not transform
 `messages`, inline `data:` image URLs, generation parameters, or response

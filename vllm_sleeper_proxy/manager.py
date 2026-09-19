@@ -12,6 +12,7 @@ from urllib.parse import urlencode
 
 from .client import HttpClient, sleep_until
 from .config import ModelConfig
+from .thermal_control import ThermalAction
 
 
 class UnknownModelError(ValueError):
@@ -27,18 +28,27 @@ class LifecycleUnavailableError(WakeError):
 
 
 @contextmanager
-def startup_lease(path: str) -> Iterator[None]:
-    """Hold an OS lease across model startup and readiness validation.
-
-    The lock is released automatically if the proxy process crashes. Deployments
-    spanning containers should mount the same host path into every proxy and set
-    ``SLEEPER_STARTUP_LEASE_PATH`` accordingly.
-    """
+def startup_lease(path: str, *, timeout_s: float | None = None) -> Iterator[None]:
+    """Hold the shared lifecycle lease, optionally within one finite deadline."""
     parent = os.path.dirname(path)
     if parent:
         os.makedirs(parent, exist_ok=True)
     with open(path, "a+", encoding="utf-8") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        if timeout_s is None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        else:
+            if not math.isfinite(timeout_s) or timeout_s <= 0:
+                raise WakeError("thermal action deadline expired before lifecycle lease")
+            deadline = time.monotonic() + timeout_s
+            while True:
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise WakeError("timed out waiting for shared lifecycle lease")
+                    time.sleep(min(0.05, remaining))
         handle.seek(0)
         handle.truncate()
         handle.write(f"pid={os.getpid()}\n")
@@ -99,6 +109,19 @@ class ModelManager:
         self.models = list(models)
         if not self.models:
             raise ValueError("at least one model must be configured")
+        if len(self.models) > 64:
+            raise ValueError("at most 64 models may be configured")
+        names = [model.name for model in self.models]
+        if any(
+            not name or len(name) > 256 or not name.isprintable()
+            for name in names
+        ):
+            raise ValueError("model names must be printable and at most 256 characters")
+        if len(set(names)) != len(names):
+            raise ValueError("configured model names must be unique")
+        control_urls = [model.control_base_url for model in self.models]
+        if len(set(control_urls)) != len(control_urls):
+            raise ValueError("configured engine control URLs must be unique")
         self.http = http
         self.sleep_level = sleep_level
         self.request_timeout_s = request_timeout_s
@@ -119,6 +142,7 @@ class ModelManager:
         self.bootstrap_mode = bootstrap_mode
         self._startup_finalized = not bootstrap_mode
         self._condition = threading.Condition()
+        self._thermal_action_lock = threading.Lock()
         self._active_model_name: str | None = None
         self._starting_model_name: str | None = None
         self._active_model_ready = False
@@ -366,10 +390,13 @@ class ModelManager:
             self._wait_for_switch_safety(target)
             return self._activate_locked(target)
 
+    def _check_pre_admission(self, target: ModelConfig) -> None:
+        if self.pre_admission_check is not None:
+            self.pre_admission_check(target)
+
     def check_fast_admission(self) -> None:
         """Check the host-wide fast gate before reading a new request body."""
-        if self.pre_admission_check is not None:
-            self.pre_admission_check(self.models[0])
+        self._check_pre_admission(self.models[0])
 
     def acquire(self, requested: str) -> ModelLease:
         """Wake a model and hold it awake for one buffered or streaming request."""
@@ -377,21 +404,30 @@ class ModelManager:
         target = self.find_model(requested)
         # Check before contending on lifecycle state so a cooldown response is
         # prompt even while another request is draining or switching.
-        if self.pre_admission_check is not None:
-            self.pre_admission_check(target)
+        self._check_pre_admission(target)
         with self._condition:
-            # Recheck under the condition to close the race between the first
-            # fast read and lifecycle ownership.
-            # The fast thermal projection is checked before waiting for any
-            # switch/drain. Cooldown requests must fail promptly instead of
-            # joining a queue behind the active request that is draining.
-            if self.pre_admission_check is not None:
-                self.pre_admission_check(target)
-            self._wait_for_switch_safety(target)
-            if self.admission_check is not None:
-                self.admission_check(target)
-            self._activate_locked(target)
-            self._inflight_requests += 1
+            try:
+                # Recheck under the condition to close the race between the first
+                # fast read and lifecycle ownership.
+                # The fast thermal projection is checked before waiting for any
+                # switch/drain. Cooldown requests must fail promptly instead of
+                # joining a queue behind the active request that is draining.
+                self._check_pre_admission(target)
+                self._wait_for_switch_safety(target)
+                # A request can wait across an externally published thermal hold.
+                # Re-read the fast fence after every lifecycle wait and again in
+                # the activation path so a queued request cannot wake after proof.
+                self._check_pre_admission(target)
+                if self.admission_check is not None:
+                    self.admission_check(target)
+                self._check_pre_admission(target)
+                self._activate_locked(target)
+                self._inflight_requests += 1
+            except Exception:
+                if self._pending_switch_name == target.name:
+                    self._pending_switch_name = None
+                    self._condition.notify_all()
+                raise
         return ModelLease(self, target)
 
     def sleep_active_model(self) -> str | None:
@@ -403,6 +439,8 @@ class ModelManager:
         """
 
         with self._condition:
+            if self._quiescing:
+                raise WakeError("lifecycle is already quiescing")
             deadline = time.monotonic() + self.drain_timeout_s
             self._quiescing = True
             try:
@@ -475,6 +513,195 @@ class ModelManager:
             self._quiescing = False
             self._condition.notify_all()
         return current.name
+
+    @staticmethod
+    def _remaining_epoch(deadline_epoch: float, label: str) -> float:
+        remaining = deadline_epoch - time.time()
+        if not math.isfinite(remaining) or remaining <= 0:
+            raise WakeError(f"thermal action {label} deadline expired")
+        return remaining
+
+    def _finish_thermal_action(self) -> None:
+        with self._condition:
+            self._quiescing = False
+            self._condition.notify_all()
+
+    def thermal_hold(
+        self,
+        action: ThermalAction,
+        *,
+        reauthorize: Callable[[], None],
+    ) -> dict[str, object]:
+        """Drain and positively prove every configured engine sleeping.
+
+        The root projection owns identity, phase, and immutable deadlines.
+        This method never treats an HTTP write as containment proof.
+        """
+        if action.phase not in {"graceful_hold", "urgent_hold", "held"}:
+            raise WakeError("thermal action phase is not a hold phase")
+        if self.sleep_level != 2:
+            raise WakeError("thermal actions require vLLM sleep level 2")
+        lock_timeout = (
+            self._remaining_epoch(action.overall_deadline_epoch, "overall")
+            if action.phase != "held"
+            else self.owner_validation_timeout_s
+        )
+        if not self._thermal_action_lock.acquire(timeout=lock_timeout):
+            raise WakeError("timed out serializing thermal action")
+        quiescing = False
+        try:
+            reauthorize()
+            condition_timeout = (
+                self._remaining_epoch(action.overall_deadline_epoch, "overall")
+                if action.phase != "held"
+                else self.owner_validation_timeout_s
+            )
+            if not self._condition.acquire(timeout=condition_timeout):
+                raise WakeError("timed out acquiring lifecycle condition")
+            try:
+                reauthorize()
+                if self._quiescing:
+                    raise WakeError("lifecycle is already quiescing")
+                self._quiescing = True
+                quiescing = True
+                if action.phase == "held" and self._inflight_requests:
+                    raise WakeError("held action still has in-flight requests")
+                while self._inflight_requests > 0:
+                    remaining = self._remaining_epoch(
+                        action.drain_deadline_epoch, "drain"
+                    )
+                    self._condition.wait(timeout=remaining)
+            finally:
+                self._condition.release()
+
+            if action.phase != "held":
+                lifecycle_deadline = min(
+                    action.sleep_deadline_epoch, action.overall_deadline_epoch
+                )
+            else:
+                lifecycle_deadline = time.time() + self.owner_validation_timeout_s
+            with startup_lease(
+                self.startup_lease_path,
+                timeout_s=self._remaining_epoch(lifecycle_deadline, "sleep"),
+            ):
+                proofs: dict[str, dict[str, object]] = {}
+                for model in self.models:
+                    reauthorize()
+                    sleeping = self._is_sleeping(
+                        model,
+                        timeout_s=min(
+                            self.request_timeout_s,
+                            self._remaining_epoch(lifecycle_deadline, "sleep"),
+                        ),
+                    )
+                    if sleeping is None:
+                        raise WakeError(
+                            f"cannot verify thermal sleep state for {model.name}"
+                        )
+                    if sleeping is False:
+                        if action.phase == "held":
+                            raise WakeError(
+                                f"engine is awake during held verification: {model.name}"
+                            )
+                        reauthorize()
+                        self._sleep(
+                            model,
+                            timeout_s=min(
+                                self.request_timeout_s,
+                                self._remaining_epoch(lifecycle_deadline, "sleep"),
+                            ),
+                        )
+                        self._wait_until_sleeping(
+                            model,
+                            timeout_s=self._remaining_epoch(
+                                lifecycle_deadline, "sleep"
+                            ),
+                        )
+                    reauthorize()
+                    final_state = self._is_sleeping(
+                        model,
+                        timeout_s=min(
+                            self.request_timeout_s,
+                            self._remaining_epoch(lifecycle_deadline, "sleep"),
+                        ),
+                    )
+                    if final_state is not True:
+                        raise WakeError(
+                            f"positive thermal sleep proof unavailable for {model.name}"
+                        )
+                    proofs[model.name] = {
+                        "state": "sleeping",
+                        "proof": "vllm_is_sleeping_true",
+                    }
+                reauthorize()
+                with self._condition:
+                    self._clear_owner_locked()
+            return {"all_sleeping": True, "engine_proofs": proofs}
+        finally:
+            if quiescing:
+                self._finish_thermal_action()
+            self._thermal_action_lock.release()
+
+    def thermal_release_ready(
+        self,
+        action: ThermalAction,
+        *,
+        reauthorize: Callable[[], None],
+    ) -> dict[str, object]:
+        """Verify all-sleeping release readiness without sleeping or waking."""
+        if action.phase not in {"release_authorized", "releasing"}:
+            raise WakeError("thermal action phase is not a release phase")
+        if not self._thermal_action_lock.acquire(
+            timeout=self.owner_validation_timeout_s
+        ):
+            raise WakeError("timed out serializing thermal release proof")
+        quiescing = False
+        deadline = time.monotonic() + self.owner_validation_timeout_s
+        try:
+            reauthorize()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not self._condition.acquire(timeout=remaining):
+                raise WakeError("timed out acquiring lifecycle condition")
+            try:
+                reauthorize()
+                if self._quiescing:
+                    raise WakeError("lifecycle is already quiescing")
+                self._quiescing = True
+                quiescing = True
+                if self._inflight_requests:
+                    raise WakeError("release proof still has in-flight requests")
+            finally:
+                self._condition.release()
+            with startup_lease(
+                self.startup_lease_path,
+                timeout_s=max(0.001, deadline - time.monotonic()),
+            ):
+                proofs: dict[str, dict[str, object]] = {}
+                for model in self.models:
+                    reauthorize()
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise WakeError("thermal release proof deadline expired")
+                    sleeping = self._is_sleeping(
+                        model,
+                        timeout_s=min(self.request_timeout_s, remaining),
+                    )
+                    if sleeping is not True:
+                        raise WakeError(
+                            f"all-sleeping release proof unavailable for {model.name}"
+                        )
+                    proofs[model.name] = {
+                        "state": "sleeping",
+                        "proof": "vllm_is_sleeping_true",
+                    }
+                reauthorize()
+                with self._condition:
+                    self._clear_owner_locked()
+            return {"release_ready": True, "engine_proofs": proofs}
+        finally:
+            if quiescing:
+                self._finish_thermal_action()
+            self._thermal_action_lock.release()
 
     def release(self, target: ModelConfig) -> None:
         with self._condition:
@@ -601,8 +828,12 @@ class ModelManager:
 
     def _activate_locked(self, target: ModelConfig) -> ModelConfig:
         try:
+            self._check_pre_admission(target)
             with startup_lease(self.startup_lease_path):
-                return self._ensure_awake_locked(target)
+                self._check_pre_admission(target)
+                activated = self._ensure_awake_locked(target)
+                self._check_pre_admission(target)
+                return activated
         except WakeError:
             raise
         except (ConnectionError, OSError, TimeoutError, TypeError, ValueError) as exc:
@@ -699,8 +930,10 @@ class ModelManager:
             # Recheck after any previous engine has been slept. Sleeping is an
             # asynchronous memory transition, so an admission decision made
             # before the drain can be stale by the time this engine allocates.
+            self._check_pre_admission(target)
             if self.admission_check is not None:
                 self.admission_check(target)
+            self._check_pre_admission(target)
             # Conservatively remember the target before wake begins. A partial
             # wake failure can leave weights resident; the next model switch
             # must sleep this engine even when readiness never completed.
@@ -723,12 +956,14 @@ class ModelManager:
 
         return target
 
-    def _sleep(self, model: ModelConfig) -> None:
+    def _sleep(
+        self, model: ModelConfig, *, timeout_s: float | None = None
+    ) -> None:
         query = urlencode({"level": str(self.sleep_level)})
         resp = self.http.request(
             "POST",
             f"{model.control_base_url}/sleep?{query}",
-            timeout=self.request_timeout_s,
+            timeout=self.request_timeout_s if timeout_s is None else timeout_s,
         )
         if resp.status >= 400:
             raise WakeError(f"sleep failed for {model.name}: HTTP {resp.status}: {resp.body[:300]!r}")
@@ -809,13 +1044,23 @@ class ModelManager:
                     return value
         return None
 
-    def _wait_until_sleeping(self, model: ModelConfig) -> None:
+    def _wait_until_sleeping(
+        self, model: ModelConfig, *, timeout_s: float | None = None
+    ) -> None:
+        effective_timeout = self.wake_timeout_s if timeout_s is None else timeout_s
+        deadline = time.monotonic() + effective_timeout
+
         def sleeping() -> bool:
-            return self._is_sleeping(model) is True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            return self._is_sleeping(
+                model, timeout_s=min(self.request_timeout_s, remaining)
+            ) is True
 
         if not sleep_until(
             sleeping,
-            timeout_s=self.wake_timeout_s,
+            timeout_s=effective_timeout,
             interval_s=self.poll_interval_s,
         ):
             raise WakeError(f"timed out waiting for {model.name} to enter sleep state")

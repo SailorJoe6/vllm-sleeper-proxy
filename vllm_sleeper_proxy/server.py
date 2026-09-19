@@ -15,6 +15,10 @@ from .admission import (
     FileThermalAdmissionGuard,
     ThermalCooldownError,
 )
+from .thermal_control import (
+    FileThermalActionAuthority,
+    ThermalActionControlError,
+)
 from .config import load_models_from_env
 from .manager import (
     LifecycleUnavailableError,
@@ -62,6 +66,9 @@ PROXIED_POST_PATHS = {
 class SleeperProxyHandler(BaseHTTPRequestHandler):
     manager: ModelManager
     max_request_body_bytes = 10 * 1024 * 1024
+    thermal_action_control_enabled = False
+    thermal_action_authority: FileThermalActionAuthority | None = None
+    thermal_action_max_body_bytes = 2048
 
     server_version = "vllm-sleeper-proxy/0.1"
 
@@ -111,6 +118,9 @@ class SleeperProxyHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802 - stdlib API
         path = urlsplit(self.path).path
+        if path in {"/thermal/actions/hold", "/thermal/actions/release"}:
+            self._handle_thermal_action(path.rsplit("/", 1)[-1])
+            return
         if self.manager.bootstrap_mode and path == "/startup/sleep":
             from urllib.parse import parse_qs
             requested = parse_qs(urlsplit(self.path).query).get("model", [None])[0]
@@ -302,6 +312,108 @@ class SleeperProxyHandler(BaseHTTPRequestHandler):
         finally:
             response.close()
 
+    def _handle_thermal_action(self, operation: str) -> None:
+        authority = self.thermal_action_authority
+        if not self.thermal_action_control_enabled or authority is None:
+            self._send_json(404, {"error": {"message": "not found"}})
+            return
+        if self.headers.get("transfer-encoding") is not None:
+            self._send_error(411, "content-length is required", "length_required")
+            return
+        raw_length = self.headers.get("content-length")
+        try:
+            content_length = int(raw_length) if raw_length is not None else -1
+        except ValueError:
+            content_length = -1
+        if content_length <= 0 or content_length > self.thermal_action_max_body_bytes:
+            self._send_error(400, "invalid thermal action body", "invalid_request")
+            return
+        try:
+            body = self.rfile.read(content_length)
+            payload = json.loads(body.decode("utf-8"))
+        except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
+            self._send_error(400, "invalid thermal action body", "invalid_request")
+            return
+        try:
+            action = authority.authorize(operation, payload)
+        except ThermalActionControlError as exc:
+            if exc.code == "invalid_request":
+                self._send_error(
+                    400,
+                    "invalid thermal action request",
+                    "invalid_request",
+                    error_fields={"code": "thermal_action_invalid"},
+                )
+            else:
+                self._send_error(
+                    409,
+                    "thermal action does not match root authority",
+                    "conflict",
+                    error_fields={"code": "thermal_action_mismatch"},
+                )
+            return
+
+        def reauthorize() -> None:
+            refreshed = authority.authorize(operation, payload)
+            if refreshed != action:
+                raise ThermalActionControlError("mismatch")
+
+        try:
+            if operation == "hold":
+                proof = self.manager.thermal_hold(
+                    action, reauthorize=reauthorize
+                )
+                response = {
+                    "schema_version": 1,
+                    "ok": True,
+                    "operation": "hold",
+                    "action_id": action.action_id,
+                    "root_phase": action.phase,
+                    **proof,
+                }
+            else:
+                proof = self.manager.thermal_release_ready(
+                    action, reauthorize=reauthorize
+                )
+                response = {
+                    "schema_version": 1,
+                    "ok": True,
+                    "operation": "release",
+                    "action_id": action.action_id,
+                    "root_phase": action.phase,
+                    **proof,
+                }
+        except ThermalActionControlError:
+            self._send_error(
+                409,
+                "thermal action changed during lifecycle work",
+                "conflict",
+                error_fields={"code": "thermal_action_mismatch"},
+            )
+            return
+        except (WakeError, OSError, TimeoutError, socket.timeout):
+            self._send_error(
+                503,
+                "thermal lifecycle proof is unavailable",
+                "service_unavailable",
+                {"Retry-After": "1"},
+                {"code": "thermal_action_unavailable"},
+            )
+            return
+        try:
+            # Bind success to the same root action, phase, creation time, and
+            # immutable deadlines after all manager cleanup has completed.
+            reauthorize()
+        except ThermalActionControlError:
+            self._send_error(
+                409,
+                "thermal action changed before proof return",
+                "conflict",
+                error_fields={"code": "thermal_action_mismatch"},
+            )
+            return
+        self._send_json(200, response)
+
     def _forward_headers(self, *, extra_content_length: int) -> dict[str, str]:
         headers = {
             key: value
@@ -372,6 +484,8 @@ def build_server(
     manager: ModelManager,
     *,
     max_request_body_bytes: int = 10 * 1024 * 1024,
+    thermal_action_control_enabled: bool = False,
+    thermal_action_authority: FileThermalActionAuthority | None = None,
 ) -> ThreadingHTTPServer:
     # Reconcile before ThreadingHTTPServer binds its listening socket. If any
     # engine cannot be verified asleep, startup fails closed and no request can
@@ -384,6 +498,8 @@ def build_server(
 
     Handler.manager = manager
     Handler.max_request_body_bytes = max_request_body_bytes
+    Handler.thermal_action_control_enabled = thermal_action_control_enabled
+    Handler.thermal_action_authority = thermal_action_authority
     return ThreadingHTTPServer((host, port), Handler)
 
 
@@ -394,6 +510,19 @@ def main(argv: Iterable[str] | None = None) -> int:
     thermal_status_path = os.environ.get("SLEEPER_THERMAL_ADMISSION_STATUS_PATH")
     thermal_containment_path = os.environ.get(
         "SLEEPER_THERMAL_CONTAINMENT_STATUS_PATH"
+    )
+    thermal_action_enabled = (
+        os.environ.get("SLEEPER_THERMAL_ACTION_CONTROL_ENABLED", "0") == "1"
+    )
+    thermal_action_path = os.environ.get("SLEEPER_THERMAL_ACTION_STATUS_PATH")
+    if thermal_action_enabled and not thermal_action_path:
+        raise RuntimeError(
+            "thermal action control requires SLEEPER_THERMAL_ACTION_STATUS_PATH"
+        )
+    thermal_action_authority = (
+        FileThermalActionAuthority(Path(thermal_action_path))
+        if thermal_action_enabled and thermal_action_path
+        else None
     )
     models = load_models_from_env()
     require_qwen_admission(models, admission_path)
@@ -444,6 +573,8 @@ def main(argv: Iterable[str] | None = None) -> int:
         max_request_body_bytes=int(
             os.environ.get("SLEEPER_MAX_REQUEST_BODY_BYTES", str(10 * 1024 * 1024))
         ),
+        thermal_action_control_enabled=thermal_action_enabled,
+        thermal_action_authority=thermal_action_authority,
     )
     print(f"vllm-sleeper-proxy listening on http://{host}:{port}", flush=True)
     httpd.serve_forever()

@@ -11,6 +11,7 @@ from dataclasses import replace
 from vllm_sleeper_proxy.client import HttpResponse
 from vllm_sleeper_proxy.config import ModelConfig
 from vllm_sleeper_proxy.manager import ModelManager, UnknownModelError, WakeError, startup_lease
+from vllm_sleeper_proxy.thermal_control import ThermalAction
 
 
 class FakeHttp:
@@ -61,6 +62,15 @@ def vision_model() -> ModelConfig:
         upstream_model="Qwen/Qwen3-VL-4B-Instruct",
         upstream_base_url="http://vision:8000/v1",
         control_base_url="http://vision:8000",
+    )
+
+
+def flash_model() -> ModelConfig:
+    return ModelConfig(
+        name="qwen3.8-flash-next",
+        upstream_model="qwen3.8-flash-next",
+        upstream_base_url="http://flash:8000/v1",
+        control_base_url="http://flash:8000",
     )
 
 
@@ -124,7 +134,11 @@ class PerModelSleepHttp(FakeHttp):
 
     def request(self, method, url, *, headers=None, body=None, timeout=None):
         self.calls.append((method, url, body))
-        model = "vision" if url.startswith("http://vision") else "embedding"
+        model = (
+            "vision" if url.startswith("http://vision")
+            else "flash" if url.startswith("http://flash")
+            else "embedding"
+        )
         if url.endswith("/is_sleeping"):
             state = self.states[model]
             if state is None:
@@ -1040,6 +1054,233 @@ class ModelManagerTests(unittest.TestCase):
         retry_urls = [url for _, url, _ in http.calls[before_retry:]]
         self.assertIn("http://vision:8000/sleep?level=2", all_urls)
         self.assertIn("http://vllm:8888/wake_up?tags=weights", retry_urls)
+
+
+    def test_configured_engine_proof_identities_must_be_unique(self) -> None:
+        duplicate_name = replace(vision_model(), name=qwen_model().name)
+        duplicate_control = replace(
+            vision_model(), control_base_url=qwen_model().control_base_url
+        )
+        oversized_name = replace(qwen_model(), name="x" * 257)
+        for models, message in (
+            ([qwen_model(), duplicate_name], "model names must be unique"),
+            ([qwen_model(), duplicate_control], "control URLs must be unique"),
+            ([oversized_name], "printable and at most 256"),
+        ):
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(ValueError, message):
+                    ModelManager(models, PerModelSleepHttp({}))
+
+    def test_thermal_hold_rejects_non_level_two_without_engine_contact(self) -> None:
+        http = PerModelSleepHttp({"embedding": False})
+        manager = ModelManager([qwen_model()], http, sleep_level=1)
+        now = time.time()
+        action = ThermalAction(
+            action_id="thermal-level",
+            phase="graceful_hold",
+            drain_deadline_epoch=now + 5,
+            sleep_deadline_epoch=now + 10,
+            overall_deadline_epoch=now + 10,
+        )
+        with self.assertRaisesRegex(WakeError, "sleep level 2"):
+            manager.thermal_hold(action, reauthorize=lambda: None)
+        self.assertEqual([], http.calls)
+
+    def test_queued_switch_cannot_wake_after_thermal_hold_proof(self) -> None:
+        http = PerModelSleepHttp({"embedding": False, "vision": True})
+        fenced = threading.Event()
+
+        def pre_admission(_model: ModelConfig) -> None:
+            if fenced.is_set():
+                raise WakeError("thermal fence active")
+
+        manager = ModelManager(
+            [qwen_model(), vision_model()],
+            http,
+            pre_admission_check=pre_admission,
+            poll_interval_s=0,
+            request_timeout_s=1,
+            owner_validation_timeout_s=1,
+        )
+        manager._active_model_name = qwen_model().name
+        manager._active_model_ready = True
+        manager._lifecycle_state = "active"
+        manager._inflight_requests = 1
+        waiter_errors: list[BaseException] = []
+        hold_results: list[dict[str, object]] = []
+
+        def wait_for_vision() -> None:
+            try:
+                manager.acquire(vision_model().name)
+            except BaseException as exc:
+                waiter_errors.append(exc)
+
+        waiter = threading.Thread(target=wait_for_vision)
+        waiter.start()
+        deadline = time.monotonic() + 2
+        while manager._pending_switch_name != vision_model().name:
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.001)
+
+        fenced.set()
+        now = time.time()
+        action = ThermalAction(
+            action_id="thermal-race",
+            phase="graceful_hold",
+            drain_deadline_epoch=now + 5,
+            sleep_deadline_epoch=now + 10,
+            overall_deadline_epoch=now + 10,
+        )
+        holder = threading.Thread(
+            target=lambda: hold_results.append(
+                manager.thermal_hold(action, reauthorize=lambda: None)
+            )
+        )
+        holder.start()
+        deadline = time.monotonic() + 2
+        while not manager._quiescing:
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.001)
+        manager.release(qwen_model())
+        holder.join(timeout=2)
+        waiter.join(timeout=2)
+
+        self.assertFalse(holder.is_alive())
+        self.assertFalse(waiter.is_alive())
+        self.assertTrue(hold_results[0]["all_sleeping"])
+        self.assertEqual(1, len(waiter_errors))
+        self.assertRegex(str(waiter_errors[0]), "thermal fence active")
+        self.assertTrue(http.states["embedding"])
+        self.assertTrue(http.states["vision"])
+        self.assertFalse(any("wake_up" in url for _, url, _ in http.calls))
+        self.assertIsNone(manager._pending_switch_name)
+
+    def test_thermal_hold_sleeps_and_positively_proves_every_engine(self) -> None:
+        http = PerModelSleepHttp({
+            "embedding": False, "vision": True, "flash": False
+        })
+        manager = ModelManager(
+            [qwen_model(), vision_model(), flash_model()],
+            http,
+            poll_interval_s=0,
+            request_timeout_s=1,
+            owner_validation_timeout_s=1,
+        )
+        now = time.time()
+        action = ThermalAction(
+            action_id="thermal-7",
+            phase="graceful_hold",
+            drain_deadline_epoch=now + 5,
+            sleep_deadline_epoch=now + 10,
+            overall_deadline_epoch=now + 10,
+        )
+        proof = manager.thermal_hold(action, reauthorize=lambda: None)
+        self.assertTrue(proof["all_sleeping"])
+        self.assertEqual(
+            {"Qwen3-Embedding-8B", "chess-vlm-bootstrap", "qwen3.8-flash-next"},
+            set(proof["engine_proofs"]),
+        )
+        self.assertTrue(all(item == {
+            "state": "sleeping", "proof": "vllm_is_sleeping_true"
+        } for item in proof["engine_proofs"].values()))
+        self.assertEqual(
+            [
+                "http://vllm:8888/sleep?level=2",
+                "http://flash:8000/sleep?level=2",
+            ],
+            [url for method, url, _ in http.calls if method == "POST"],
+        )
+
+        http.calls.clear()
+        replay = manager.thermal_hold(action, reauthorize=lambda: None)
+        self.assertTrue(replay["all_sleeping"])
+        self.assertFalse(any(method == "POST" for method, _, _ in http.calls))
+
+    def test_generic_sleep_cannot_race_an_action_quiesce(self) -> None:
+        http = PerModelSleepHttp({"embedding": True, "vision": True})
+        manager = ModelManager([qwen_model(), vision_model()], http)
+        manager._quiescing = True
+        with self.assertRaisesRegex(WakeError, "already quiescing"):
+            manager.sleep_active_model()
+        self.assertEqual([], http.calls)
+
+    def test_thermal_hold_expired_deadline_never_contacts_engines(self) -> None:
+        http = PerModelSleepHttp({"embedding": False, "vision": True})
+        manager = ModelManager([qwen_model(), vision_model()], http)
+        now = time.time()
+        action = ThermalAction(
+            action_id="thermal-expired",
+            phase="graceful_hold",
+            drain_deadline_epoch=now - 3,
+            sleep_deadline_epoch=now - 2,
+            overall_deadline_epoch=now - 1,
+        )
+        with self.assertRaisesRegex(WakeError, "overall deadline expired"):
+            manager.thermal_hold(action, reauthorize=lambda: None)
+        self.assertEqual([], http.calls)
+
+    def test_thermal_hold_rejects_unknown_or_held_awake_state(self) -> None:
+        now = time.time()
+        for phase, state in (("graceful_hold", None), ("held", False)):
+            with self.subTest(phase=phase, state=state):
+                http = PerModelSleepHttp({"embedding": True, "vision": state})
+                manager = ModelManager(
+                    [qwen_model(), vision_model()], http, poll_interval_s=0
+                )
+                action = ThermalAction(
+                    action_id="thermal-8",
+                    phase=phase,
+                    drain_deadline_epoch=now + 5,
+                    sleep_deadline_epoch=now + 10,
+                    overall_deadline_epoch=now + 10,
+                )
+                with self.assertRaises(WakeError):
+                    manager.thermal_hold(action, reauthorize=lambda: None)
+                self.assertFalse(any(method == "POST" for method, _, _ in http.calls))
+
+    def test_thermal_hold_rechecks_authority_before_mutation(self) -> None:
+        http = PerModelSleepHttp({"embedding": False, "vision": True})
+        manager = ModelManager([qwen_model(), vision_model()], http, poll_interval_s=0)
+        now = time.time()
+        action = ThermalAction(
+            action_id="thermal-9",
+            phase="graceful_hold",
+            drain_deadline_epoch=now + 5,
+            sleep_deadline_epoch=now + 10,
+            overall_deadline_epoch=now + 10,
+        )
+        calls = 0
+
+        def changed() -> None:
+            nonlocal calls
+            calls += 1
+            if calls >= 3:
+                raise RuntimeError("root phase changed")
+
+        with self.assertRaisesRegex(RuntimeError, "root phase changed"):
+            manager.thermal_hold(action, reauthorize=changed)
+        self.assertFalse(any(method == "POST" for method, _, _ in http.calls))
+
+    def test_thermal_release_is_positive_proof_only_and_never_mutates_engines(self) -> None:
+        now = time.time()
+        action = ThermalAction(
+            action_id="thermal-10",
+            phase="release_authorized",
+            drain_deadline_epoch=now - 20,
+            sleep_deadline_epoch=now - 10,
+            overall_deadline_epoch=now - 5,
+        )
+        sleeping_http = PerModelSleepHttp({"embedding": True, "vision": True})
+        manager = ModelManager([qwen_model(), vision_model()], sleeping_http)
+        proof = manager.thermal_release_ready(action, reauthorize=lambda: None)
+        self.assertTrue(proof["release_ready"])
+        self.assertFalse(any(method == "POST" for method, _, _ in sleeping_http.calls))
+
+        awake_http = PerModelSleepHttp({"embedding": True, "vision": False})
+        manager = ModelManager([qwen_model(), vision_model()], awake_http)
+        with self.assertRaises(WakeError):
+            manager.thermal_release_ready(action, reauthorize=lambda: None)
+        self.assertFalse(any(method == "POST" for method, _, _ in awake_http.calls))
 
 
 if __name__ == "__main__":

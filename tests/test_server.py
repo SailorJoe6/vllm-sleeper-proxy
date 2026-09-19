@@ -1,19 +1,23 @@
 from __future__ import annotations
 
 import json
+import os
 import socket
+import tempfile
 import threading
 import time
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from vllm_sleeper_proxy.admission import FileThermalAdmissionGuard, ThermalCooldownError
+from vllm_sleeper_proxy.thermal_control import FileThermalActionAuthority
 from vllm_sleeper_proxy.client import HttpResponse
 from vllm_sleeper_proxy.config import ModelConfig
 from vllm_sleeper_proxy.manager import ModelManager, WakeError
-from vllm_sleeper_proxy.server import build_server, require_qwen_admission
+from vllm_sleeper_proxy.server import build_server, main, require_qwen_admission
 
 
 class AdmissionWiringTests(unittest.TestCase):
@@ -27,6 +31,17 @@ class AdmissionWiringTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "SLEEPER_ADMISSION_STATUS_PATH"):
             require_qwen_admission([model], None)
         require_qwen_admission([model], "/run/status.json")
+
+    def test_action_control_enable_requires_explicit_authority_path(self):
+        with patch.dict(
+            os.environ,
+            {"SLEEPER_THERMAL_ACTION_CONTROL_ENABLED": "1"},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "SLEEPER_THERMAL_ACTION_STATUS_PATH"
+            ):
+                main([])
 
 
 class FakeStream:
@@ -1035,6 +1050,182 @@ class BootstrapServerTests(unittest.TestCase):
         )
         with urlopen(req, timeout=2) as response:
             self.assertEqual(response.status, 200)
+
+
+class ThermalActionServerTests(unittest.TestCase):
+    def _post(self, base_url: str, path: str, payload: dict) -> tuple[int, dict]:
+        request = Request(
+            f"{base_url}{path}",
+            data=json.dumps(payload).encode(),
+            headers={"content-type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=2) as response:  # noqa: S310 - local test server
+                return response.status, json.loads(response.read().decode())
+        except HTTPError as exc:
+            return exc.code, json.loads(exc.read().decode())
+
+    def _serve(self, manager, **kwargs):
+        server = build_server("127.0.0.1", 0, manager, **kwargs)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        return server, thread, f"http://127.0.0.1:{server.server_address[1]}"
+
+    def test_action_routes_are_absent_when_control_is_not_explicitly_enabled(self) -> None:
+        manager = ModelManager([ModelConfig(
+            name="Qwen3-Embedding-8B",
+            upstream_model="Qwen/Qwen3-Embedding-8B",
+            upstream_base_url="http://vllm:8888/v1",
+            control_base_url="http://vllm:8888",
+        )], ProxyHttp())
+        server, thread, base_url = self._serve(manager)
+        try:
+            status, payload = self._post(base_url, "/thermal/actions/hold", {
+                "schema_version": 1,
+                "action_id": "thermal-7",
+                "phase": "graceful_hold",
+            })
+            self.assertEqual(404, status)
+            self.assertIn("not found", payload["error"]["message"])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+    def test_enabled_action_route_requires_exact_root_authority_and_returns_proof(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            now = time.time()
+            authority_path = Path(directory) / "containment.json"
+            authority_path.write_text(json.dumps({
+                "schema_version": 1,
+                "created_at_epoch": now - 1,
+                "generated_at_epoch": now,
+                "active": True,
+                "state": "sleep",
+                "phase": "graceful_hold",
+                "applied": False,
+                "action_id": "thermal-7",
+                "reason_codes": ["acpi_temperature_requires_sleep"],
+                "drain_deadline_epoch": now + 5,
+                "sleep_deadline_epoch": now + 10,
+                "overall_deadline_epoch": now + 10,
+                "requirement": "REQ-MODEL-AVAIL-001",
+            }))
+            authority = FileThermalActionAuthority(authority_path)
+            http = ProxyHttp()
+            http.sleeping = False
+            manager = ModelManager([ModelConfig(
+                name="Qwen3-Embedding-8B",
+                upstream_model="Qwen/Qwen3-Embedding-8B",
+                upstream_base_url="http://vllm:8888/v1",
+                control_base_url="http://vllm:8888",
+            )], http, poll_interval_s=0, bootstrap_mode=True)
+            server, thread, base_url = self._serve(
+                manager,
+                thermal_action_control_enabled=True,
+                thermal_action_authority=authority,
+            )
+            try:
+                body = {
+                    "schema_version": 1,
+                    "action_id": "thermal-7",
+                    "phase": "graceful_hold",
+                }
+                status, payload = self._post(
+                    base_url,
+                    "/thermal/actions/hold",
+                    {**body, "unexpected": True},
+                )
+                self.assertEqual(400, status)
+                self.assertEqual("thermal_action_invalid", payload["error"]["code"])
+                self.assertEqual([], http.requests)
+
+                status, payload = self._post(
+                    base_url, "/thermal/actions/hold", body
+                )
+                self.assertEqual(200, status)
+                self.assertEqual("hold", payload["operation"])
+                self.assertTrue(payload["all_sleeping"])
+                self.assertEqual(
+                    {"Qwen3-Embedding-8B"}, set(payload["engine_proofs"])
+                )
+
+                original_hold = manager.thermal_hold
+
+                def hold_then_flip(*args, **kwargs):
+                    proof = original_hold(*args, **kwargs)
+                    changed = json.loads(authority_path.read_text())
+                    changed["phase"] = "held"
+                    authority_path.write_text(json.dumps(changed))
+                    return proof
+
+                manager.thermal_hold = hold_then_flip
+                status, payload = self._post(
+                    base_url, "/thermal/actions/hold", body
+                )
+                self.assertEqual(409, status)
+                self.assertEqual(
+                    "thermal_action_mismatch", payload["error"]["code"]
+                )
+                manager.thermal_hold = original_hold
+                unchanged = json.loads(authority_path.read_text())
+                unchanged["phase"] = "graceful_hold"
+                authority_path.write_text(json.dumps(unchanged))
+
+                def hold_then_extend(*args, **kwargs):
+                    proof = original_hold(*args, **kwargs)
+                    changed = json.loads(authority_path.read_text())
+                    changed["sleep_deadline_epoch"] += 0.25
+                    authority_path.write_text(json.dumps(changed))
+                    return proof
+
+                manager.thermal_hold = hold_then_extend
+                status, payload = self._post(
+                    base_url, "/thermal/actions/hold", body
+                )
+                self.assertEqual(409, status)
+                self.assertEqual(
+                    "thermal_action_mismatch", payload["error"]["code"]
+                )
+                manager.thermal_hold = original_hold
+                unchanged = json.loads(authority_path.read_text())
+                unchanged["sleep_deadline_epoch"] -= 0.25
+                authority_path.write_text(json.dumps(unchanged))
+
+                http.requests.clear()
+                status, payload = self._post(
+                    base_url,
+                    "/thermal/actions/hold",
+                    {**body, "action_id": "thermal-other"},
+                )
+                self.assertEqual(409, status)
+                self.assertEqual("thermal_action_mismatch", payload["error"]["code"])
+                self.assertEqual([], http.requests)
+
+                authority_value = json.loads(authority_path.read_text())
+                authority_value["phase"] = "release_authorized"
+                authority_path.write_text(json.dumps(authority_value))
+                http.requests.clear()
+                status, payload = self._post(
+                    base_url,
+                    "/thermal/actions/release",
+                    {
+                        "schema_version": 1,
+                        "action_id": "thermal-7",
+                        "phase": "release_authorized",
+                    },
+                )
+                self.assertEqual(200, status)
+                self.assertEqual("release", payload["operation"])
+                self.assertTrue(payload["release_ready"])
+                self.assertFalse(any(
+                    method == "POST" for method, _, _ in http.requests
+                ))
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
 
 
 if __name__ == "__main__":
