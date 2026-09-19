@@ -14,6 +14,37 @@ from vllm_sleeper_proxy.manager import ModelManager, UnknownModelError, WakeErro
 from vllm_sleeper_proxy.thermal_control import ThermalAction
 
 
+def thermal_action(
+    *,
+    action_id: str,
+    phase: str,
+    drain_deadline_epoch: float,
+    sleep_deadline_epoch: float,
+    overall_deadline_epoch: float,
+) -> ThermalAction:
+    release = phase in {"release_authorized", "cutoff_recovery_authorized", "releasing"}
+    created = drain_deadline_epoch - 5.0
+    return ThermalAction(
+        record_revision=2 if release else 1,
+        incident_id="incident-manager-test",
+        action_id=action_id,
+        generation=1,
+        predecessor_action_id=None,
+        transition_kind="graceful_hold",
+        phase=phase,
+        containment_level="graceful",
+        created_at_epoch=created,
+        phase_updated_at_epoch=created,
+        drain_deadline_epoch=drain_deadline_epoch,
+        sleep_deadline_epoch=sleep_deadline_epoch,
+        overall_deadline_epoch=overall_deadline_epoch,
+        release_authorized_at_epoch=created if release else None,
+        repair_deadline_epoch=time.time() + 60 if release else None,
+        recovery_authorized=release,
+        engine_keys=("Qwen3-Embedding-8B",),
+    )
+
+
 class FakeHttp:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str, bytes | None]] = []
@@ -1075,7 +1106,7 @@ class ModelManagerTests(unittest.TestCase):
         http = PerModelSleepHttp({"embedding": False})
         manager = ModelManager([qwen_model()], http, sleep_level=1)
         now = time.time()
-        action = ThermalAction(
+        action = thermal_action(
             action_id="thermal-level",
             phase="graceful_hold",
             drain_deadline_epoch=now + 5,
@@ -1124,7 +1155,7 @@ class ModelManagerTests(unittest.TestCase):
 
         fenced.set()
         now = time.time()
-        action = ThermalAction(
+        action = thermal_action(
             action_id="thermal-race",
             phase="graceful_hold",
             drain_deadline_epoch=now + 5,
@@ -1167,7 +1198,7 @@ class ModelManagerTests(unittest.TestCase):
             owner_validation_timeout_s=1,
         )
         now = time.time()
-        action = ThermalAction(
+        action = thermal_action(
             action_id="thermal-7",
             phase="graceful_hold",
             drain_deadline_epoch=now + 5,
@@ -1208,7 +1239,7 @@ class ModelManagerTests(unittest.TestCase):
         http = PerModelSleepHttp({"embedding": False, "vision": True})
         manager = ModelManager([qwen_model(), vision_model()], http)
         now = time.time()
-        action = ThermalAction(
+        action = thermal_action(
             action_id="thermal-expired",
             phase="graceful_hold",
             drain_deadline_epoch=now - 3,
@@ -1227,7 +1258,7 @@ class ModelManagerTests(unittest.TestCase):
                 manager = ModelManager(
                     [qwen_model(), vision_model()], http, poll_interval_s=0
                 )
-                action = ThermalAction(
+                action = thermal_action(
                     action_id="thermal-8",
                     phase=phase,
                     drain_deadline_epoch=now + 5,
@@ -1242,7 +1273,7 @@ class ModelManagerTests(unittest.TestCase):
         http = PerModelSleepHttp({"embedding": False, "vision": True})
         manager = ModelManager([qwen_model(), vision_model()], http, poll_interval_s=0)
         now = time.time()
-        action = ThermalAction(
+        action = thermal_action(
             action_id="thermal-9",
             phase="graceful_hold",
             drain_deadline_epoch=now + 5,
@@ -1263,7 +1294,7 @@ class ModelManagerTests(unittest.TestCase):
 
     def test_thermal_release_is_positive_proof_only_and_never_mutates_engines(self) -> None:
         now = time.time()
-        action = ThermalAction(
+        action = thermal_action(
             action_id="thermal-10",
             phase="release_authorized",
             drain_deadline_epoch=now - 20,

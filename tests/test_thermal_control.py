@@ -11,26 +11,95 @@ from vllm_sleeper_proxy.thermal_control import (
 )
 
 
-def projection(*, phase: str = "graceful_hold", action_id: str = "thermal-7") -> dict:
+def projection(
+    *,
+    phase: str = "graceful_hold",
+    action_id: str = "thermal-7",
+    incident_id: str = "incident-3",
+    generation: int = 1,
+    predecessor_action_id: str | None = None,
+    transition_kind: str | None = None,
+) -> dict:
+    release = phase in {"release_authorized", "cutoff_recovery_authorized", "releasing"}
+    cutoff_recovery = phase == "cutoff_recovery_authorized"
+    if transition_kind is None:
+        transition_kind = "cutoff_recovery" if cutoff_recovery else (
+            "urgent_hold" if phase == "urgent_hold" else "graceful_hold"
+        )
+    if cutoff_recovery:
+        generation = 2
+        predecessor_action_id = predecessor_action_id or "thermal-cutoff-6"
+    created = 95.0 if cutoff_recovery else (100.0 if transition_kind == "urgent_hold" else 90.0)
+    phase_updated = 96.0 if release else created
     return {
-        "schema_version": 1,
-        "created_at_epoch": 90.0,
-        "generated_at_epoch": 99.0,
-        "active": True,
-        "state": "sleep",
-        "phase": phase,
-        "applied": False,
+        "schema_version": 2,
+        "record_revision": 1 if cutoff_recovery else (3 if release else 1),
+        "incident_id": incident_id,
         "action_id": action_id,
+        "generation": generation,
+        "predecessor_action_id": predecessor_action_id,
+        "transition_kind": transition_kind,
+        "created_at_epoch": created,
+        "phase_updated_at_epoch": phase_updated,
+        "generated_at_epoch": 100.0 if transition_kind == "urgent_hold" else 99.0,
+        "active": True,
+        "state": "recovering" if release else "sleep",
+        "phase": phase,
+        "containment_level": "cutoff_recovery" if cutoff_recovery else (
+            "urgent" if transition_kind == "urgent_hold" else "graceful"
+        ),
+        "applied": not cutoff_recovery and (phase in {"held", "release_authorized", "releasing"}),
+        "result": "repair_pending" if cutoff_recovery else (
+            "all_sleeping_or_stopped" if release or phase == "held" else "pending"
+        ),
+        "recovery_authorized": release,
         "reason_codes": ["acpi_temperature_requires_sleep"],
-        "drain_deadline_epoch": 150.0,
-        "sleep_deadline_epoch": 180.0,
-        "overall_deadline_epoch": 200.0,
+        "drain_deadline_epoch": None if cutoff_recovery else (100.5 if transition_kind == "urgent_hold" else 150.0),
+        "sleep_deadline_epoch": None if cutoff_recovery else (105.5 if transition_kind == "urgent_hold" else 180.0),
+        "overall_deadline_epoch": None if cutoff_recovery else (105.5 if transition_kind == "urgent_hold" else 200.0),
+        "release_authorized_at_epoch": created if release else None,
+        "repair_deadline_epoch": 200.0 if release else None,
+        "engine_keys": ["Qwen3-Embedding-8B", "qwen3.8-flash-next", "vision-vla"],
+        "authorized_operations": ["release" if release else "hold"],
         "requirement": "REQ-MODEL-AVAIL-001",
     }
 
 
-def request(*, phase: str = "graceful_hold", action_id: str = "thermal-7") -> dict:
-    return {"schema_version": 1, "action_id": action_id, "phase": phase}
+def request(
+    *, phase: str = "graceful_hold", action_id: str = "thermal-7", **kwargs
+) -> dict:
+    value = projection(phase=phase, action_id=action_id, **kwargs)
+    operation = value["authorized_operations"][0]
+    keys = {
+        "record_revision", "incident_id", "action_id", "generation",
+        "predecessor_action_id", "transition_kind", "phase",
+        "containment_level", "created_at_epoch", "phase_updated_at_epoch",
+        "drain_deadline_epoch", "sleep_deadline_epoch", "overall_deadline_epoch",
+        "release_authorized_at_epoch", "repair_deadline_epoch",
+        "recovery_authorized", "engine_keys",
+    }
+    return {
+        "schema_version": 2,
+        "operation": operation,
+        **{key: value[key] for key in keys},
+    }
+
+
+def request_from_projection(value: dict, *, operation: str | None = None) -> dict:
+    selected = operation or value["authorized_operations"][0]
+    keys = {
+        "record_revision", "incident_id", "action_id", "generation",
+        "predecessor_action_id", "transition_kind", "phase",
+        "containment_level", "created_at_epoch", "phase_updated_at_epoch",
+        "drain_deadline_epoch", "sleep_deadline_epoch", "overall_deadline_epoch",
+        "release_authorized_at_epoch", "repair_deadline_epoch",
+        "recovery_authorized", "engine_keys",
+    }
+    return {
+        "schema_version": 2,
+        "operation": selected,
+        **{key: value[key] for key in keys},
+    }
 
 
 class FileThermalActionAuthorityTests(unittest.TestCase):
@@ -51,13 +120,15 @@ class FileThermalActionAuthorityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "containment.json"
             authority = FileThermalActionAuthority(path, now=lambda: 100.0)
+            nonfinite = {**projection(), "overall_deadline_epoch": float("nan")}
+            inverted = {**projection(), "drain_deadline_epoch": 190.0, "sleep_deadline_epoch": 180.0}
             cases = (
                 (None, request(), "unavailable"),
                 ({"schema_version": 1, "active": False}, request(), "inactive"),
                 (projection(), request(action_id="thermal-other"), "mismatch"),
                 (projection(), {**request(), "unexpected": True}, "invalid_request"),
-                ({**projection(), "overall_deadline_epoch": float("nan")}, request(), "invalid_authority"),
-                ({**projection(), "drain_deadline_epoch": 190.0, "sleep_deadline_epoch": 180.0}, request(), "invalid_authority"),
+                (nonfinite, request_from_projection(nonfinite), "mismatch"),
+                (inverted, request_from_projection(inverted), "invalid_authority"),
             )
             for value, body, code in cases:
                 with self.subTest(code=code):
@@ -85,7 +156,7 @@ class FileThermalActionAuthorityTests(unittest.TestCase):
             path.write_text(json.dumps(projection(phase="release_authorized")))
             with self.assertRaises(ThermalActionControlError) as observed:
                 authority.authorize("hold", request(phase="release_authorized"))
-            self.assertEqual("phase_not_allowed", observed.exception.code)
+            self.assertEqual("invalid_request", observed.exception.code)
             release = authority.authorize(
                 "release", request(phase="release_authorized")
             )
@@ -100,7 +171,7 @@ class FileThermalActionAuthorityTests(unittest.TestCase):
             path.write_text(json.dumps(value))
             authority = FileThermalActionAuthority(path, now=lambda: 100.0)
             with self.assertRaises(ThermalActionControlError) as observed:
-                authority.authorize("hold", request())
+                authority.authorize("hold", request_from_projection(value))
         self.assertEqual("invalid_authority", observed.exception.code)
 
     def test_urgent_hold_is_authorized_but_expired_urgent_work_is_not(self) -> None:
@@ -126,7 +197,7 @@ class FileThermalActionAuthorityTests(unittest.TestCase):
             original = authority.authorize("hold", request())
             value["sleep_deadline_epoch"] = 190.0
             path.write_text(json.dumps(value))
-            changed = authority.authorize("hold", request())
+            changed = authority.authorize("hold", request_from_projection(value))
         self.assertNotEqual(original, changed)
         self.assertEqual(original.created_at_epoch, changed.created_at_epoch)
 
@@ -140,6 +211,136 @@ class FileThermalActionAuthorityTests(unittest.TestCase):
             with self.assertRaises(ThermalActionControlError) as observed:
                 authority.authorize("hold", request())
         self.assertEqual("invalid_authority", observed.exception.code)
+
+
+    def test_v1_request_and_active_authority_are_rejected_without_downgrade(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "containment.json"
+            path.write_text(json.dumps(projection()))
+            authority = FileThermalActionAuthority(path, now=lambda: 100.0)
+            legacy = {"schema_version": 1, "action_id": "thermal-7", "phase": "graceful_hold"}
+            with self.assertRaises(ThermalActionControlError) as observed:
+                authority.authorize("hold", legacy)
+            self.assertEqual("invalid_request", observed.exception.code)
+            legacy_projection = projection()
+            legacy_projection["schema_version"] = 1
+            path.write_text(json.dumps(legacy_projection))
+            with self.assertRaises(ThermalActionControlError) as observed:
+                authority.authorize("hold", request())
+            self.assertEqual("invalid_authority", observed.exception.code)
+
+    def test_every_bound_lineage_revision_deadline_and_engine_field_is_exact(self) -> None:
+        mutations = {
+            "record_revision": 2,
+            "incident_id": "incident-other",
+            "action_id": "thermal-other",
+            "generation": 2,
+            "predecessor_action_id": "thermal-6",
+            "transition_kind": "urgent_hold",
+            "phase": "held",
+            "containment_level": "urgent",
+            "created_at_epoch": 91.0,
+            "phase_updated_at_epoch": 91.0,
+            "drain_deadline_epoch": 151.0,
+            "sleep_deadline_epoch": 181.0,
+            "overall_deadline_epoch": 201.0,
+            "release_authorized_at_epoch": 95.0,
+            "repair_deadline_epoch": 195.0,
+            "recovery_authorized": True,
+            "engine_keys": ["Qwen3-Embedding-8B"],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "containment.json"
+            current = projection()
+            path.write_text(json.dumps(current))
+            authority = FileThermalActionAuthority(path, now=lambda: 100.0)
+            for key, changed in mutations.items():
+                with self.subTest(key=key):
+                    stale = request()
+                    stale[key] = changed
+                    with self.assertRaises(ThermalActionControlError) as observed:
+                        authority.authorize("hold", stale)
+                    self.assertEqual("mismatch", observed.exception.code)
+
+    def test_cutoff_recovery_authorizes_release_proof_only_with_null_containment_deadlines(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "containment.json"
+            value = projection(phase="cutoff_recovery_authorized")
+            body = request(phase="cutoff_recovery_authorized")
+            path.write_text(json.dumps(value))
+            authority = FileThermalActionAuthority(path, now=lambda: 100.0)
+            action = authority.authorize("release", body)
+            self.assertEqual("cutoff_recovery", action.transition_kind)
+            self.assertIsNone(action.overall_deadline_epoch)
+            wrong = dict(body)
+            wrong["operation"] = "hold"
+            with self.assertRaises(ThermalActionControlError) as observed:
+                authority.authorize("hold", wrong)
+            self.assertEqual("phase_not_allowed", observed.exception.code)
+
+    def test_cutoff_recovery_and_ordinary_release_deadline_matrices_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "containment.json"
+            authority = FileThermalActionAuthority(path, now=lambda: 100.0)
+            cases = []
+            cutoff_with_containment = projection(phase="cutoff_recovery_authorized")
+            cutoff_with_containment["overall_deadline_epoch"] = 150.0
+            cases.append(cutoff_with_containment)
+            ordinary_without_containment = projection(phase="release_authorized")
+            ordinary_without_containment["drain_deadline_epoch"] = None
+            cases.append(ordinary_without_containment)
+            overlong_repair = projection(phase="release_authorized")
+            overlong_repair["repair_deadline_epoch"] = overlong_repair["release_authorized_at_epoch"] + 5400.001
+            cases.append(overlong_repair)
+            for value in cases:
+                with self.subTest(phase=value["phase"]):
+                    path.write_text(json.dumps(value))
+                    body = request_from_projection(value)
+                    with self.assertRaises(ThermalActionControlError) as observed:
+                        authority.authorize("release", body)
+                    self.assertEqual("invalid_authority", observed.exception.code)
+
+
+    def test_kind_generation_phase_and_level_matrix_rejects_impossible_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "containment.json"
+            authority = FileThermalActionAuthority(path, now=lambda: 100.0)
+            cases = []
+            bad = projection()
+            bad.update({"transition_kind": "hard_cutoff"})
+            cases.append(("hold", bad))
+            bad = projection(phase="release_authorized")
+            bad.update({"transition_kind": "hard_cutoff"})
+            cases.append(("release", bad))
+            bad = projection(phase="cutoff_recovery_authorized")
+            bad.update({
+                "generation": 1, "predecessor_action_id": None,
+            })
+            cases.append(("release", bad))
+            bad = projection(phase="cutoff_recovery_authorized")
+            bad.update({
+                "transition_kind": "graceful_hold",
+                "containment_level": "graceful",
+                "drain_deadline_epoch": 150.0,
+                "sleep_deadline_epoch": 180.0,
+                "overall_deadline_epoch": 200.0,
+                "created_at_epoch": 90.0,
+                "release_authorized_at_epoch": 95.0,
+            })
+            cases.append(("release", bad))
+            bad = projection()
+            bad["containment_level"] = "urgent"
+            cases.append(("hold", bad))
+            for operation, value in cases:
+                with self.subTest(operation=operation, kind=value["transition_kind"],
+                                  phase=value["phase"], level=value["containment_level"]):
+                    value["authorized_operations"] = [operation]
+                    path.write_text(json.dumps(value))
+                    with self.assertRaises(ThermalActionControlError) as observed:
+                        authority.authorize(
+                            operation, request_from_projection(value, operation=operation)
+                        )
+                    self.assertEqual("invalid_authority", observed.exception.code)
 
 
 if __name__ == "__main__":

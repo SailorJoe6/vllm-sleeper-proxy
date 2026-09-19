@@ -1052,6 +1052,64 @@ class BootstrapServerTests(unittest.TestCase):
             self.assertEqual(response.status, 200)
 
 
+def thermal_action_projection(
+    now: float,
+    *,
+    phase: str = "graceful_hold",
+    action_id: str = "thermal-7",
+) -> dict[str, object]:
+    release = phase in {"release_authorized", "cutoff_recovery_authorized", "releasing"}
+    cutoff_recovery = phase == "cutoff_recovery_authorized"
+    created = now - 1
+    return {
+        "schema_version": 2,
+        "record_revision": 1 if not release else 2,
+        "incident_id": "incident-3",
+        "action_id": action_id,
+        "generation": 2 if cutoff_recovery else 1,
+        "predecessor_action_id": "thermal-cutoff-6" if cutoff_recovery else None,
+        "transition_kind": "cutoff_recovery" if cutoff_recovery else "graceful_hold",
+        "created_at_epoch": created,
+        "phase_updated_at_epoch": now if release else created,
+        "generated_at_epoch": now,
+        "active": True,
+        "state": "recovering" if release else "sleep",
+        "phase": phase,
+        "containment_level": "cutoff_recovery" if cutoff_recovery else "graceful",
+        "applied": release and not cutoff_recovery,
+        "result": "repair_pending" if cutoff_recovery else (
+            "all_sleeping_or_stopped" if release else "pending"
+        ),
+        "recovery_authorized": release,
+        "reason_codes": ["acpi_temperature_requires_sleep"],
+        "drain_deadline_epoch": None if cutoff_recovery else now + 5,
+        "sleep_deadline_epoch": None if cutoff_recovery else now + 10,
+        "overall_deadline_epoch": None if cutoff_recovery else now + 10,
+        "release_authorized_at_epoch": created if release else None,
+        "repair_deadline_epoch": now + 60 if release else None,
+        "engine_keys": ["Qwen3-Embedding-8B"],
+        "authorized_operations": ["release" if release else "hold"],
+        "requirement": "REQ-MODEL-AVAIL-001",
+    }
+
+
+def thermal_action_request(value: dict[str, object]) -> dict[str, object]:
+    operation = value["authorized_operations"][0]
+    keys = {
+        "record_revision", "incident_id", "action_id", "generation",
+        "predecessor_action_id", "transition_kind", "phase",
+        "containment_level", "created_at_epoch", "phase_updated_at_epoch",
+        "drain_deadline_epoch", "sleep_deadline_epoch", "overall_deadline_epoch",
+        "release_authorized_at_epoch", "repair_deadline_epoch",
+        "recovery_authorized", "engine_keys",
+    }
+    return {
+        "schema_version": 2,
+        "operation": operation,
+        **{key: value[key] for key in keys},
+    }
+
+
 class ThermalActionServerTests(unittest.TestCase):
     def _post(self, base_url: str, path: str, payload: dict) -> tuple[int, dict]:
         request = Request(
@@ -1097,21 +1155,8 @@ class ThermalActionServerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             now = time.time()
             authority_path = Path(directory) / "containment.json"
-            authority_path.write_text(json.dumps({
-                "schema_version": 1,
-                "created_at_epoch": now - 1,
-                "generated_at_epoch": now,
-                "active": True,
-                "state": "sleep",
-                "phase": "graceful_hold",
-                "applied": False,
-                "action_id": "thermal-7",
-                "reason_codes": ["acpi_temperature_requires_sleep"],
-                "drain_deadline_epoch": now + 5,
-                "sleep_deadline_epoch": now + 10,
-                "overall_deadline_epoch": now + 10,
-                "requirement": "REQ-MODEL-AVAIL-001",
-            }))
+            authority_value = thermal_action_projection(now)
+            authority_path.write_text(json.dumps(authority_value))
             authority = FileThermalActionAuthority(authority_path)
             http = ProxyHttp()
             http.sleeping = False
@@ -1127,11 +1172,7 @@ class ThermalActionServerTests(unittest.TestCase):
                 thermal_action_authority=authority,
             )
             try:
-                body = {
-                    "schema_version": 1,
-                    "action_id": "thermal-7",
-                    "phase": "graceful_hold",
-                }
+                body = thermal_action_request(authority_value)
                 status, payload = self._post(
                     base_url,
                     "/thermal/actions/hold",
@@ -1150,6 +1191,15 @@ class ThermalActionServerTests(unittest.TestCase):
                 self.assertEqual(
                     {"Qwen3-Embedding-8B"}, set(payload["engine_proofs"])
                 )
+                for key in (
+                    "record_revision", "incident_id", "action_id", "generation",
+                    "predecessor_action_id", "transition_kind", "containment_level",
+                    "created_at_epoch", "phase_updated_at_epoch",
+                    "drain_deadline_epoch", "sleep_deadline_epoch",
+                    "overall_deadline_epoch", "release_authorized_at_epoch",
+                    "repair_deadline_epoch", "recovery_authorized", "engine_keys",
+                ):
+                    self.assertEqual(authority_value[key], payload[key])
 
                 original_hold = manager.thermal_hold
 
@@ -1203,24 +1253,96 @@ class ThermalActionServerTests(unittest.TestCase):
                 self.assertEqual("thermal_action_mismatch", payload["error"]["code"])
                 self.assertEqual([], http.requests)
 
-                authority_value = json.loads(authority_path.read_text())
-                authority_value["phase"] = "release_authorized"
+                authority_value = thermal_action_projection(
+                    time.time(), phase="release_authorized"
+                )
                 authority_path.write_text(json.dumps(authority_value))
                 http.requests.clear()
                 status, payload = self._post(
                     base_url,
                     "/thermal/actions/release",
-                    {
-                        "schema_version": 1,
-                        "action_id": "thermal-7",
-                        "phase": "release_authorized",
-                    },
+                    thermal_action_request(authority_value),
                 )
                 self.assertEqual(200, status)
                 self.assertEqual("release", payload["operation"])
                 self.assertTrue(payload["release_ready"])
                 self.assertFalse(any(
                     method == "POST" for method, _, _ in http.requests
+                ))
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
+    def test_cutoff_recovery_is_release_proof_only_and_stale_predecessor_does_no_work(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            now = time.time()
+            authority_path = Path(directory) / "containment.json"
+            current = thermal_action_projection(
+                now, phase="cutoff_recovery_authorized", action_id="thermal-recovery-2"
+            )
+            authority_path.write_text(json.dumps(current))
+            authority = FileThermalActionAuthority(authority_path)
+            http = ProxyHttp()
+            manager = ModelManager([ModelConfig(
+                name="Qwen3-Embedding-8B",
+                upstream_model="Qwen/Qwen3-Embedding-8B",
+                upstream_base_url="http://vllm:8888/v1",
+                control_base_url="http://vllm:8888",
+            )], http, poll_interval_s=0, bootstrap_mode=True)
+            server, thread, base_url = self._serve(
+                manager,
+                thermal_action_control_enabled=True,
+                thermal_action_authority=authority,
+            )
+            try:
+                current_request = thermal_action_request(current)
+                stale = dict(current_request)
+                stale.update({
+                    "record_revision": 3,
+                    "action_id": "thermal-cutoff-6",
+                    "generation": 1,
+                    "predecessor_action_id": None,
+                    "transition_kind": "graceful_hold",
+                    "phase": "release_authorized",
+                    "containment_level": "graceful",
+                    "created_at_epoch": now - 20,
+                    "phase_updated_at_epoch": now - 10,
+                    "drain_deadline_epoch": now - 15,
+                    "sleep_deadline_epoch": now - 5,
+                    "overall_deadline_epoch": now - 5,
+                    "release_authorized_at_epoch": now - 10,
+                    "repair_deadline_epoch": now + 60,
+                })
+                status, payload = self._post(
+                    base_url, "/thermal/actions/release", stale
+                )
+                self.assertEqual(409, status)
+                self.assertEqual("thermal_action_mismatch", payload["error"]["code"])
+                self.assertEqual([], http.requests)
+
+                hold_body = dict(current_request)
+                hold_body["operation"] = "hold"
+                status, payload = self._post(
+                    base_url, "/thermal/actions/hold", hold_body
+                )
+                self.assertEqual(409, status)
+                self.assertEqual([], http.requests)
+
+                status, payload = self._post(
+                    base_url, "/thermal/actions/release", current_request
+                )
+                self.assertEqual(200, status)
+                self.assertEqual("incident-3", payload["incident_id"])
+                self.assertEqual("thermal-recovery-2", payload["action_id"])
+                self.assertEqual(2, payload["generation"])
+                self.assertEqual("thermal-cutoff-6", payload["predecessor_action_id"])
+                self.assertEqual("cutoff_recovery", payload["transition_kind"])
+                self.assertTrue(payload["release_ready"])
+                self.assertTrue(http.requests)
+                self.assertTrue(all(
+                    method == "GET" and url.endswith("/is_sleeping")
+                    for method, url, _ in http.requests
                 ))
             finally:
                 server.shutdown()

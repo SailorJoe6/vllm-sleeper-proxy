@@ -649,7 +649,9 @@ class ModelManager:
         reauthorize: Callable[[], None],
     ) -> dict[str, object]:
         """Verify all-sleeping release readiness without sleeping or waking."""
-        if action.phase not in {"release_authorized", "releasing"}:
+        if action.phase not in {
+            "release_authorized", "cutoff_recovery_authorized", "releasing"
+        }:
             raise WakeError("thermal action phase is not a release phase")
         if not self._thermal_action_lock.acquire(
             timeout=self.owner_validation_timeout_s

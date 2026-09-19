@@ -128,21 +128,23 @@ GBrain embedding Compose integration:
   `inference_available=false` distinguish the fenced request plane. It also
   reports startup, lifecycle readiness, selected/starting model, and sanitized
   thermal phase/action fields without waiting for a lifecycle lease.
-  The schema-v1 root watchdog and memory-pressure monitor continue using the
-  existing bodyless loopback `POST /sleep`. Dormant action-scoped
-  `/thermal/actions/hold` and `/thermal/actions/release` routes are absent unless
-  both `SLEEPER_THERMAL_ACTION_CONTROL_ENABLED=1` and
-  `SLEEPER_THERMAL_ACTION_STATUS_PATH` are configured. `hold` accepts graceful,
-  urgent, or held verification only inside the immutable root action contract,
-  whose creation time bounds the active window to at most 300 seconds. It drains
-  within the original deadline, serializes on the shared lease, re-fences queued
-  requests before any wake, rejects non-level-2 sleep, requires unique engine
-  identities, and returns exact positive all-engine sleep proof. `release` uses
-  a separate bounded local proof timeout after hold deadlines and never sleeps,
-  wakes, selects a model, or clears root authority. Building
-  this code does not activate those routes. Deployment must enable them only
-  with the matching root durable-record/caller migration and a tested local-only
-  control binding; action IDs are correlation values, not credentials.
+  The schema-v1 admission latch, root watchdog, and memory-pressure caller remain
+  unchanged, including bodyless loopback `POST /sleep`. The separate dormant
+  action-authority contract is strict schema v2. `/thermal/actions/hold` and
+  `/thermal/actions/release` remain absent unless both
+  `SLEEPER_THERMAL_ACTION_CONTROL_ENABLED=1` and
+  `SLEEPER_THERMAL_ACTION_STATUS_PATH` are configured. Every request and response
+  binds record revision, incident/action/generation/predecessor lineage,
+  transition kind, phase revision, containment level, kind-specific deadlines,
+  recovery authority, and the exact configured engine set; schema v1 action
+  requests are rejected rather than downgraded. `hold` accepts graceful, urgent,
+  or held work only inside the immutable containment window, serializes on the
+  shared lease, rejects non-level-2 sleep, and returns exact positive all-engine
+  proof. `release` accepts ordinary release or `cutoff_recovery_authorized`
+  authority and is proof-only: it never sleeps, wakes, selects a model, repairs
+  a container, or clears root state. Building this code does not activate either
+  route. Deployment must enable them only with the matching root migration and a
+  tested local-only binding; action IDs are correlation values, not credentials.
   The bundled memory monitor polls total-host `MemAvailable` and asks the
   proxy to quiesce and sleep the active model at the configured ceiling.
 * `services/gbrain-embeddings/` wires GBrain → LiteLLM → sleeper proxy → vLLM
@@ -168,8 +170,8 @@ GBrain embedding Compose integration:
 | `POST /v1/embeddings` | OpenAI-compatible JSON | Buffered upstream response |
 | `POST /v1/chat/completions` | OpenAI-compatible text or inline multimodal JSON | Buffered JSON, or SSE when `"stream": true` |
 | `POST /sleep` | Empty body | Quiesces new inference, drains ownership, then sleeps the active model |
-| `POST /thermal/actions/hold` | Exact schema-v1 action ID and root phase; disabled by default | Sleeps only as root-authorized and returns exact all-engine positive proof |
-| `POST /thermal/actions/release` | Exact schema-v1 action ID and root release phase; disabled by default | Verifies all engines sleeping without sleep, wake, selection, or root-state mutation |
+| `POST /thermal/actions/hold` | Exact schema-v2 generation/revision/deadline/engine-set authority; disabled by default | Sleeps only as root-authorized and returns exact identity-bound all-engine positive proof |
+| `POST /thermal/actions/release` | Exact schema-v2 ordinary or cutoff-recovery proof authority; disabled by default | Verifies all engines sleeping without sleep, wake, selection, repair, or root-state mutation |
 
 The proxy rewrites only the top-level `model` field. It does not transform
 `messages`, inline `data:` image URLs, generation parameters, or response

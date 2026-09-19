@@ -364,11 +364,26 @@ class SleeperProxyHandler(BaseHTTPRequestHandler):
                     action, reauthorize=reauthorize
                 )
                 response = {
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "ok": True,
                     "operation": "hold",
+                    "record_revision": action.record_revision,
+                    "incident_id": action.incident_id,
                     "action_id": action.action_id,
+                    "generation": action.generation,
+                    "predecessor_action_id": action.predecessor_action_id,
+                    "transition_kind": action.transition_kind,
                     "root_phase": action.phase,
+                    "containment_level": action.containment_level,
+                    "created_at_epoch": action.created_at_epoch,
+                    "phase_updated_at_epoch": action.phase_updated_at_epoch,
+                    "drain_deadline_epoch": action.drain_deadline_epoch,
+                    "sleep_deadline_epoch": action.sleep_deadline_epoch,
+                    "overall_deadline_epoch": action.overall_deadline_epoch,
+                    "release_authorized_at_epoch": action.release_authorized_at_epoch,
+                    "repair_deadline_epoch": action.repair_deadline_epoch,
+                    "recovery_authorized": action.recovery_authorized,
+                    "engine_keys": list(action.engine_keys),
                     **proof,
                 }
             else:
@@ -376,11 +391,26 @@ class SleeperProxyHandler(BaseHTTPRequestHandler):
                     action, reauthorize=reauthorize
                 )
                 response = {
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "ok": True,
                     "operation": "release",
+                    "record_revision": action.record_revision,
+                    "incident_id": action.incident_id,
                     "action_id": action.action_id,
+                    "generation": action.generation,
+                    "predecessor_action_id": action.predecessor_action_id,
+                    "transition_kind": action.transition_kind,
                     "root_phase": action.phase,
+                    "containment_level": action.containment_level,
+                    "created_at_epoch": action.created_at_epoch,
+                    "phase_updated_at_epoch": action.phase_updated_at_epoch,
+                    "drain_deadline_epoch": action.drain_deadline_epoch,
+                    "sleep_deadline_epoch": action.sleep_deadline_epoch,
+                    "overall_deadline_epoch": action.overall_deadline_epoch,
+                    "release_authorized_at_epoch": action.release_authorized_at_epoch,
+                    "repair_deadline_epoch": action.repair_deadline_epoch,
+                    "recovery_authorized": action.recovery_authorized,
+                    "engine_keys": list(action.engine_keys),
                     **proof,
                 }
         except ThermalActionControlError:
