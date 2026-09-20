@@ -4,6 +4,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 import socket
+import time
 from pathlib import Path
 from typing import Iterable
 from urllib.parse import urlsplit
@@ -16,6 +17,7 @@ from .admission import (
     ThermalCooldownError,
 )
 from .thermal_control import (
+    MAX_SLEEPING_SUBSET_PROOF_SECONDS,
     FileThermalActionAuthority,
     ThermalActionControlError,
 )
@@ -26,6 +28,17 @@ from .manager import (
     UnknownModelError,
     WakeError,
 )
+
+def _reject_duplicate_json_object(
+    pairs: list[tuple[str, object]],
+) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate JSON key")
+        value[key] = item
+    return value
+
 
 def require_qwen_admission(models, admission_path: str | None) -> None:
     if any(model.upstream_model == "unsloth/Qwen3.8-27B-NVFP4" for model in models) and not admission_path:
@@ -118,8 +131,13 @@ class SleeperProxyHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802 - stdlib API
         path = urlsplit(self.path).path
-        if path in {"/thermal/actions/hold", "/thermal/actions/release"}:
-            self._handle_thermal_action(path.rsplit("/", 1)[-1])
+        thermal_actions = {
+            "/thermal/actions/hold": "hold",
+            "/thermal/actions/release": "release",
+            "/thermal/actions/sleeping-subset-proof": "sleeping_subset_proof",
+        }
+        if path in thermal_actions:
+            self._handle_thermal_action(thermal_actions[path])
             return
         if self.manager.bootstrap_mode and path == "/startup/sleep":
             from urllib.parse import parse_qs
@@ -330,7 +348,10 @@ class SleeperProxyHandler(BaseHTTPRequestHandler):
             return
         try:
             body = self.rfile.read(content_length)
-            payload = json.loads(body.decode("utf-8"))
+            payload = json.loads(
+                body.decode("utf-8"),
+                object_pairs_hook=_reject_duplicate_json_object,
+            )
         except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
             self._send_error(400, "invalid thermal action body", "invalid_request")
             return
@@ -359,60 +380,45 @@ class SleeperProxyHandler(BaseHTTPRequestHandler):
                 raise ThermalActionControlError("mismatch")
 
         try:
+            common = {
+                "schema_version": 2,
+                "ok": True,
+                "operation": operation,
+                "record_revision": action.record_revision,
+                "incident_id": action.incident_id,
+                "action_id": action.action_id,
+                "generation": action.generation,
+                "predecessor_action_id": action.predecessor_action_id,
+                "transition_kind": action.transition_kind,
+                "root_phase": action.phase,
+                "containment_level": action.containment_level,
+                "created_at_epoch": action.created_at_epoch,
+                "phase_updated_at_epoch": action.phase_updated_at_epoch,
+                "drain_deadline_epoch": action.drain_deadline_epoch,
+                "sleep_deadline_epoch": action.sleep_deadline_epoch,
+                "overall_deadline_epoch": action.overall_deadline_epoch,
+                "release_authorized_at_epoch": action.release_authorized_at_epoch,
+                "repair_deadline_epoch": action.repair_deadline_epoch,
+                "recovery_authorized": action.recovery_authorized,
+                "engine_keys": list(action.engine_keys),
+                "proof_engine_keys": list(action.proof_engine_keys),
+            }
+            proof_started_at_epoch = (
+                time.time() if operation == "sleeping_subset_proof" else None
+            )
             if operation == "hold":
                 proof = self.manager.thermal_hold(
                     action, reauthorize=reauthorize
                 )
-                response = {
-                    "schema_version": 2,
-                    "ok": True,
-                    "operation": "hold",
-                    "record_revision": action.record_revision,
-                    "incident_id": action.incident_id,
-                    "action_id": action.action_id,
-                    "generation": action.generation,
-                    "predecessor_action_id": action.predecessor_action_id,
-                    "transition_kind": action.transition_kind,
-                    "root_phase": action.phase,
-                    "containment_level": action.containment_level,
-                    "created_at_epoch": action.created_at_epoch,
-                    "phase_updated_at_epoch": action.phase_updated_at_epoch,
-                    "drain_deadline_epoch": action.drain_deadline_epoch,
-                    "sleep_deadline_epoch": action.sleep_deadline_epoch,
-                    "overall_deadline_epoch": action.overall_deadline_epoch,
-                    "release_authorized_at_epoch": action.release_authorized_at_epoch,
-                    "repair_deadline_epoch": action.repair_deadline_epoch,
-                    "recovery_authorized": action.recovery_authorized,
-                    "engine_keys": list(action.engine_keys),
-                    **proof,
-                }
+            elif operation == "sleeping_subset_proof":
+                proof = self.manager.thermal_sleeping_subset_proof(
+                    action, reauthorize=reauthorize
+                )
             else:
                 proof = self.manager.thermal_release_ready(
                     action, reauthorize=reauthorize
                 )
-                response = {
-                    "schema_version": 2,
-                    "ok": True,
-                    "operation": "release",
-                    "record_revision": action.record_revision,
-                    "incident_id": action.incident_id,
-                    "action_id": action.action_id,
-                    "generation": action.generation,
-                    "predecessor_action_id": action.predecessor_action_id,
-                    "transition_kind": action.transition_kind,
-                    "root_phase": action.phase,
-                    "containment_level": action.containment_level,
-                    "created_at_epoch": action.created_at_epoch,
-                    "phase_updated_at_epoch": action.phase_updated_at_epoch,
-                    "drain_deadline_epoch": action.drain_deadline_epoch,
-                    "sleep_deadline_epoch": action.sleep_deadline_epoch,
-                    "overall_deadline_epoch": action.overall_deadline_epoch,
-                    "release_authorized_at_epoch": action.release_authorized_at_epoch,
-                    "repair_deadline_epoch": action.repair_deadline_epoch,
-                    "recovery_authorized": action.recovery_authorized,
-                    "engine_keys": list(action.engine_keys),
-                    **proof,
-                }
+            response = {**common, **proof}
         except ThermalActionControlError:
             self._send_error(
                 409,
@@ -434,12 +440,32 @@ class SleeperProxyHandler(BaseHTTPRequestHandler):
             # Bind success to the same root action, phase, creation time, and
             # immutable deadlines after all manager cleanup has completed.
             reauthorize()
+            if operation == "sleeping_subset_proof":
+                proof_completed_at_epoch = time.time()
+                assert proof_started_at_epoch is not None
+                if (
+                    proof_completed_at_epoch < proof_started_at_epoch
+                    or proof_completed_at_epoch - proof_started_at_epoch
+                    > MAX_SLEEPING_SUBSET_PROOF_SECONDS
+                ):
+                    raise WakeError("sleeping subset proof exceeded deadline")
+                response["proof_started_at_epoch"] = proof_started_at_epoch
+                response["proof_completed_at_epoch"] = proof_completed_at_epoch
         except ThermalActionControlError:
             self._send_error(
                 409,
                 "thermal action changed before proof return",
                 "conflict",
                 error_fields={"code": "thermal_action_mismatch"},
+            )
+            return
+        except WakeError:
+            self._send_error(
+                503,
+                "thermal lifecycle proof is unavailable",
+                "service_unavailable",
+                {"Retry-After": "1"},
+                {"code": "thermal_action_unavailable"},
             )
             return
         self._send_json(200, response)

@@ -60,6 +60,7 @@ def projection(
         "release_authorized_at_epoch": created if release else None,
         "repair_deadline_epoch": 200.0 if release else None,
         "engine_keys": ["Qwen3-Embedding-8B", "qwen3.8-flash-next", "vision-vla"],
+        "sleeping_peer_engine_keys": [],
         "authorized_operations": ["release" if release else "hold"],
         "requirement": "REQ-MODEL-AVAIL-001",
     }
@@ -82,6 +83,7 @@ def request(
         "schema_version": 2,
         "operation": operation,
         **{key: value[key] for key in keys},
+        "proof_engine_keys": list(value["engine_keys"]),
     }
 
 
@@ -99,6 +101,7 @@ def request_from_projection(value: dict, *, operation: str | None = None) -> dic
         "schema_version": 2,
         "operation": selected,
         **{key: value[key] for key in keys},
+        "proof_engine_keys": list(value["engine_keys"]),
     }
 
 
@@ -212,6 +215,93 @@ class FileThermalActionAuthorityTests(unittest.TestCase):
                 authority.authorize("hold", request())
         self.assertEqual("invalid_authority", observed.exception.code)
 
+
+    def test_held_sleeping_subset_proof_is_exact_and_operation_scoped(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "containment.json"
+            value = projection(phase="held")
+            value["sleeping_peer_engine_keys"] = [
+                "qwen3.8-flash-next", "vision-vla"
+            ]
+            value["authorized_operations"] = [
+                "hold", "sleeping_subset_proof"
+            ]
+            body = request_from_projection(
+                value, operation="sleeping_subset_proof"
+            )
+            body["proof_engine_keys"] = list(
+                value["sleeping_peer_engine_keys"]
+            )
+            path.write_text(json.dumps(value))
+            authority = FileThermalActionAuthority(path, now=lambda: 100.0)
+            action = authority.authorize("sleeping_subset_proof", body)
+            self.assertEqual("held", action.phase)
+            self.assertEqual(
+                ("qwen3.8-flash-next", "vision-vla"),
+                action.proof_engine_keys,
+            )
+            self.assertEqual(
+                (
+                    "Qwen3-Embedding-8B", "qwen3.8-flash-next", "vision-vla"
+                ),
+                action.engine_keys,
+            )
+
+            for keys in (
+                [],
+                ["qwen3.8-flash-next"],
+                ["qwen3.8-flash-next", "qwen3.8-flash-next"],
+                ["Qwen3-Embedding-8B", "qwen3.8-flash-next", "vision-vla"],
+                ["qwen3.8-flash-next", "vision-vla", "unknown"],
+                ["vision-vla", "qwen3.8-flash-next"],
+            ):
+                with self.subTest(keys=keys):
+                    changed = dict(body)
+                    changed["proof_engine_keys"] = keys
+                    with self.assertRaises(ThermalActionControlError):
+                        authority.authorize("sleeping_subset_proof", changed)
+
+            for field, malformed in (
+                ("record_revision", True),
+                ("generation", True),
+                ("recovery_authorized", 0),
+            ):
+                with self.subTest(field=field, malformed=malformed):
+                    changed = dict(body)
+                    changed[field] = malformed
+                    with self.assertRaises(ThermalActionControlError):
+                        authority.authorize("sleeping_subset_proof", changed)
+
+            duplicate_authority = json.dumps(value).replace(
+                '"record_revision": 1,',
+                '"record_revision": 1, "record_revision": 1,',
+                1,
+            )
+            self.assertIn(
+                '"record_revision": 1, "record_revision": 1,',
+                duplicate_authority,
+            )
+            path.write_text(duplicate_authority)
+            with self.assertRaises(ThermalActionControlError) as duplicate:
+                authority.authorize("sleeping_subset_proof", body)
+            self.assertEqual("invalid_authority", duplicate.exception.code)
+
+            nonheld = projection()
+            nonheld["sleeping_peer_engine_keys"] = list(
+                value["sleeping_peer_engine_keys"]
+            )
+            nonheld["authorized_operations"] = [
+                "hold", "sleeping_subset_proof"
+            ]
+            path.write_text(json.dumps(nonheld))
+            changed = request_from_projection(
+                nonheld, operation="sleeping_subset_proof"
+            )
+            changed["proof_engine_keys"] = list(
+                nonheld["sleeping_peer_engine_keys"]
+            )
+            with self.assertRaises(ThermalActionControlError):
+                authority.authorize("sleeping_subset_proof", changed)
 
     def test_v1_request_and_active_authority_are_rejected_without_downgrade(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

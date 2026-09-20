@@ -1088,6 +1088,7 @@ def thermal_action_projection(
         "release_authorized_at_epoch": created if release else None,
         "repair_deadline_epoch": now + 60 if release else None,
         "engine_keys": ["Qwen3-Embedding-8B"],
+        "sleeping_peer_engine_keys": [],
         "authorized_operations": ["release" if release else "hold"],
         "requirement": "REQ-MODEL-AVAIL-001",
     }
@@ -1107,6 +1108,7 @@ def thermal_action_request(value: dict[str, object]) -> dict[str, object]:
         "schema_version": 2,
         "operation": operation,
         **{key: value[key] for key in keys},
+        "proof_engine_keys": list(value["engine_keys"]),
     }
 
 
@@ -1115,6 +1117,19 @@ class ThermalActionServerTests(unittest.TestCase):
         request = Request(
             f"{base_url}{path}",
             data=json.dumps(payload).encode(),
+            headers={"content-type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=2) as response:  # noqa: S310 - local test server
+                return response.status, json.loads(response.read().decode())
+        except HTTPError as exc:
+            return exc.code, json.loads(exc.read().decode())
+
+    def _post_raw(self, base_url: str, path: str, payload: bytes) -> tuple[int, dict]:
+        request = Request(
+            f"{base_url}{path}",
+            data=payload,
             headers={"content-type": "application/json"},
             method="POST",
         )
@@ -1144,6 +1159,13 @@ class ThermalActionServerTests(unittest.TestCase):
                 "action_id": "thermal-7",
                 "phase": "graceful_hold",
             })
+            self.assertEqual(404, status)
+            self.assertIn("not found", payload["error"]["message"])
+            status, payload = self._post(
+                base_url,
+                "/thermal/actions/sleeping-subset-proof",
+                {"schema_version": 2},
+            )
             self.assertEqual(404, status)
             self.assertIn("not found", payload["error"]["message"])
         finally:
@@ -1269,6 +1291,122 @@ class ThermalActionServerTests(unittest.TestCase):
                 self.assertFalse(any(
                     method == "POST" for method, _, _ in http.requests
                 ))
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
+    def test_sleeping_subset_route_is_held_only_proof_only_and_exact(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            now = time.time()
+            authority_path = Path(directory) / "containment.json"
+            authority_value = thermal_action_projection(now, phase="held")
+            authority_value.update({
+                "applied": True,
+                "result": "all_sleeping_or_stopped",
+                "sleeping_peer_engine_keys": ["Qwen3-Embedding-8B"],
+                "authorized_operations": [
+                    "hold", "sleeping_subset_proof"
+                ],
+            })
+            authority_path.write_text(json.dumps(authority_value))
+            authority = FileThermalActionAuthority(authority_path)
+            http = ProxyHttp()
+            http.sleeping = True
+            manager = ModelManager([ModelConfig(
+                name="Qwen3-Embedding-8B",
+                upstream_model="Qwen/Qwen3-Embedding-8B",
+                upstream_base_url="http://vllm:8888/v1",
+                control_base_url="http://vllm:8888",
+            )], http, poll_interval_s=0, bootstrap_mode=True)
+            server, thread, base_url = self._serve(
+                manager,
+                thermal_action_control_enabled=True,
+                thermal_action_authority=authority,
+            )
+            try:
+                body = thermal_action_request(authority_value)
+                body["operation"] = "sleeping_subset_proof"
+                body["proof_engine_keys"] = ["Qwen3-Embedding-8B"]
+                status, payload = self._post(
+                    base_url,
+                    "/thermal/actions/sleeping-subset-proof",
+                    body,
+                )
+                self.assertEqual(200, status)
+                self.assertEqual("sleeping_subset_proof", payload["operation"])
+                self.assertTrue(payload["sleeping_subset_verified"])
+                self.assertGreater(
+                    payload["proof_started_at_epoch"],
+                    authority_value["phase_updated_at_epoch"],
+                )
+                self.assertGreaterEqual(
+                    payload["proof_completed_at_epoch"],
+                    payload["proof_started_at_epoch"],
+                )
+                self.assertLessEqual(
+                    payload["proof_completed_at_epoch"]
+                    - payload["proof_started_at_epoch"],
+                    2.0,
+                )
+                self.assertEqual(
+                    ["Qwen3-Embedding-8B"], payload["proof_engine_keys"]
+                )
+                self.assertEqual(
+                    {"Qwen3-Embedding-8B"}, set(payload["engine_proofs"])
+                )
+                self.assertTrue(http.requests)
+                self.assertTrue(all(
+                    method == "GET" and url.endswith("/is_sleeping")
+                    for method, url, _ in http.requests
+                ))
+                self.assertFalse(any(
+                    method == "POST" for method, _, _ in http.requests
+                ))
+
+                encoded = json.dumps(body, separators=(",", ":"))
+                duplicated = encoded.replace(
+                    '"operation":"sleeping_subset_proof",',
+                    '"operation":"sleeping_subset_proof",'
+                    '"operation":"sleeping_subset_proof",',
+                    1,
+                ).encode()
+                http.requests.clear()
+                status, _ = self._post_raw(
+                    base_url,
+                    "/thermal/actions/sleeping-subset-proof",
+                    duplicated,
+                )
+                self.assertEqual(400, status)
+                self.assertEqual([], http.requests)
+
+                changed = dict(body)
+                changed["proof_engine_keys"] = []
+                http.requests.clear()
+                status, _ = self._post(
+                    base_url,
+                    "/thermal/actions/sleeping-subset-proof",
+                    changed,
+                )
+                self.assertEqual(400, status)
+                self.assertEqual([], http.requests)
+
+                original_proof = manager.thermal_sleeping_subset_proof
+
+                def supersede_after_manager(action, *, reauthorize):
+                    proof = original_proof(action, reauthorize=reauthorize)
+                    superseded = dict(authority_value)
+                    superseded["record_revision"] += 1
+                    authority_path.write_text(json.dumps(superseded))
+                    return proof
+
+                manager.thermal_sleeping_subset_proof = supersede_after_manager
+                status, _ = self._post(
+                    base_url,
+                    "/thermal/actions/sleeping-subset-proof",
+                    body,
+                )
+                self.assertEqual(409, status)
             finally:
                 server.shutdown()
                 server.server_close()

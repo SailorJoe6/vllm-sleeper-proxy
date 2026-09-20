@@ -130,8 +130,9 @@ GBrain embedding Compose integration:
   thermal phase/action fields without waiting for a lifecycle lease.
   The schema-v1 admission latch, root watchdog, and memory-pressure caller remain
   unchanged, including bodyless loopback `POST /sleep`. The separate dormant
-  action-authority contract is strict schema v2. `/thermal/actions/hold` and
-  `/thermal/actions/release` remain absent unless both
+  action-authority contract is strict schema v2. `/thermal/actions/hold`,
+  `/thermal/actions/sleeping-subset-proof`, and `/thermal/actions/release` remain
+  absent unless both
   `SLEEPER_THERMAL_ACTION_CONTROL_ENABLED=1` and
   `SLEEPER_THERMAL_ACTION_STATUS_PATH` are configured. Every request and response
   binds record revision, incident/action/generation/predecessor lineage,
@@ -140,10 +141,16 @@ GBrain embedding Compose integration:
   requests are rejected rather than downgraded. `hold` accepts graceful, urgent,
   or held work only inside the immutable containment window, serializes on the
   shared lease, rejects non-level-2 sleep, and returns exact positive all-engine
-  proof. `release` accepts ordinary release or `cutoff_recovery_authorized`
-  authority and is proof-only: it never sleeps, wakes, selects a model, repairs
-  a container, or clears root state. Building this code does not activate either
-  route. Deployment must enable them only with the matching root migration and a
+  proof. Held authority may also expose the dedicated
+  `/thermal/actions/sleeping-subset-proof` operation. Root binds its exact sorted
+  retained-sleeping subset beside the full configured engine set. Proxy probes
+  only that subset under the action lock, lifecycle condition, and shared startup
+  lease, repeatedly reauthorizes the root projection, and returns conservative
+  proof start/completion times within one two-second budget. It never contacts a
+  stopped peer or sleeps, wakes, selects, repairs, persists, or clears ownership.
+  `release` accepts ordinary release or `cutoff_recovery_authorized` authority and
+  remains the distinct all-engine proof-only final gate. Building this code does
+  not activate any action route. Deployment must enable them only with the matching root migration and a
   tested local-only binding; action IDs are correlation values, not credentials.
   The bundled memory monitor polls total-host `MemAvailable` and asks the
   proxy to quiesce and sleep the active model at the configured ceiling.
@@ -171,6 +178,7 @@ GBrain embedding Compose integration:
 | `POST /v1/chat/completions` | OpenAI-compatible text or inline multimodal JSON | Buffered JSON, or SSE when `"stream": true` |
 | `POST /sleep` | Empty body | Quiesces new inference, drains ownership, then sleeps the active model |
 | `POST /thermal/actions/hold` | Exact schema-v2 generation/revision/deadline/engine-set authority; disabled by default | Sleeps only as root-authorized and returns exact identity-bound all-engine positive proof |
+| `POST /thermal/actions/sleeping-subset-proof` | Exact held authority, full engine set, and root-derived retained-sleeping subset; disabled by default | Within two seconds, verifies only the exact subset without lifecycle or root-state mutation and never contacts stopped peers |
 | `POST /thermal/actions/release` | Exact schema-v2 ordinary or cutoff-recovery proof authority; disabled by default | Verifies all engines sleeping without sleep, wake, selection, repair, or root-state mutation |
 
 The proxy rewrites only the top-level `model` field. It does not transform

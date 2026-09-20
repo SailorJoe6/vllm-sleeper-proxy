@@ -12,7 +12,7 @@ from urllib.parse import urlencode
 
 from .client import HttpClient, sleep_until
 from .config import ModelConfig
-from .thermal_control import ThermalAction
+from .thermal_control import MAX_SLEEPING_SUBSET_PROOF_SECONDS, ThermalAction
 
 
 class UnknownModelError(ValueError):
@@ -637,6 +637,84 @@ class ModelManager:
                 with self._condition:
                     self._clear_owner_locked()
             return {"all_sleeping": True, "engine_proofs": proofs}
+        finally:
+            if quiescing:
+                self._finish_thermal_action()
+            self._thermal_action_lock.release()
+
+    def thermal_sleeping_subset_proof(
+        self,
+        action: ThermalAction,
+        *,
+        reauthorize: Callable[[], None],
+    ) -> dict[str, object]:
+        """Positively verify only root-declared retained sleeping peers."""
+        if action.phase != "held":
+            raise WakeError("sleeping subset proof requires held phase")
+        configured = tuple(sorted(model.name for model in self.models))
+        if action.engine_keys != configured:
+            raise WakeError("thermal action engine set does not match configuration")
+        if (
+            not action.proof_engine_keys
+            or action.proof_engine_keys != tuple(sorted(set(action.proof_engine_keys)))
+            or any(key not in action.engine_keys for key in action.proof_engine_keys)
+        ):
+            raise WakeError("thermal sleeping subset is invalid")
+        models = {model.name: model for model in self.models}
+        deadline = time.monotonic() + MAX_SLEEPING_SUBSET_PROOF_SECONDS
+
+        def remaining(stage: str) -> float:
+            value = deadline - time.monotonic()
+            if value <= 0:
+                raise WakeError(f"thermal sleeping subset {stage} deadline expired")
+            return value
+
+        if not self._thermal_action_lock.acquire(timeout=remaining("action lock")):
+            raise WakeError("timed out serializing thermal sleeping subset proof")
+        quiescing = False
+        try:
+            reauthorize()
+            if not self._condition.acquire(timeout=remaining("condition")):
+                raise WakeError("timed out acquiring lifecycle condition")
+            try:
+                reauthorize()
+                if self._quiescing:
+                    raise WakeError("lifecycle is already quiescing")
+                if self._inflight_requests:
+                    raise WakeError("sleeping subset proof still has in-flight requests")
+                self._quiescing = True
+                quiescing = True
+            finally:
+                self._condition.release()
+
+            with startup_lease(
+                self.startup_lease_path,
+                timeout_s=remaining("startup lease"),
+            ):
+                proofs: dict[str, dict[str, object]] = {}
+                for name in action.proof_engine_keys:
+                    reauthorize()
+                    sleeping = self._is_sleeping(
+                        models[name],
+                        timeout_s=min(
+                            self.request_timeout_s,
+                            remaining("engine proof"),
+                        ),
+                    )
+                    reauthorize()
+                    if sleeping is not True:
+                        raise WakeError(
+                            f"sleeping subset proof unavailable for {name}"
+                        )
+                    proofs[name] = {
+                        "state": "sleeping",
+                        "proof": "vllm_is_sleeping_true",
+                    }
+                reauthorize()
+            return {
+                "sleeping_subset_verified": True,
+                "engine_proofs": proofs,
+            }
         finally:
             if quiescing:
                 self._finish_thermal_action()

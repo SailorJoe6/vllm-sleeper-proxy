@@ -27,7 +27,7 @@ REQUEST_KEYS = {
     "phase", "containment_level", "created_at_epoch", "phase_updated_at_epoch",
     "drain_deadline_epoch", "sleep_deadline_epoch", "overall_deadline_epoch",
     "release_authorized_at_epoch", "repair_deadline_epoch",
-    "recovery_authorized", "engine_keys",
+    "recovery_authorized", "engine_keys", "proof_engine_keys",
 }
 PROJECTION_KEYS = {
     "schema_version", "record_revision", "incident_id", "action_id",
@@ -37,16 +37,30 @@ PROJECTION_KEYS = {
     "recovery_authorized", "reason_codes", "drain_deadline_epoch",
     "sleep_deadline_epoch", "overall_deadline_epoch",
     "release_authorized_at_epoch", "repair_deadline_epoch", "engine_keys",
-    "authorized_operations", "requirement",
+    "sleeping_peer_engine_keys", "authorized_operations", "requirement",
 }
-BOUND_REQUEST_FIELDS = REQUEST_KEYS - {"schema_version", "operation"}
+BOUND_REQUEST_FIELDS = REQUEST_KEYS - {
+    "schema_version", "operation", "proof_engine_keys"
+}
 MAX_ACTION_WINDOW_SECONDS = 300.0
+MAX_SLEEPING_SUBSET_PROOF_SECONDS = 2.0
 MAX_URGENT_DRAIN_SECONDS = 0.5
 MAX_URGENT_SLEEP_SECONDS = 5.0
 MAX_TOTAL_REPAIR_SECONDS = 5_400.0
 MAX_CLOCK_FUTURE_SKEW_SECONDS = 5.0
 MAX_ENGINES = 16
 MAX_INTEGER = (1 << 63) - 1
+
+
+def _reject_duplicate_json_object(
+    pairs: list[tuple[str, object]],
+) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate JSON key")
+        value[key] = item
+    return value
 
 
 class ThermalActionControlError(RuntimeError):
@@ -76,6 +90,7 @@ class ThermalAction:
     repair_deadline_epoch: float | None
     recovery_authorized: bool
     engine_keys: tuple[str, ...]
+    proof_engine_keys: tuple[str, ...]
 
 
 class FileThermalActionAuthority:
@@ -98,6 +113,8 @@ class FileThermalActionAuthority:
             return HOLD_PHASES
         if operation == "release":
             return RELEASE_PHASES
+        if operation == "sleeping_subset_proof":
+            return {"held"}
         raise ValueError("unsupported thermal action operation")
 
     def _load(self) -> dict[str, object]:
@@ -109,7 +126,10 @@ class FileThermalActionAuthority:
         if len(raw) > self.maximum_bytes:
             raise ThermalActionControlError("invalid_authority")
         try:
-            value = json.loads(raw)
+            value = json.loads(
+                raw,
+                object_pairs_hook=_reject_duplicate_json_object,
+            )
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
             raise ThermalActionControlError("invalid_authority") from exc
         if not isinstance(value, dict):
@@ -153,6 +173,29 @@ class FileThermalActionAuthority:
             raise ThermalActionControlError("invalid_authority")
         return tuple(value)
 
+    @staticmethod
+    def _engine_subset(
+        value: object,
+        *,
+        engine_keys: tuple[str, ...],
+        allow_empty: bool,
+        error_code: str,
+    ) -> tuple[str, ...]:
+        if (
+            not isinstance(value, list)
+            or len(value) > len(engine_keys)
+            or (not allow_empty and not value)
+            or value != sorted(set(value))
+            or any(
+                not isinstance(item, str)
+                or not ENGINE_ID.fullmatch(item)
+                or item not in engine_keys
+                for item in value
+            )
+        ):
+            raise ThermalActionControlError(error_code)
+        return tuple(value)
+
     def authorize(self, operation: str, request: object) -> ThermalAction:
         allowed_phases = self._allowed_phases(operation)
         if not isinstance(request, dict) or set(request) != REQUEST_KEYS:
@@ -172,7 +215,12 @@ class FileThermalActionAuthority:
         if type(value.get("schema_version")) is not int or value["schema_version"] != SCHEMA_VERSION:
             raise ThermalActionControlError("invalid_authority")
         for key in BOUND_REQUEST_FIELDS:
-            if request.get(key) != value.get(key):
+            requested = request.get(key)
+            authoritative = value.get(key)
+            if (
+                type(requested) is not type(authoritative)
+                or requested != authoritative
+            ):
                 raise ThermalActionControlError("mismatch")
 
         record_revision = self._positive_integer(value.get("record_revision"))
@@ -216,7 +264,10 @@ class FileThermalActionAuthority:
             else "urgent" if kind == "urgent_hold"
             else "cutoff"
         )
-        expected_state = "sleep" if operation == "hold" else "recovering"
+        expected_state = (
+            "sleep" if operation in {"hold", "sleeping_subset_proof"}
+            else "recovering"
+        )
         if (
             phase not in allowed_kind_phases
             or level != expected_level
@@ -225,13 +276,15 @@ class FileThermalActionAuthority:
             raise ThermalActionControlError("invalid_authority")
         if operation == "hold" and phase not in HOLD_PHASES:
             raise ThermalActionControlError("invalid_authority")
+        if operation == "sleeping_subset_proof" and phase != "held":
+            raise ThermalActionControlError("invalid_authority")
         if operation == "release" and phase not in RELEASE_PHASES:
             raise ThermalActionControlError("invalid_authority")
         if value.get("state") not in {"sleep", "recovering"}:
             raise ThermalActionControlError("invalid_authority")
         if not isinstance(value.get("applied"), bool):
             raise ThermalActionControlError("invalid_authority")
-        if operation == "hold":
+        if operation in {"hold", "sleeping_subset_proof"}:
             if phase == "held":
                 if value["applied"] is not True or value.get("result") != "all_sleeping_or_stopped":
                     raise ThermalActionControlError("invalid_authority")
@@ -243,9 +296,6 @@ class FileThermalActionAuthority:
             raise ThermalActionControlError("invalid_authority")
         if value.get("requirement") != "REQ-MODEL-AVAIL-001":
             raise ThermalActionControlError("invalid_authority")
-        expected_operations = [operation]
-        if value.get("authorized_operations") != expected_operations:
-            raise ThermalActionControlError("invalid_authority")
         reasons = value.get("reason_codes")
         if (
             not isinstance(reasons, list)
@@ -255,6 +305,37 @@ class FileThermalActionAuthority:
         ):
             raise ThermalActionControlError("invalid_authority")
         engine_keys = self._engine_keys(value.get("engine_keys"))
+        sleeping_peer_keys = self._engine_subset(
+            value.get("sleeping_peer_engine_keys"),
+            engine_keys=engine_keys,
+            allow_empty=True,
+            error_code="invalid_authority",
+        )
+        requested_proof_keys = self._engine_subset(
+            request.get("proof_engine_keys"),
+            engine_keys=engine_keys,
+            allow_empty=False,
+            error_code="invalid_request",
+        )
+        expected_proof_keys = (
+            sleeping_peer_keys
+            if operation == "sleeping_subset_proof"
+            else engine_keys
+        )
+        if phase == "held":
+            expected_operations = ["hold"]
+            if sleeping_peer_keys:
+                expected_operations.append("sleeping_subset_proof")
+        elif operation == "release":
+            expected_operations = ["release"]
+        else:
+            expected_operations = ["hold"]
+        if (
+            requested_proof_keys != expected_proof_keys
+            or value.get("authorized_operations") != expected_operations
+            or operation not in expected_operations
+        ):
+            raise ThermalActionControlError("mismatch")
 
         created = self._finite_number(value.get("created_at_epoch"))
         phase_updated = self._finite_number(value.get("phase_updated_at_epoch"))
@@ -273,7 +354,7 @@ class FileThermalActionAuthority:
         overall = self._nullable_number(value.get("overall_deadline_epoch"))
         release_authorized = self._nullable_number(value.get("release_authorized_at_epoch"))
         repair_deadline = self._nullable_number(value.get("repair_deadline_epoch"))
-        if operation == "hold":
+        if operation in {"hold", "sleeping_subset_proof"}:
             if any(item is None for item in (drain, sleep, overall)):
                 raise ThermalActionControlError("invalid_authority")
             assert drain is not None and sleep is not None and overall is not None
@@ -333,4 +414,5 @@ class FileThermalActionAuthority:
             repair_deadline_epoch=repair_deadline,
             recovery_authorized=value["recovery_authorized"],
             engine_keys=engine_keys,
+            proof_engine_keys=requested_proof_keys,
         )
