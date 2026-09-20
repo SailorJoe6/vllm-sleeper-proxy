@@ -1057,6 +1057,9 @@ def thermal_action_projection(
     *,
     phase: str = "graceful_hold",
     action_id: str = "thermal-7",
+    repair_target_engine_key: str | None = None,
+    repair_target_status: str | None = None,
+    repair_target_deadline_epoch: float | None = None,
 ) -> dict[str, object]:
     release = phase in {"release_authorized", "cutoff_recovery_authorized", "releasing"}
     cutoff_recovery = phase == "cutoff_recovery_authorized"
@@ -1087,9 +1090,22 @@ def thermal_action_projection(
         "overall_deadline_epoch": None if cutoff_recovery else now + 10,
         "release_authorized_at_epoch": created if release else None,
         "repair_deadline_epoch": now + 60 if release else None,
+        "repair_target_engine_key": repair_target_engine_key,
+        "repair_target_status": (
+            repair_target_status
+            if repair_target_engine_key is not None else None
+        ),
+        "repair_target_deadline_epoch": repair_target_deadline_epoch,
         "engine_keys": ["Qwen3-Embedding-8B"],
         "sleeping_peer_engine_keys": [],
-        "authorized_operations": ["release" if release else "hold"],
+        "authorized_operations": [
+            (
+                "repair_peer_proof"
+                if repair_target_status == "starting"
+                else "repair_converge"
+            ) if repair_target_engine_key is not None
+            else "release" if release else "hold"
+        ],
         "requirement": "REQ-MODEL-AVAIL-001",
     }
 
@@ -1102,13 +1118,21 @@ def thermal_action_request(value: dict[str, object]) -> dict[str, object]:
         "containment_level", "created_at_epoch", "phase_updated_at_epoch",
         "drain_deadline_epoch", "sleep_deadline_epoch", "overall_deadline_epoch",
         "release_authorized_at_epoch", "repair_deadline_epoch",
+        "repair_target_engine_key", "repair_target_status",
+        "repair_target_deadline_epoch",
         "recovery_authorized", "engine_keys",
     }
     return {
         "schema_version": 2,
         "operation": operation,
         **{key: value[key] for key in keys},
-        "proof_engine_keys": list(value["engine_keys"]),
+        "proof_engine_keys": (
+            [value["repair_target_engine_key"]]
+            if operation == "repair_converge"
+            else list(value["sleeping_peer_engine_keys"])
+            if operation in {"repair_peer_proof", "sleeping_subset_proof"}
+            else list(value["engine_keys"])
+        ),
     }
 
 
@@ -1164,6 +1188,20 @@ class ThermalActionServerTests(unittest.TestCase):
             status, payload = self._post(
                 base_url,
                 "/thermal/actions/sleeping-subset-proof",
+                {"schema_version": 2},
+            )
+            self.assertEqual(404, status)
+            self.assertIn("not found", payload["error"]["message"])
+            status, payload = self._post(
+                base_url,
+                "/thermal/actions/repair-peer-proof",
+                {"schema_version": 2},
+            )
+            self.assertEqual(404, status)
+            self.assertIn("not found", payload["error"]["message"])
+            status, payload = self._post(
+                base_url,
+                "/thermal/actions/repair-converge",
                 {"schema_version": 2},
             )
             self.assertEqual(404, status)
@@ -1291,6 +1329,56 @@ class ThermalActionServerTests(unittest.TestCase):
                 self.assertFalse(any(
                     method == "POST" for method, _, _ in http.requests
                 ))
+
+                authority_value = thermal_action_projection(
+                    time.time(),
+                    phase="release_authorized",
+                    repair_target_engine_key="Qwen3-Embedding-8B",
+                    repair_target_status="starting",
+                    repair_target_deadline_epoch=time.time() + 30,
+                )
+                authority_path.write_text(json.dumps(authority_value))
+                http.requests.clear()
+                peer_body = thermal_action_request(authority_value)
+                status, payload = self._post(
+                    base_url,
+                    "/thermal/actions/repair-peer-proof",
+                    peer_body,
+                )
+                self.assertEqual(200, status)
+                self.assertTrue(payload["repair_peers_verified"])
+                self.assertEqual({}, payload["engine_proofs"])
+                self.assertEqual([], http.requests)
+
+                authority_value = thermal_action_projection(
+                    time.time(),
+                    phase="release_authorized",
+                    repair_target_engine_key="Qwen3-Embedding-8B",
+                    repair_target_status="converging",
+                    repair_target_deadline_epoch=time.time() + 30,
+                )
+                authority_path.write_text(json.dumps(authority_value))
+                http.requests.clear()
+                http.sleeping = False
+                repair_body = thermal_action_request(authority_value)
+                status, payload = self._post(
+                    base_url,
+                    "/thermal/actions/repair-converge",
+                    repair_body,
+                )
+                self.assertEqual(200, status)
+                self.assertEqual("repair_converge", payload["operation"])
+                self.assertTrue(payload["repair_converged"])
+                self.assertEqual(
+                    {"Qwen3-Embedding-8B"}, set(payload["engine_proofs"])
+                )
+                self.assertEqual(
+                    ["http://vllm:8888/sleep?level=2"],
+                    [url for method, url, _ in http.requests if method == "POST"],
+                )
+                self.assertFalse(any(
+                    "wake_up" in url for _, url, _ in http.requests
+                ))
             finally:
                 server.shutdown()
                 server.server_close()
@@ -1407,6 +1495,125 @@ class ThermalActionServerTests(unittest.TestCase):
                     body,
                 )
                 self.assertEqual(409, status)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
+    def test_repair_peer_route_rejects_late_receipt_after_two_second_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            authority_path = Path(directory) / "containment.json"
+            value = thermal_action_projection(
+                time.time(),
+                phase="release_authorized",
+                repair_target_engine_key="Qwen3-Embedding-8B",
+                repair_target_status="starting",
+                repair_target_deadline_epoch=time.time() + 30,
+            )
+            authority_path.write_text(json.dumps(value))
+            authority = FileThermalActionAuthority(authority_path)
+
+            class SlowPeerManager(ModelManager):
+                def thermal_repair_peer_proof(self, action, *, reauthorize):
+                    proof = super().thermal_repair_peer_proof(
+                        action, reauthorize=reauthorize
+                    )
+                    time.sleep(0.03)
+                    return proof
+
+            manager = SlowPeerManager([ModelConfig(
+                name="Qwen3-Embedding-8B",
+                upstream_model="Qwen/Qwen3-Embedding-8B",
+                upstream_base_url="http://vllm:8888/v1",
+                control_base_url="http://vllm:8888",
+            )], ProxyHttp(), bootstrap_mode=True)
+            server, thread, base_url = self._serve(
+                manager,
+                thermal_action_control_enabled=True,
+                thermal_action_authority=authority,
+            )
+            try:
+                with patch(
+                    "vllm_sleeper_proxy.server.MAX_SLEEPING_SUBSET_PROOF_SECONDS",
+                    0.01,
+                ):
+                    status, payload = self._post(
+                        base_url,
+                        "/thermal/actions/repair-peer-proof",
+                        thermal_action_request(value),
+                    )
+                self.assertEqual(503, status)
+                self.assertEqual(
+                    "thermal_action_unavailable", payload["error"]["code"]
+                )
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
+    def test_repair_routes_discard_success_after_late_authority_change(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            authority_path = Path(directory) / "containment.json"
+            authority = FileThermalActionAuthority(authority_path)
+
+            class LateMutationManager(ModelManager):
+                def _mutate_authority(self) -> None:
+                    changed = json.loads(authority_path.read_text())
+                    changed["record_revision"] += 1
+                    authority_path.write_text(json.dumps(changed))
+
+                def thermal_repair_peer_proof(self, action, *, reauthorize):
+                    proof = super().thermal_repair_peer_proof(
+                        action, reauthorize=reauthorize
+                    )
+                    self._mutate_authority()
+                    return proof
+
+                def thermal_repair_converge(self, action, *, reauthorize):
+                    proof = super().thermal_repair_converge(
+                        action, reauthorize=reauthorize
+                    )
+                    self._mutate_authority()
+                    return proof
+
+            http = ProxyHttp()
+            model = ModelConfig(
+                name="Qwen3-Embedding-8B",
+                upstream_model="Qwen/Qwen3-Embedding-8B",
+                upstream_base_url="http://vllm:8888/v1",
+                control_base_url="http://vllm:8888",
+            )
+            manager = LateMutationManager(
+                [model], http, poll_interval_s=0, bootstrap_mode=True
+            )
+            server, thread, base_url = self._serve(
+                manager,
+                thermal_action_control_enabled=True,
+                thermal_action_authority=authority,
+            )
+            try:
+                for status_name, path in (
+                    ("starting", "/thermal/actions/repair-peer-proof"),
+                    ("converging", "/thermal/actions/repair-converge"),
+                ):
+                    with self.subTest(status=status_name):
+                        value = thermal_action_projection(
+                            time.time(),
+                            phase="release_authorized",
+                            repair_target_engine_key="Qwen3-Embedding-8B",
+                            repair_target_status=status_name,
+                            repair_target_deadline_epoch=time.time() + 30,
+                        )
+                        authority_path.write_text(json.dumps(value))
+                        http.sleeping = status_name == "starting"
+                        body = thermal_action_request(value)
+                        response_status, payload = self._post(
+                            base_url, path, body
+                        )
+                        self.assertEqual(409, response_status)
+                        self.assertEqual(
+                            "thermal_action_mismatch", payload["error"]["code"]
+                        )
             finally:
                 server.shutdown()
                 server.server_close()

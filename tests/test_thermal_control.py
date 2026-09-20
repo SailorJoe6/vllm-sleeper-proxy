@@ -19,6 +19,9 @@ def projection(
     generation: int = 1,
     predecessor_action_id: str | None = None,
     transition_kind: str | None = None,
+    repair_target_engine_key: str | None = None,
+    repair_target_status: str | None = None,
+    repair_target_deadline_epoch: float | None = None,
 ) -> dict:
     release = phase in {"release_authorized", "cutoff_recovery_authorized", "releasing"}
     cutoff_recovery = phase == "cutoff_recovery_authorized"
@@ -59,9 +62,22 @@ def projection(
         "overall_deadline_epoch": None if cutoff_recovery else (105.5 if transition_kind == "urgent_hold" else 200.0),
         "release_authorized_at_epoch": created if release else None,
         "repair_deadline_epoch": 200.0 if release else None,
+        "repair_target_engine_key": repair_target_engine_key,
+        "repair_target_status": (
+            repair_target_status
+            if repair_target_engine_key is not None else None
+        ),
+        "repair_target_deadline_epoch": repair_target_deadline_epoch,
         "engine_keys": ["Qwen3-Embedding-8B", "qwen3.8-flash-next", "vision-vla"],
         "sleeping_peer_engine_keys": [],
-        "authorized_operations": ["release" if release else "hold"],
+        "authorized_operations": [
+            (
+                "repair_peer_proof"
+                if repair_target_status == "starting"
+                else "repair_converge"
+            ) if repair_target_engine_key is not None
+            else "release" if release else "hold"
+        ],
         "requirement": "REQ-MODEL-AVAIL-001",
     }
 
@@ -77,13 +93,21 @@ def request(
         "containment_level", "created_at_epoch", "phase_updated_at_epoch",
         "drain_deadline_epoch", "sleep_deadline_epoch", "overall_deadline_epoch",
         "release_authorized_at_epoch", "repair_deadline_epoch",
+        "repair_target_engine_key", "repair_target_status",
+        "repair_target_deadline_epoch",
         "recovery_authorized", "engine_keys",
     }
     return {
         "schema_version": 2,
         "operation": operation,
         **{key: value[key] for key in keys},
-        "proof_engine_keys": list(value["engine_keys"]),
+        "proof_engine_keys": (
+            [value["repair_target_engine_key"]]
+            if operation == "repair_converge"
+            else list(value["sleeping_peer_engine_keys"])
+            if operation in {"repair_peer_proof", "sleeping_subset_proof"}
+            else list(value["engine_keys"])
+        ),
     }
 
 
@@ -95,13 +119,21 @@ def request_from_projection(value: dict, *, operation: str | None = None) -> dic
         "containment_level", "created_at_epoch", "phase_updated_at_epoch",
         "drain_deadline_epoch", "sleep_deadline_epoch", "overall_deadline_epoch",
         "release_authorized_at_epoch", "repair_deadline_epoch",
+        "repair_target_engine_key", "repair_target_status",
+        "repair_target_deadline_epoch",
         "recovery_authorized", "engine_keys",
     }
     return {
         "schema_version": 2,
         "operation": selected,
         **{key: value[key] for key in keys},
-        "proof_engine_keys": list(value["engine_keys"]),
+        "proof_engine_keys": (
+            [value["repair_target_engine_key"]]
+            if selected == "repair_converge"
+            else list(value["sleeping_peer_engine_keys"])
+            if selected in {"repair_peer_proof", "sleeping_subset_proof"}
+            else list(value["engine_keys"])
+        ),
     }
 
 
@@ -351,6 +383,112 @@ class FileThermalActionAuthorityTests(unittest.TestCase):
                     with self.assertRaises(ThermalActionControlError) as observed:
                         authority.authorize("hold", stale)
                     self.assertEqual("mismatch", observed.exception.code)
+
+    def test_repair_peer_proof_is_exact_non_target_release_subset(self) -> None:
+        value = projection(
+            phase="release_authorized",
+            repair_target_engine_key="Qwen3-Embedding-8B",
+            repair_target_status="starting",
+            repair_target_deadline_epoch=150.0,
+        )
+        value["sleeping_peer_engine_keys"] = [
+            "qwen3.8-flash-next", "vision-vla"
+        ]
+        body = request_from_projection(value, operation="repair_peer_proof")
+        self.assertEqual(
+            ["qwen3.8-flash-next", "vision-vla"],
+            body["proof_engine_keys"],
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "containment.json"
+            path.write_text(json.dumps(value))
+            authority = FileThermalActionAuthority(path, now=lambda: 100.0)
+            action = authority.authorize("repair_peer_proof", body)
+        self.assertEqual("starting", action.repair_target_status)
+        self.assertNotIn(
+            action.repair_target_engine_key, action.proof_engine_keys
+        )
+        variants = []
+        wrong_target = dict(body)
+        wrong_target["repair_target_engine_key"] = "vision-vla"
+        variants.append(wrong_target)
+        target_included = dict(body)
+        target_included["proof_engine_keys"] = [
+            "Qwen3-Embedding-8B", "qwen3.8-flash-next", "vision-vla"
+        ]
+        variants.append(target_included)
+        wrong_status = dict(body)
+        wrong_status["repair_target_status"] = "converging"
+        variants.append(wrong_status)
+        bool_deadline = dict(body)
+        bool_deadline["repair_target_deadline_epoch"] = True
+        variants.append(bool_deadline)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "containment.json"
+            path.write_text(json.dumps(value))
+            authority = FileThermalActionAuthority(path, now=lambda: 100.0)
+            for changed in variants:
+                with self.subTest(changed=changed):
+                    with self.assertRaises(ThermalActionControlError):
+                        authority.authorize("repair_peer_proof", changed)
+            expired = dict(value)
+            expired["repair_target_deadline_epoch"] = 99.0
+            path.write_text(json.dumps(expired))
+            with self.assertRaises(ThermalActionControlError):
+                authority.authorize(
+                    "repair_peer_proof",
+                    request_from_projection(
+                        expired, operation="repair_peer_proof"
+                    ),
+                )
+
+    def test_repair_converge_is_exact_single_target_release_phase_only(self) -> None:
+        value = projection(
+            phase="release_authorized",
+            repair_target_engine_key="Qwen3-Embedding-8B",
+            repair_target_status="converging",
+            repair_target_deadline_epoch=150.0,
+        )
+        body = request_from_projection(value, operation="repair_converge")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "containment.json"
+            path.write_text(json.dumps(value))
+            authority = FileThermalActionAuthority(path, now=lambda: 100.0)
+            action = authority.authorize("repair_converge", body)
+            self.assertEqual(
+                "Qwen3-Embedding-8B", action.repair_target_engine_key
+            )
+            self.assertEqual(150.0, action.repair_target_deadline_epoch)
+            self.assertEqual(("Qwen3-Embedding-8B",), action.proof_engine_keys)
+            variants = []
+            wrong_target = dict(body)
+            wrong_target["repair_target_engine_key"] = "vision-vla"
+            variants.append(wrong_target)
+            wrong_proof = dict(body)
+            wrong_proof["proof_engine_keys"] = ["vision-vla"]
+            variants.append(wrong_proof)
+            extended = dict(body)
+            extended["repair_target_deadline_epoch"] = 151.0
+            variants.append(extended)
+            wrong_status = dict(body)
+            wrong_status["repair_target_status"] = "starting"
+            variants.append(wrong_status)
+            bool_deadline = dict(body)
+            bool_deadline["repair_target_deadline_epoch"] = True
+            variants.append(bool_deadline)
+            for changed in variants:
+                with self.subTest(changed=changed):
+                    with self.assertRaises(ThermalActionControlError):
+                        authority.authorize("repair_converge", changed)
+
+            expired = dict(value)
+            expired["repair_target_deadline_epoch"] = 99.0
+            path.write_text(json.dumps(expired))
+            with self.assertRaises(ThermalActionControlError):
+                authority.authorize(
+                    "repair_converge",
+                    request_from_projection(expired, operation="repair_converge"),
+                )
 
     def test_cutoff_recovery_authorizes_release_proof_only_with_null_containment_deadlines(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

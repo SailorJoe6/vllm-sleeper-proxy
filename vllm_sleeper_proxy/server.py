@@ -135,6 +135,8 @@ class SleeperProxyHandler(BaseHTTPRequestHandler):
             "/thermal/actions/hold": "hold",
             "/thermal/actions/release": "release",
             "/thermal/actions/sleeping-subset-proof": "sleeping_subset_proof",
+            "/thermal/actions/repair-peer-proof": "repair_peer_proof",
+            "/thermal/actions/repair-converge": "repair_converge",
         }
         if path in thermal_actions:
             self._handle_thermal_action(thermal_actions[path])
@@ -399,12 +401,17 @@ class SleeperProxyHandler(BaseHTTPRequestHandler):
                 "overall_deadline_epoch": action.overall_deadline_epoch,
                 "release_authorized_at_epoch": action.release_authorized_at_epoch,
                 "repair_deadline_epoch": action.repair_deadline_epoch,
+                "repair_target_engine_key": action.repair_target_engine_key,
+                "repair_target_status": action.repair_target_status,
+                "repair_target_deadline_epoch": action.repair_target_deadline_epoch,
                 "recovery_authorized": action.recovery_authorized,
                 "engine_keys": list(action.engine_keys),
                 "proof_engine_keys": list(action.proof_engine_keys),
             }
             proof_started_at_epoch = (
-                time.time() if operation == "sleeping_subset_proof" else None
+                time.time()
+                if operation in {"sleeping_subset_proof", "repair_peer_proof"}
+                else None
             )
             if operation == "hold":
                 proof = self.manager.thermal_hold(
@@ -412,6 +419,14 @@ class SleeperProxyHandler(BaseHTTPRequestHandler):
                 )
             elif operation == "sleeping_subset_proof":
                 proof = self.manager.thermal_sleeping_subset_proof(
+                    action, reauthorize=reauthorize
+                )
+            elif operation == "repair_peer_proof":
+                proof = self.manager.thermal_repair_peer_proof(
+                    action, reauthorize=reauthorize
+                )
+            elif operation == "repair_converge":
+                proof = self.manager.thermal_repair_converge(
                     action, reauthorize=reauthorize
                 )
             else:
@@ -440,7 +455,7 @@ class SleeperProxyHandler(BaseHTTPRequestHandler):
             # Bind success to the same root action, phase, creation time, and
             # immutable deadlines after all manager cleanup has completed.
             reauthorize()
-            if operation == "sleeping_subset_proof":
+            if operation in {"sleeping_subset_proof", "repair_peer_proof"}:
                 proof_completed_at_epoch = time.time()
                 assert proof_started_at_epoch is not None
                 if (
@@ -448,7 +463,7 @@ class SleeperProxyHandler(BaseHTTPRequestHandler):
                     or proof_completed_at_epoch - proof_started_at_epoch
                     > MAX_SLEEPING_SUBSET_PROOF_SECONDS
                 ):
-                    raise WakeError("sleeping subset proof exceeded deadline")
+                    raise WakeError("bounded thermal proof exceeded deadline")
                 response["proof_started_at_epoch"] = proof_started_at_epoch
                 response["proof_completed_at_epoch"] = proof_completed_at_epoch
         except ThermalActionControlError:

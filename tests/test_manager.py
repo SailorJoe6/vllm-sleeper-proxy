@@ -41,6 +41,9 @@ def thermal_action(
         overall_deadline_epoch=overall_deadline_epoch,
         release_authorized_at_epoch=created if release else None,
         repair_deadline_epoch=time.time() + 60 if release else None,
+        repair_target_engine_key=None,
+        repair_target_status=None,
+        repair_target_deadline_epoch=None,
         recovery_authorized=release,
         engine_keys=("Qwen3-Embedding-8B",),
         proof_engine_keys=("Qwen3-Embedding-8B",),
@@ -1460,6 +1463,310 @@ class ModelManagerTests(unittest.TestCase):
                 action, reauthorize=changed
             )
         self.assertFalse(any(method == "POST" for method, _, _ in http.calls))
+        self.assertFalse(manager._quiescing)
+
+    def test_repair_peer_proof_contacts_only_exact_non_target_subset(self) -> None:
+        now = time.time()
+        action = replace(
+            thermal_action(
+                action_id="thermal-repair-peers",
+                phase="release_authorized",
+                drain_deadline_epoch=now - 20,
+                sleep_deadline_epoch=now - 10,
+                overall_deadline_epoch=now - 5,
+            ),
+            engine_keys=(qwen_model().name, vision_model().name),
+            proof_engine_keys=(vision_model().name,),
+            repair_target_engine_key=qwen_model().name,
+            repair_target_status="starting",
+            repair_target_deadline_epoch=now + 5,
+        )
+        http = PerModelSleepHttp({"embedding": None, "vision": True})
+        manager = ModelManager(
+            [qwen_model(), vision_model()], http,
+            owner_validation_timeout_s=1,
+        )
+        manager._active_model_name = qwen_model().name
+        manager._active_model_ready = True
+        manager._lifecycle_state = "active"
+        manager._pending_switch_name = vision_model().name
+        published: list[tuple[object, ...]] = []
+        manager._publish_transition = lambda *args: published.append(args)
+        owner_state = (
+            manager._active_model_name,
+            manager._active_model_ready,
+            manager._lifecycle_state,
+            manager._pending_switch_name,
+        )
+        proof = manager.thermal_repair_peer_proof(
+            action, reauthorize=lambda: None
+        )
+        self.assertTrue(proof["repair_peers_verified"])
+        self.assertEqual({vision_model().name}, set(proof["engine_proofs"]))
+        self.assertTrue(http.calls)
+        self.assertTrue(all(
+            method == "GET" and url == "http://vision:8000/is_sleeping"
+            for method, url, _ in http.calls
+        ))
+        self.assertFalse(any(method == "POST" for method, _, _ in http.calls))
+        self.assertFalse(any(
+            url.startswith("http://vllm") for _, url, _ in http.calls
+        ))
+        self.assertFalse(manager._quiescing)
+        self.assertEqual(
+            owner_state,
+            (
+                manager._active_model_name,
+                manager._active_model_ready,
+                manager._lifecycle_state,
+                manager._pending_switch_name,
+            ),
+        )
+        self.assertEqual([], published)
+
+    def test_repair_peer_proof_lock_budget_expires_without_engine_contact(self) -> None:
+        now = time.time()
+        action = replace(
+            thermal_action(
+                action_id="thermal-repair-peer-lock",
+                phase="release_authorized",
+                drain_deadline_epoch=now - 20,
+                sleep_deadline_epoch=now - 10,
+                overall_deadline_epoch=now - 5,
+            ),
+            repair_target_engine_key=qwen_model().name,
+            repair_target_status="starting",
+            repair_target_deadline_epoch=now + 5,
+            proof_engine_keys=(),
+        )
+        http = PerModelSleepHttp({"embedding": None})
+        manager = ModelManager([qwen_model()], http)
+        manager._thermal_action_lock.acquire()
+        original = manager_module.MAX_SLEEPING_SUBSET_PROOF_SECONDS
+        manager_module.MAX_SLEEPING_SUBSET_PROOF_SECONDS = 0.05
+        started = time.monotonic()
+        try:
+            with self.assertRaises(WakeError):
+                manager.thermal_repair_peer_proof(
+                    action, reauthorize=lambda: None
+                )
+        finally:
+            manager_module.MAX_SLEEPING_SUBSET_PROOF_SECONDS = original
+            manager._thermal_action_lock.release()
+        self.assertLess(time.monotonic() - started, 0.5)
+        self.assertEqual([], http.calls)
+        self.assertFalse(manager._quiescing)
+
+    def test_repair_peer_proof_discards_stale_or_expired_evidence(self) -> None:
+        now = time.time()
+        action = replace(
+            thermal_action(
+                action_id="thermal-repair-peers-stale",
+                phase="release_authorized",
+                drain_deadline_epoch=now - 20,
+                sleep_deadline_epoch=now - 10,
+                overall_deadline_epoch=now - 5,
+            ),
+            engine_keys=(qwen_model().name, vision_model().name),
+            proof_engine_keys=(vision_model().name,),
+            repair_target_engine_key=qwen_model().name,
+            repair_target_status="starting",
+            repair_target_deadline_epoch=now + 5,
+        )
+        http = PerModelSleepHttp({"embedding": None, "vision": True})
+        manager = ModelManager(
+            [qwen_model(), vision_model()], http,
+            owner_validation_timeout_s=1,
+        )
+        calls = 0
+
+        def stale() -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 4:
+                raise RuntimeError("root action changed")
+
+        with self.assertRaisesRegex(RuntimeError, "root action changed"):
+            manager.thermal_repair_peer_proof(action, reauthorize=stale)
+        self.assertTrue(http.calls)
+        self.assertFalse(any(method == "POST" for method, _, _ in http.calls))
+        self.assertFalse(any(
+            url.startswith("http://vllm") for _, url, _ in http.calls
+        ))
+        self.assertFalse(manager._quiescing)
+
+        expired_http = PerModelSleepHttp(
+            {"embedding": None, "vision": True}
+        )
+        expired_manager = ModelManager(
+            [qwen_model(), vision_model()], expired_http,
+            owner_validation_timeout_s=1,
+        )
+        with self.assertRaisesRegex(WakeError, "deadline expired"):
+            expired_manager.thermal_repair_peer_proof(
+                replace(action, repair_target_deadline_epoch=now - 1),
+                reauthorize=lambda: None,
+            )
+        self.assertEqual([], expired_http.calls)
+
+    def test_repair_converge_sleeps_only_exact_target_and_never_contacts_peer(self) -> None:
+        now = time.time()
+        action = thermal_action(
+            action_id="thermal-repair",
+            phase="release_authorized",
+            drain_deadline_epoch=now - 20,
+            sleep_deadline_epoch=now - 10,
+            overall_deadline_epoch=now - 5,
+        )
+        action = replace(
+            action,
+            engine_keys=(qwen_model().name, vision_model().name),
+            proof_engine_keys=(qwen_model().name,),
+            repair_target_engine_key=qwen_model().name,
+            repair_target_status="converging",
+            repair_target_deadline_epoch=now + 5,
+        )
+        unsafe_http = PerModelSleepHttp({"embedding": False, "vision": None})
+        unsafe_manager = ModelManager(
+            [qwen_model(), vision_model()], unsafe_http,
+            poll_interval_s=0, request_timeout_s=1, sleep_level=1,
+        )
+        with self.assertRaisesRegex(WakeError, "sleep level 2"):
+            unsafe_manager.thermal_repair_converge(
+                action, reauthorize=lambda: None
+            )
+        self.assertEqual([], unsafe_http.calls)
+
+        http = PerModelSleepHttp({"embedding": False, "vision": None})
+        manager = ModelManager(
+            [qwen_model(), vision_model()], http,
+            poll_interval_s=0, request_timeout_s=1,
+        )
+        manager._active_model_name = qwen_model().name
+        manager._active_model_ready = True
+        manager._lifecycle_state = "active"
+        manager._pending_switch_name = vision_model().name
+        published: list[tuple[object, ...]] = []
+        manager._publish_transition = lambda *args: published.append(args)
+        owner_state = (
+            manager._active_model_name,
+            manager._active_model_ready,
+            manager._lifecycle_state,
+            manager._pending_switch_name,
+        )
+        proof = manager.thermal_repair_converge(
+            action, reauthorize=lambda: None
+        )
+        self.assertTrue(proof["repair_converged"])
+        self.assertEqual({qwen_model().name}, set(proof["engine_proofs"]))
+        self.assertTrue(http.calls)
+        self.assertTrue(all(
+            url.startswith("http://vllm:8888/") for _, url, _ in http.calls
+        ))
+        self.assertEqual(
+            ["http://vllm:8888/sleep?level=2"],
+            [url for method, url, _ in http.calls if method == "POST"],
+        )
+        self.assertFalse(any("wake_up" in url for _, url, _ in http.calls))
+        self.assertFalse(manager._quiescing)
+        self.assertEqual(
+            owner_state,
+            (
+                manager._active_model_name,
+                manager._active_model_ready,
+                manager._lifecycle_state,
+                manager._pending_switch_name,
+            ),
+        )
+        self.assertEqual([], published)
+
+        sleeping_http = PerModelSleepHttp({"embedding": True, "vision": None})
+        sleeping_manager = ModelManager(
+            [qwen_model(), vision_model()], sleeping_http, poll_interval_s=0
+        )
+        replay = sleeping_manager.thermal_repair_converge(
+            action, reauthorize=lambda: None
+        )
+        self.assertTrue(replay["repair_converged"])
+        self.assertFalse(any(
+            method == "POST" for method, _, _ in sleeping_http.calls
+        ))
+        self.assertFalse(any(
+            url.startswith("http://vision") for _, url, _ in sleeping_http.calls
+        ))
+
+    def test_repair_converge_reauthorizes_before_sleep_and_discards_stale_success(self) -> None:
+        now = time.time()
+        action = replace(
+            thermal_action(
+                action_id="thermal-repair-stale",
+                phase="release_authorized",
+                drain_deadline_epoch=now - 20,
+                sleep_deadline_epoch=now - 10,
+                overall_deadline_epoch=now - 5,
+            ),
+            repair_target_engine_key=qwen_model().name,
+            repair_target_status="converging",
+            repair_target_deadline_epoch=now + 5,
+        )
+        for fail_at in (6, 8):
+            with self.subTest(fail_at=fail_at):
+                http = PerModelSleepHttp({"embedding": False})
+                manager = ModelManager([qwen_model()], http, poll_interval_s=0)
+                calls = 0
+
+                def changed() -> None:
+                    nonlocal calls
+                    calls += 1
+                    if calls == fail_at:
+                        raise RuntimeError("root action changed")
+
+                with self.assertRaisesRegex(RuntimeError, "root action changed"):
+                    manager.thermal_repair_converge(
+                        action, reauthorize=changed
+                    )
+                self.assertEqual(
+                    ["http://vllm:8888/sleep?level=2"],
+                    [
+                        url for method, url, _ in http.calls
+                        if method == "POST"
+                    ],
+                )
+                self.assertFalse(manager._quiescing)
+
+    def test_repair_converge_deadline_expiry_after_sleep_has_no_late_probe(self) -> None:
+        now = time.time()
+        action = replace(
+            thermal_action(
+                action_id="thermal-repair-expiry",
+                phase="release_authorized",
+                drain_deadline_epoch=now - 20,
+                sleep_deadline_epoch=now - 10,
+                overall_deadline_epoch=now - 5,
+            ),
+            repair_target_engine_key=qwen_model().name,
+            repair_target_status="converging",
+            repair_target_deadline_epoch=now + 0.1,
+        )
+
+        class SlowSleepHttp(PerModelSleepHttp):
+            def request(self, method, url, **kwargs):
+                response = super().request(method, url, **kwargs)
+                if method == "POST" and "/sleep?" in url:
+                    time.sleep(0.15)
+                return response
+
+        http = SlowSleepHttp({"embedding": False})
+        manager = ModelManager(
+            [qwen_model()], http, poll_interval_s=0, request_timeout_s=1
+        )
+        with self.assertRaisesRegex(WakeError, "deadline expired"):
+            manager.thermal_repair_converge(
+                action, reauthorize=lambda: None
+            )
+        self.assertEqual(
+            ["GET", "POST"], [method for method, _, _ in http.calls]
+        )
         self.assertFalse(manager._quiescing)
 
     def test_thermal_release_is_positive_proof_only_and_never_mutates_engines(self) -> None:

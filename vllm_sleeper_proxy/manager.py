@@ -720,6 +720,177 @@ class ModelManager:
                 self._finish_thermal_action()
             self._thermal_action_lock.release()
 
+    def thermal_repair_peer_proof(
+        self,
+        action: ThermalAction,
+        *,
+        reauthorize: Callable[[], None],
+    ) -> dict[str, object]:
+        """Prove only the release-phase sleeping peers of one repair target."""
+        if action.phase not in {
+            "release_authorized", "cutoff_recovery_authorized", "releasing"
+        } or action.repair_target_status != "starting":
+            raise WakeError("repair peer proof requires a starting repair target")
+        if action.repair_target_engine_key is None:
+            raise WakeError("repair peer proof target is missing")
+        configured = tuple(sorted(model.name for model in self.models))
+        if action.engine_keys != configured:
+            raise WakeError("thermal action engine set does not match configuration")
+        if (
+            action.repair_target_engine_key not in action.engine_keys
+            or action.repair_target_engine_key in action.proof_engine_keys
+            or action.proof_engine_keys
+            != tuple(sorted(set(action.proof_engine_keys)))
+            or any(key not in action.engine_keys for key in action.proof_engine_keys)
+        ):
+            raise WakeError("repair peer proof set is invalid")
+        models = {model.name: model for model in self.models}
+        monotonic_deadline = time.monotonic() + MAX_SLEEPING_SUBSET_PROOF_SECONDS
+
+        def remaining(stage: str) -> float:
+            target_remaining = (
+                action.repair_target_deadline_epoch - time.time()
+                if action.repair_target_deadline_epoch is not None else -1.0
+            )
+            value = min(monotonic_deadline - time.monotonic(), target_remaining)
+            if value <= 0:
+                raise WakeError(f"thermal repair peer {stage} deadline expired")
+            return value
+
+        if not self._thermal_action_lock.acquire(timeout=remaining("action lock")):
+            raise WakeError("timed out serializing thermal repair peer proof")
+        quiescing = False
+        try:
+            reauthorize()
+            if not self._condition.acquire(timeout=remaining("condition")):
+                raise WakeError("timed out acquiring lifecycle condition")
+            try:
+                reauthorize()
+                if self._quiescing:
+                    raise WakeError("lifecycle is already quiescing")
+                if self._inflight_requests:
+                    raise WakeError("repair peer proof still has in-flight requests")
+                self._quiescing = True
+                quiescing = True
+            finally:
+                self._condition.release()
+            with startup_lease(
+                self.startup_lease_path,
+                timeout_s=remaining("startup lease"),
+            ):
+                proofs: dict[str, dict[str, object]] = {}
+                for name in action.proof_engine_keys:
+                    reauthorize()
+                    sleeping = self._is_sleeping(
+                        models[name],
+                        timeout_s=min(self.request_timeout_s, remaining("engine proof")),
+                    )
+                    reauthorize()
+                    if sleeping is not True:
+                        raise WakeError(f"repair peer proof unavailable for {name}")
+                    proofs[name] = {
+                        "state": "sleeping",
+                        "proof": "vllm_is_sleeping_true",
+                    }
+                reauthorize()
+            return {"repair_peers_verified": True, "engine_proofs": proofs}
+        finally:
+            if quiescing:
+                self._finish_thermal_action()
+            self._thermal_action_lock.release()
+
+    def thermal_repair_converge(
+        self,
+        action: ThermalAction,
+        *,
+        reauthorize: Callable[[], None],
+    ) -> dict[str, object]:
+        """Level-2 sleep and prove only the already-running repair target."""
+        if action.phase not in {
+            "release_authorized", "cutoff_recovery_authorized", "releasing"
+        } or action.repair_target_status != "converging":
+            raise WakeError("repair convergence requires a converging target")
+        if self.sleep_level != 2:
+            raise WakeError("thermal repair convergence requires vLLM sleep level 2")
+        target_name = action.repair_target_engine_key
+        if (
+            target_name is None
+            or action.proof_engine_keys != (target_name,)
+            or action.repair_target_deadline_epoch is None
+        ):
+            raise WakeError("repair convergence target is invalid")
+        models = {model.name: model for model in self.models}
+        target = models.get(target_name)
+        if target is None or action.engine_keys != tuple(sorted(models)):
+            raise WakeError("repair convergence target is not configured")
+
+        def remaining(stage: str) -> float:
+            value = action.repair_target_deadline_epoch - time.time()
+            if value <= 0:
+                raise WakeError(f"thermal repair convergence {stage} deadline expired")
+            return value
+
+        if not self._thermal_action_lock.acquire(timeout=remaining("action lock")):
+            raise WakeError("timed out serializing thermal repair convergence")
+        quiescing = False
+        try:
+            reauthorize()
+            if not self._condition.acquire(timeout=remaining("condition")):
+                raise WakeError("timed out acquiring lifecycle condition")
+            try:
+                reauthorize()
+                if self._quiescing:
+                    raise WakeError("lifecycle is already quiescing")
+                if self._inflight_requests:
+                    raise WakeError("repair convergence still has in-flight requests")
+                self._quiescing = True
+                quiescing = True
+            finally:
+                self._condition.release()
+            with startup_lease(
+                self.startup_lease_path,
+                timeout_s=remaining("startup lease"),
+            ):
+                reauthorize()
+                sleeping = self._is_sleeping(
+                    target,
+                    timeout_s=min(self.request_timeout_s, remaining("initial proof")),
+                )
+                reauthorize()
+                if sleeping is None:
+                    raise WakeError("repair target sleep state is unavailable")
+                if sleeping is False:
+                    reauthorize()
+                    self._sleep(
+                        target,
+                        timeout_s=min(self.request_timeout_s, remaining("sleep")),
+                    )
+                    reauthorize()
+                    self._wait_until_sleeping(
+                        target, timeout_s=remaining("sleep proof")
+                    )
+                reauthorize()
+                final_state = self._is_sleeping(
+                    target,
+                    timeout_s=min(self.request_timeout_s, remaining("final proof")),
+                )
+                reauthorize()
+                if final_state is not True:
+                    raise WakeError("repair target positive sleep proof is unavailable")
+            return {
+                "repair_converged": True,
+                "engine_proofs": {
+                    target_name: {
+                        "state": "sleeping",
+                        "proof": "vllm_is_sleeping_true",
+                    }
+                },
+            }
+        finally:
+            if quiescing:
+                self._finish_thermal_action()
+            self._thermal_action_lock.release()
+
     def thermal_release_ready(
         self,
         action: ThermalAction,

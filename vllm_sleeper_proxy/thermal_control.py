@@ -27,7 +27,9 @@ REQUEST_KEYS = {
     "phase", "containment_level", "created_at_epoch", "phase_updated_at_epoch",
     "drain_deadline_epoch", "sleep_deadline_epoch", "overall_deadline_epoch",
     "release_authorized_at_epoch", "repair_deadline_epoch",
-    "recovery_authorized", "engine_keys", "proof_engine_keys",
+    "repair_target_engine_key", "repair_target_status",
+    "repair_target_deadline_epoch", "recovery_authorized",
+    "engine_keys", "proof_engine_keys",
 }
 PROJECTION_KEYS = {
     "schema_version", "record_revision", "incident_id", "action_id",
@@ -36,7 +38,9 @@ PROJECTION_KEYS = {
     "active", "state", "phase", "containment_level", "applied", "result",
     "recovery_authorized", "reason_codes", "drain_deadline_epoch",
     "sleep_deadline_epoch", "overall_deadline_epoch",
-    "release_authorized_at_epoch", "repair_deadline_epoch", "engine_keys",
+    "release_authorized_at_epoch", "repair_deadline_epoch",
+    "repair_target_engine_key", "repair_target_status",
+    "repair_target_deadline_epoch", "engine_keys",
     "sleeping_peer_engine_keys", "authorized_operations", "requirement",
 }
 BOUND_REQUEST_FIELDS = REQUEST_KEYS - {
@@ -88,6 +92,9 @@ class ThermalAction:
     overall_deadline_epoch: float | None
     release_authorized_at_epoch: float | None
     repair_deadline_epoch: float | None
+    repair_target_engine_key: str | None
+    repair_target_status: str | None
+    repair_target_deadline_epoch: float | None
     recovery_authorized: bool
     engine_keys: tuple[str, ...]
     proof_engine_keys: tuple[str, ...]
@@ -115,6 +122,8 @@ class FileThermalActionAuthority:
             return RELEASE_PHASES
         if operation == "sleeping_subset_proof":
             return {"held"}
+        if operation in {"repair_peer_proof", "repair_converge"}:
+            return RELEASE_PHASES
         raise ValueError("unsupported thermal action operation")
 
     def _load(self) -> dict[str, object]:
@@ -278,7 +287,10 @@ class FileThermalActionAuthority:
             raise ThermalActionControlError("invalid_authority")
         if operation == "sleeping_subset_proof" and phase != "held":
             raise ThermalActionControlError("invalid_authority")
-        if operation == "release" and phase not in RELEASE_PHASES:
+        if (
+            operation in {"repair_peer_proof", "repair_converge", "release"}
+            and phase not in RELEASE_PHASES
+        ):
             raise ThermalActionControlError("invalid_authority")
         if value.get("state") not in {"sleep", "recovering"}:
             raise ThermalActionControlError("invalid_authority")
@@ -311,25 +323,49 @@ class FileThermalActionAuthority:
             allow_empty=True,
             error_code="invalid_authority",
         )
+        repair_target = value.get("repair_target_engine_key")
+        repair_status = value.get("repair_target_status")
+        repair_target_deadline = self._nullable_number(
+            value.get("repair_target_deadline_epoch")
+        )
+        if repair_target is None and repair_status is None and repair_target_deadline is None:
+            pass
+        elif (
+            not isinstance(repair_target, str)
+            or repair_target not in engine_keys
+            or repair_status not in {"starting", "converging"}
+            or repair_target_deadline is None
+            or repair_target in sleeping_peer_keys
+        ):
+            raise ThermalActionControlError("invalid_authority")
         requested_proof_keys = self._engine_subset(
             request.get("proof_engine_keys"),
             engine_keys=engine_keys,
-            allow_empty=False,
+            allow_empty=operation == "repair_peer_proof",
             error_code="invalid_request",
         )
-        expected_proof_keys = (
-            sleeping_peer_keys
-            if operation == "sleeping_subset_proof"
-            else engine_keys
-        )
+        if operation in {"sleeping_subset_proof", "repair_peer_proof"}:
+            expected_proof_keys = sleeping_peer_keys
+        elif operation == "repair_converge":
+            expected_proof_keys = (repair_target,) if repair_target is not None else ()
+        else:
+            expected_proof_keys = engine_keys
         if phase == "held":
             expected_operations = ["hold"]
             if sleeping_peer_keys:
                 expected_operations.append("sleeping_subset_proof")
+        elif repair_target is not None:
+            expected_operations = [
+                "repair_peer_proof"
+                if repair_status == "starting"
+                else "repair_converge"
+            ]
+        elif operation == "hold":
+            expected_operations = ["hold"]
         elif operation == "release":
             expected_operations = ["release"]
         else:
-            expected_operations = ["hold"]
+            expected_operations = []
         if (
             requested_proof_keys != expected_proof_keys
             or value.get("authorized_operations") != expected_operations
@@ -395,6 +431,24 @@ class FileThermalActionAuthority:
                 or level not in {"graceful", "urgent"}
             ):
                 raise ThermalActionControlError("invalid_authority")
+        if operation in {"hold", "sleeping_subset_proof", "release"}:
+            if any(item is not None for item in (
+                repair_target, repair_status, repair_target_deadline
+            )):
+                raise ThermalActionControlError("invalid_authority")
+        else:
+            expected_status = (
+                "starting" if operation == "repair_peer_proof" else "converging"
+            )
+            if (
+                repair_target is None
+                or repair_status != expected_status
+                or repair_target_deadline is None
+                or repair_deadline is None
+                or repair_target_deadline <= now
+                or repair_target_deadline > repair_deadline
+            ):
+                raise ThermalActionControlError("invalid_authority")
 
         return ThermalAction(
             record_revision=record_revision,
@@ -412,6 +466,9 @@ class FileThermalActionAuthority:
             overall_deadline_epoch=overall,
             release_authorized_at_epoch=release_authorized,
             repair_deadline_epoch=repair_deadline,
+            repair_target_engine_key=repair_target,
+            repair_target_status=repair_status,
+            repair_target_deadline_epoch=repair_target_deadline,
             recovery_authorized=value["recovery_authorized"],
             engine_keys=engine_keys,
             proof_engine_keys=requested_proof_keys,

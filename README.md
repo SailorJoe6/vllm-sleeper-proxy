@@ -131,7 +131,8 @@ GBrain embedding Compose integration:
   The schema-v1 admission latch, root watchdog, and memory-pressure caller remain
   unchanged, including bodyless loopback `POST /sleep`. The separate dormant
   action-authority contract is strict schema v2. `/thermal/actions/hold`,
-  `/thermal/actions/sleeping-subset-proof`, and `/thermal/actions/release` remain
+  `/thermal/actions/sleeping-subset-proof`, `/thermal/actions/repair-peer-proof`,
+  `/thermal/actions/repair-converge`, and `/thermal/actions/release` remain
   absent unless both
   `SLEEPER_THERMAL_ACTION_CONTROL_ENABLED=1` and
   `SLEEPER_THERMAL_ACTION_STATUS_PATH` are configured. Every request and response
@@ -148,7 +149,15 @@ GBrain embedding Compose integration:
   lease, repeatedly reauthorizes the root projection, and returns conservative
   proof start/completion times within one two-second budget. It never contacts a
   stopped peer or sleeps, wakes, selects, repairs, persists, or clears ownership.
-  `release` accepts ordinary release or `cutoff_recovery_authorized` authority and
+  During a durable repair, `repair-peer-proof` accepts only the exact current
+  `starting` target and proves only its projected non-target sleeping peers within
+  the same two-second budget. `repair-converge` accepts only the exact current
+  `converging` target and immutable target deadline. It contacts only that target,
+  requires level-2 sleep, treats positive sleeping evidence as idempotent success,
+  otherwise requires positive awake evidence before one sleep request, and succeeds
+  only after positive sleeping proof. Both repeatedly reauthorize and never wake,
+  select an owner, mutate Docker or root state, clear the fence, or authorize final
+  release. `release` accepts ordinary release or `cutoff_recovery_authorized` authority and
   remains the distinct all-engine proof-only final gate. Building this code does
   not activate any action route. Deployment must enable them only with the matching root migration and a
   tested local-only binding; action IDs are correlation values, not credentials.
@@ -178,7 +187,9 @@ GBrain embedding Compose integration:
 | `POST /v1/chat/completions` | OpenAI-compatible text or inline multimodal JSON | Buffered JSON, or SSE when `"stream": true` |
 | `POST /sleep` | Empty body | Quiesces new inference, drains ownership, then sleeps the active model |
 | `POST /thermal/actions/hold` | Exact schema-v2 generation/revision/deadline/engine-set authority; disabled by default | Sleeps only as root-authorized and returns exact identity-bound all-engine positive proof |
-| `POST /thermal/actions/sleeping-subset-proof` | Exact held authority, full engine set, and root-derived retained-sleeping subset; disabled by default | Within two seconds, verifies only the exact subset without lifecycle or root-state mutation and never contacts stopped peers |
+| `POST /thermal/actions/sleeping-subset-proof` | Exact held authority, full engine set, and root-derived retained-sleeping subset; disabled by default | Within two seconds, verifies only the exact subset without engine lifecycle or root-state mutation and never contacts stopped peers |
+| `POST /thermal/actions/repair-peer-proof` | Exact current `starting` target plus its root-projected non-target sleeping peers; disabled by default | Within two seconds, positively proves only the peers and never contacts or mutates the target |
+| `POST /thermal/actions/repair-converge` | Exact current `converging` target plus immutable target deadline; disabled by default | Contacts only the target, uses level-2 sleep when needed, and returns exact target-only sleeping proof |
 | `POST /thermal/actions/release` | Exact schema-v2 ordinary or cutoff-recovery proof authority; disabled by default | Verifies all engines sleeping without sleep, wake, selection, repair, or root-state mutation |
 
 The proxy rewrites only the top-level `model` field. It does not transform
