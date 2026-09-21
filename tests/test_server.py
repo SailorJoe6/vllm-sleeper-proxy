@@ -1217,7 +1217,7 @@ class ThermalActionServerTests(unittest.TestCase):
             authority_path = Path(directory) / "containment.json"
             authority_value = thermal_action_projection(now)
             authority_path.write_text(json.dumps(authority_value))
-            authority = FileThermalActionAuthority(authority_path)
+            authority = FileThermalActionAuthority(authority_path, allow_legacy=True)
             http = ProxyHttp()
             http.sleeping = False
             manager = ModelManager([ModelConfig(
@@ -1398,7 +1398,7 @@ class ThermalActionServerTests(unittest.TestCase):
                 ],
             })
             authority_path.write_text(json.dumps(authority_value))
-            authority = FileThermalActionAuthority(authority_path)
+            authority = FileThermalActionAuthority(authority_path, allow_legacy=True)
             http = ProxyHttp()
             http.sleeping = True
             manager = ModelManager([ModelConfig(
@@ -1511,7 +1511,7 @@ class ThermalActionServerTests(unittest.TestCase):
                 repair_target_deadline_epoch=time.time() + 30,
             )
             authority_path.write_text(json.dumps(value))
-            authority = FileThermalActionAuthority(authority_path)
+            authority = FileThermalActionAuthority(authority_path, allow_legacy=True)
 
             class SlowPeerManager(ModelManager):
                 def thermal_repair_peer_proof(self, action, *, reauthorize):
@@ -1554,7 +1554,7 @@ class ThermalActionServerTests(unittest.TestCase):
     def test_repair_routes_discard_success_after_late_authority_change(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             authority_path = Path(directory) / "containment.json"
-            authority = FileThermalActionAuthority(authority_path)
+            authority = FileThermalActionAuthority(authority_path, allow_legacy=True)
 
             class LateMutationManager(ModelManager):
                 def _mutate_authority(self) -> None:
@@ -1627,7 +1627,7 @@ class ThermalActionServerTests(unittest.TestCase):
                 now, phase="cutoff_recovery_authorized", action_id="thermal-recovery-2"
             )
             authority_path.write_text(json.dumps(current))
-            authority = FileThermalActionAuthority(authority_path)
+            authority = FileThermalActionAuthority(authority_path, allow_legacy=True)
             http = ProxyHttp()
             manager = ModelManager([ModelConfig(
                 name="Qwen3-Embedding-8B",

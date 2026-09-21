@@ -4,6 +4,7 @@ import fcntl
 import json
 import math
 import os
+import secrets
 import threading
 import time
 from contextlib import contextmanager
@@ -12,7 +13,9 @@ from urllib.parse import urlencode
 
 from .client import HttpClient, sleep_until
 from .config import ModelConfig
-from .thermal_control import MAX_SLEEPING_SUBSET_PROOF_SECONDS, ThermalAction
+from .thermal_control import (
+    MAX_SLEEPING_SUBSET_PROOF_SECONDS, ProjectionEnvelope, ThermalAction,
+)
 
 
 class UnknownModelError(ValueError):
@@ -150,6 +153,286 @@ class ModelManager:
         self._pending_switch_name: str | None = None
         self._quiescing = False
         self._lifecycle_state = "unknown"
+        self._transition_phase = "idle"
+        self._projection_control_enabled = False
+        self._projection_state = "unbound"
+        self._projection_barrier = False
+        self._projection_quiesce: ProjectionEnvelope | None = None
+        self._projection_adopted: ProjectionEnvelope | None = None
+        self._projection_ack_phase: str | None = None
+        self._proxy_instance_id = secrets.token_hex(32)
+        self._projection_activation_token: str | None = None
+
+    def configure_projection_control(self, enabled: bool = True) -> None:
+        """Enable the local two-publication projection adoption barrier."""
+        with self._condition:
+            self._projection_control_enabled = bool(enabled)
+            self._projection_state = "unbound" if enabled else "active"
+            self._projection_barrier = bool(enabled)
+            self._projection_quiesce = None
+            self._projection_adopted = None
+            self._projection_ack_phase = None
+            self._projection_activation_token = None
+            self._condition.notify_all()
+
+    @property
+    def proxy_instance_id(self) -> str:
+        return self._proxy_instance_id
+
+    @property
+    def projection_activation_token(self) -> str | None:
+        return self._projection_activation_token
+
+    @property
+    def projection_state(self) -> str:
+        return self._projection_state
+
+    @property
+    def projection_control_ready(self) -> bool:
+        return (
+            not self._projection_control_enabled
+            or (
+                self._projection_state in {"active", "inactive"}
+                and not self._projection_barrier
+                and self._projection_adopted is not None
+                and self._projection_activation_token is not None
+                and self._projection_adopted.deadline_epoch > time.time()
+            )
+        )
+
+    def _require_projection_active_locked(self) -> None:
+        if self._projection_control_enabled and not self.projection_control_ready:
+            raise WakeError("thermal projection is not active")
+
+    def require_projection_action(self, action: ThermalAction) -> None:
+        """Bind an action to the currently adopted active publication."""
+        with self._condition:
+            self._require_projection_active_locked()
+            adopted = self._projection_adopted
+            if self._projection_state != "active":
+                raise WakeError("thermal actions require an active publication")
+            if adopted is None or action.publication_sequence == 0:
+                raise WakeError("thermal action is not bound to an adopted publication")
+            binding = (
+                action.publication_sequence,
+                action.publication_id,
+                action.target_store_revision,
+                action.target_authority_sha256,
+            )
+            if (
+                binding != adopted.action_binding
+                or action.proxy_instance_id != self._proxy_instance_id
+                or action.activation_token != self._projection_activation_token
+            ):
+                raise WakeError("thermal action publication is not adopted")
+
+    @staticmethod
+    def _projection_remaining(envelope: ProjectionEnvelope, label: str) -> float:
+        remaining = envelope.deadline_epoch - time.time()
+        if not math.isfinite(remaining) or remaining <= 0:
+            raise WakeError(f"projection {label} deadline expired")
+        return remaining
+
+    def _stable_lifecycle_phase_locked(self) -> str | None:
+        phase = self._transition_phase
+        if phase not in {"idle", "ready", "unknown"}:
+            return None
+        if phase == "unknown" or self._lifecycle_state == "unknown":
+            return "unknown"
+        if phase == "ready" or self._lifecycle_state == "active":
+            return "ready"
+        if phase == "idle" or self._lifecycle_state == "sleeping":
+            return "idle"
+        return None
+
+    def _wait_for_projection_stability_locked(
+        self, envelope: ProjectionEnvelope
+    ) -> str:
+        while True:
+            phase = self._stable_lifecycle_phase_locked()
+            if (
+                phase is not None
+                and self._inflight_requests == 0
+                and self._pending_switch_name is None
+                and self._starting_model_name is None
+                and not self._quiescing
+            ):
+                return phase
+            self._condition.wait(
+                timeout=self._projection_remaining(envelope, "stability")
+            )
+
+    @staticmethod
+    def _is_expired_quiesce_replacement(
+        previous: ProjectionEnvelope, candidate: ProjectionEnvelope
+    ) -> bool:
+        return (
+            previous.deadline_epoch <= time.time()
+            and candidate.publication_sequence == previous.publication_sequence + 1
+            and candidate.predecessor_publication_sequence
+            == previous.publication_sequence
+            and candidate.predecessor_publication_id == previous.publication_id
+            and candidate.transition == previous.transition
+            and candidate.source_store_revision == previous.source_store_revision
+            and candidate.source_record_revision == previous.source_record_revision
+            and candidate.target_store_revision == previous.target_store_revision
+            and candidate.target_record_revision == previous.target_record_revision
+            and candidate.source_authority_sha256
+            == previous.source_authority_sha256
+        )
+
+    def projection_quiesce(self, envelope: ProjectionEnvelope) -> str:
+        """Install a persistent barrier and acknowledge one quiescing publication."""
+        if envelope.publication_state != "quiescing":
+            raise WakeError("quiesce requires a quiescing publication")
+        if not self._projection_control_enabled:
+            raise WakeError("thermal projection control is disabled")
+        if not self._thermal_action_lock.acquire(
+            timeout=self._projection_remaining(envelope, "action lock")
+        ):
+            raise WakeError("timed out serializing projection quiesce")
+        try:
+            if not self._condition.acquire(
+                timeout=self._projection_remaining(envelope, "condition")
+            ):
+                raise WakeError("timed out acquiring lifecycle condition")
+            try:
+                if (
+                    self._projection_state == "quiesced"
+                    and self._projection_quiesce == envelope
+                    and self._projection_ack_phase is not None
+                ):
+                    return self._projection_ack_phase
+                if self._projection_state in {"active", "inactive"}:
+                    adopted = self._projection_adopted
+                    if envelope.transition not in {"advance", "rebind"}:
+                        raise WakeError("projection transition is out of order")
+                    if adopted is None or (
+                        envelope.predecessor_publication_sequence
+                        != adopted.publication_sequence
+                        or envelope.predecessor_publication_id
+                        != adopted.publication_id
+                        or envelope.source_store_revision
+                        != adopted.target_store_revision
+                        or envelope.source_record_revision
+                        != adopted.target_record_revision
+                        or envelope.source_authority_sha256
+                        != adopted.target_authority_sha256
+                    ):
+                        raise WakeError("projection predecessor is not adopted")
+                elif self._projection_state == "unbound":
+                    if envelope.publication_sequence == 1:
+                        if envelope.transition != "bootstrap":
+                            raise WakeError("initial projection requires bootstrap")
+                    elif (
+                        envelope.predecessor_publication_sequence is None
+                        or envelope.predecessor_publication_id is None
+                    ):
+                        raise WakeError("restart projection requires a predecessor")
+                elif self._projection_state in {"quiescing", "quiesced"}:
+                    previous = self._projection_quiesce
+                    if previous == envelope:
+                        pass
+                    elif previous is None or not self._is_expired_quiesce_replacement(
+                        previous, envelope
+                    ):
+                        raise WakeError("conflicting projection quiesce retry")
+                else:
+                    raise WakeError("projection quiesce is out of order")
+                self._projection_barrier = True
+                self._projection_state = "quiescing"
+                self._projection_quiesce = envelope
+                self._projection_ack_phase = None
+                self._projection_activation_token = None
+                phase = self._wait_for_projection_stability_locked(envelope)
+            finally:
+                self._condition.release()
+            with startup_lease(
+                self.startup_lease_path,
+                timeout_s=self._projection_remaining(envelope, "startup lease"),
+            ):
+                if not self._condition.acquire(
+                    timeout=self._projection_remaining(envelope, "condition recheck")
+                ):
+                    raise WakeError("timed out reacquiring lifecycle condition")
+                try:
+                    phase = self._wait_for_projection_stability_locked(envelope)
+                    self._projection_state = "quiesced"
+                    self._projection_ack_phase = phase
+                    return phase
+                finally:
+                    self._condition.release()
+        finally:
+            self._thermal_action_lock.release()
+
+    def projection_activate(self, envelope: ProjectionEnvelope) -> str:
+        """Adopt the linked active publication, then clear the persistent barrier."""
+        if envelope.publication_state not in {"active", "inactive"}:
+            raise WakeError("activate requires an active or inactive publication")
+        if not self._projection_control_enabled:
+            raise WakeError("thermal projection control is disabled")
+        if not self._thermal_action_lock.acquire(
+            timeout=self._projection_remaining(envelope, "action lock")
+        ):
+            raise WakeError("timed out serializing projection activate")
+        try:
+            if not self._condition.acquire(
+                timeout=self._projection_remaining(envelope, "condition")
+            ):
+                raise WakeError("timed out acquiring lifecycle condition")
+            try:
+                if (
+                    self._projection_state == envelope.publication_state
+                    and self._projection_adopted == envelope
+                    and self._projection_ack_phase is not None
+                ):
+                    return self._projection_ack_phase
+                quiesce = self._projection_quiesce
+                if self._projection_state != "quiesced" or quiesce is None:
+                    raise WakeError("projection activate has no in-memory quiesce ack")
+                if not (
+                    envelope.publication_sequence == quiesce.publication_sequence + 1
+                    and envelope.predecessor_publication_sequence
+                    == quiesce.publication_sequence
+                    and envelope.predecessor_publication_id == quiesce.publication_id
+                    and quiesce.successor_publication_id == envelope.publication_id
+                    and envelope.transition == quiesce.transition
+                    and envelope.source_store_revision == quiesce.source_store_revision
+                    and envelope.source_record_revision == quiesce.source_record_revision
+                    and envelope.target_store_revision == quiesce.target_store_revision
+                    and envelope.target_record_revision == quiesce.target_record_revision
+                    and envelope.source_authority_sha256
+                    == quiesce.source_authority_sha256
+                    and envelope.target_authority_sha256
+                    == quiesce.target_authority_sha256
+                    and envelope.prepared_at_epoch == quiesce.prepared_at_epoch
+                    and envelope.deadline_epoch == quiesce.deadline_epoch
+                ):
+                    raise WakeError("active publication is not linked to quiesce ack")
+                phase = self._wait_for_projection_stability_locked(envelope)
+            finally:
+                self._condition.release()
+            with startup_lease(
+                self.startup_lease_path,
+                timeout_s=self._projection_remaining(envelope, "startup lease"),
+            ):
+                if not self._condition.acquire(
+                    timeout=self._projection_remaining(envelope, "condition recheck")
+                ):
+                    raise WakeError("timed out reacquiring lifecycle condition")
+                try:
+                    phase = self._wait_for_projection_stability_locked(envelope)
+                    self._projection_adopted = envelope
+                    self._projection_state = envelope.publication_state
+                    self._projection_ack_phase = phase
+                    self._projection_activation_token = secrets.token_hex(32)
+                    self._projection_barrier = False
+                    self._condition.notify_all()
+                    return phase
+                finally:
+                    self._condition.release()
+        finally:
+            self._thermal_action_lock.release()
 
     @property
     def startup_finalized(self) -> bool:
@@ -160,20 +443,26 @@ class ModelManager:
     def startup_sleep_model(self, requested: str) -> str:
         """Sleep one engine during serialized bootstrap, without waking any engine."""
         target = self.find_model(requested)
+        self._require_projection_active_locked()
         with startup_lease(self.startup_lease_path):
+            self._require_projection_active_locked()
             with self._condition:
+                self._require_projection_active_locked()
                 if self._inflight_requests or self._pending_switch_name is not None:
                     raise WakeError("cannot bootstrap sleep while requests are active")
                 self._starting_model_name = target.name
                 self._publish_transition("bootstrap_sleep", target.name)
             try:
+                self._require_projection_active_locked()
                 sleeping = self._is_sleeping(target)
                 if sleeping is None:
                     raise WakeError(f"cannot verify bootstrap sleep state for {target.name}")
                 if not sleeping:
+                    self._require_projection_active_locked()
                     self._sleep(target)
                 self._wait_until_sleeping(target)
                 with self._condition:
+                    self._require_projection_active_locked()
                     if self._active_model_name == target.name:
                         self._clear_owner_locked()
                 return target.name
@@ -184,6 +473,7 @@ class ModelManager:
                     self._condition.notify_all()
 
     def startup_state(self, requested: str | None = None) -> dict[str, object]:
+        self._require_projection_active_locked()
         # The unqualified bootstrap probe is a control-plane liveness check.
         # Before the first engine starts, probing every upstream would turn a
         # missing engine DNS name into a 503/empty reply and deadlock startup.
@@ -197,19 +487,26 @@ class ModelManager:
 
     def finalize_startup(self) -> None:
         """Reconcile the complete required lineup and unlock inference."""
+        self._require_projection_active_locked()
         with startup_lease(self.startup_lease_path):
+            self._require_projection_active_locked()
             with self._condition:
+                self._require_projection_active_locked()
                 self._starting_model_name = "__system_startup__"
                 self._publish_transition("finalizing", "__system_startup__")
             try:
+                self._require_projection_active_locked()
                 for model in self.models:
+                    self._require_projection_active_locked()
                     sleeping = self._is_sleeping(model)
                     if sleeping is None:
                         raise WakeError(f"cannot verify startup sleep state for {model.name}")
                     if not sleeping:
+                        self._require_projection_active_locked()
                         self._sleep(model)
                     self._wait_until_sleeping(model)
                 with self._condition:
+                    self._require_projection_active_locked()
                     self._clear_owner_locked()
                     self._startup_finalized = True
             finally:
@@ -225,13 +522,18 @@ class ModelManager:
         otherwise healthy lineup. Ambiguous state is rejected so recovery can
         retry without sleeping or stopping a healthy engine.
         """
+        self._require_projection_active_locked()
         with startup_lease(self.startup_lease_path):
+            self._require_projection_active_locked()
             with self._condition:
+                self._require_projection_active_locked()
                 self._starting_model_name = "__proxy_recovery__"
                 self._publish_transition("adopting", "__proxy_recovery__")
             try:
+                self._require_projection_active_locked()
                 awake: list[ModelConfig] = []
                 for model in self.models:
+                    self._require_projection_active_locked()
                     sleeping = self._is_sleeping(model)
                     if sleeping is None:
                         raise WakeError(
@@ -246,6 +548,7 @@ class ModelManager:
                 if awake:
                     self._wait_until_model_listed(awake[0])
                 with self._condition:
+                    self._require_projection_active_locked()
                     self._active_model_name = awake[0].name if awake else None
                     self._active_model_ready = bool(awake)
                     self._lifecycle_state = "active" if awake else "sleeping"
@@ -268,10 +571,11 @@ class ModelManager:
     @property
     def inference_ready(self) -> bool:
         """Whether lifecycle ownership is safe for request admission."""
-        return self._startup_finalized and self._lifecycle_state in {
-            "active",
-            "sleeping",
-        }
+        return (
+            self._startup_finalized
+            and self._lifecycle_state in {"active", "sleeping"}
+            and self.projection_control_ready
+        )
 
     def thermal_admission_snapshot(self):
         """Return a sanitized fast-gate view without lifecycle lock contention."""
@@ -303,6 +607,7 @@ class ModelManager:
         whether that uncertainty may gate an optional or required model. Atomic
         replacement prevents readers from observing a partial transition.
         """
+        self._transition_phase = phase
         if not self.transition_state_path:
             return
         path = self.transition_state_path
@@ -324,8 +629,11 @@ class ModelManager:
     def reconcile_startup_state(self) -> None:
         """Put every configured engine to sleep before the proxy serves traffic."""
 
+        self._require_projection_active_locked()
         with startup_lease(self.startup_lease_path):
+            self._require_projection_active_locked()
             with self._condition:
+                self._require_projection_active_locked()
                 self._starting_model_name = "__system_startup__"
                 self._publish_transition("starting", "__system_startup__")
                 try:
@@ -333,6 +641,7 @@ class ModelManager:
                         raise WakeError("cannot reconcile startup state while requests are active")
 
                     for model in self.models:
+                        self._require_projection_active_locked()
                         sleeping = self._is_sleeping(model)
                         if sleeping is None:
                             raise WakeError(
@@ -343,6 +652,7 @@ class ModelManager:
                             self._sleep(model)
                             self._wait_until_sleeping(model)
 
+                    self._require_projection_active_locked()
                     self._clear_owner_locked()
                 finally:
                     self._starting_model_name = None
@@ -386,8 +696,11 @@ class ModelManager:
 
     def ensure_awake(self, requested: str) -> ModelConfig:
         target = self.find_model(requested)
+        self._require_projection_active_locked()
         with self._condition:
+            self._require_projection_active_locked()
             self._wait_for_switch_safety(target)
+            self._require_projection_active_locked()
             return self._activate_locked(target)
 
     def _check_pre_admission(self, target: ModelConfig) -> None:
@@ -402,11 +715,13 @@ class ModelManager:
         """Wake a model and hold it awake for one buffered or streaming request."""
 
         target = self.find_model(requested)
+        self._require_projection_active_locked()
         # Check before contending on lifecycle state so a cooldown response is
         # prompt even while another request is draining or switching.
         self._check_pre_admission(target)
         with self._condition:
             try:
+                self._require_projection_active_locked()
                 # Recheck under the condition to close the race between the first
                 # fast read and lifecycle ownership.
                 # The fast thermal projection is checked before waiting for any
@@ -414,6 +729,7 @@ class ModelManager:
                 # joining a queue behind the active request that is draining.
                 self._check_pre_admission(target)
                 self._wait_for_switch_safety(target)
+                self._require_projection_active_locked()
                 # A request can wait across an externally published thermal hold.
                 # Re-read the fast fence after every lifecycle wait and again in
                 # the activation path so a queued request cannot wake after proof.
@@ -438,7 +754,9 @@ class ModelManager:
         deadlock when another proxy instance is starting a model.
         """
 
+        self._require_projection_active_locked()
         with self._condition:
+            self._require_projection_active_locked()
             if self._quiescing:
                 raise WakeError("lifecycle is already quiescing")
             deadline = time.monotonic() + self.drain_timeout_s
@@ -486,8 +804,10 @@ class ModelManager:
                 raise
 
         try:
+            self._require_projection_active_locked()
             self._publish_transition("sleeping", current.name)
             with startup_lease(self.startup_lease_path):
+                self._require_projection_active_locked()
                 sleeping = self._is_sleeping(
                     current,
                     timeout_s=self.owner_validation_timeout_s,
@@ -497,8 +817,10 @@ class ModelManager:
                         f"lifecycle state unavailable for {current.name}; retry later"
                     )
                 if sleeping is False:
+                    self._require_projection_active_locked()
                     self._sleep(current)
                     self._wait_until_sleeping(current)
+                self._require_projection_active_locked()
         except Exception as exc:
             with self._condition:
                 self._mark_lifecycle_unknown_locked(current)
@@ -509,6 +831,7 @@ class ModelManager:
             ) from exc
 
         with self._condition:
+            self._require_projection_active_locked()
             self._clear_owner_locked()
             self._quiescing = False
             self._condition.notify_all()
@@ -1049,6 +1372,7 @@ class ModelManager:
         if sleeping is None:
             self._raise_lifecycle_unavailable_locked(owner)
         if sleeping is True:
+            self._require_projection_active_locked()
             self._clear_owner_locked()
             return False
         for peer in self.models:
@@ -1072,6 +1396,7 @@ class ModelManager:
             self._raise_lifecycle_unavailable_locked(owner, exc)
         if not listed:
             self._raise_lifecycle_unavailable_locked(owner)
+        self._require_projection_active_locked()
         self._active_model_ready = True
         self._lifecycle_state = "active"
         self._publish_transition("ready", owner.name)
@@ -1079,8 +1404,10 @@ class ModelManager:
 
     def _activate_locked(self, target: ModelConfig) -> ModelConfig:
         try:
+            self._require_projection_active_locked()
             self._check_pre_admission(target)
             with startup_lease(self.startup_lease_path):
+                self._require_projection_active_locked()
                 self._check_pre_admission(target)
                 activated = self._ensure_awake_locked(target)
                 self._check_pre_admission(target)
@@ -1095,6 +1422,7 @@ class ModelManager:
                 self._condition.notify_all()
 
     def _ensure_awake_locked(self, target: ModelConfig) -> ModelConfig:
+        self._require_projection_active_locked()
         if self._active_model_name == target.name:
             if self._revalidate_cached_owner_locked(target):
                 return target
@@ -1147,6 +1475,7 @@ class ModelManager:
             # asynchronously reclaiming memory. Switching admission is only
             # valid after the proxy verifies the engine's sleep state.
             self._wait_until_sleeping(current)
+            self._require_projection_active_locked()
             self._clear_owner_locked()
 
         # The lease is host-wide, so do not trust another proxy instance's
@@ -1169,6 +1498,7 @@ class ModelManager:
         if self._active_model_name is None:
             sleeping = self._is_sleeping(target)
             if sleeping is False:
+                self._require_projection_active_locked()
                 should_wake = False
                 self._active_model_name = target.name
                 self._active_model_ready = False
@@ -1188,6 +1518,7 @@ class ModelManager:
             # Conservatively remember the target before wake begins. A partial
             # wake failure can leave weights resident; the next model switch
             # must sleep this engine even when readiness never completed.
+            self._require_projection_active_locked()
             self._active_model_name = target.name
             self._active_model_ready = False
             self._lifecycle_state = "starting"
@@ -1201,6 +1532,7 @@ class ModelManager:
                 # Revalidate after startup allocations and warmup, not only
                 # before wake, so the lease is released only from a safe state.
                 self.admission_check(target)
+            self._require_projection_active_locked()
             self._active_model_ready = True
             self._lifecycle_state = "active"
             self._publish_transition("ready", target.name)
@@ -1210,6 +1542,7 @@ class ModelManager:
     def _sleep(
         self, model: ModelConfig, *, timeout_s: float | None = None
     ) -> None:
+        self._require_projection_active_locked()
         query = urlencode({"level": str(self.sleep_level)})
         resp = self.http.request(
             "POST",
@@ -1220,6 +1553,7 @@ class ModelManager:
             raise WakeError(f"sleep failed for {model.name}: HTTP {resp.status}: {resp.body[:300]!r}")
 
     def _wake(self, model: ModelConfig) -> None:
+        self._require_projection_active_locked()
         if self.wake_strategy == "level2":
             self._wake_level2(model)
             return
@@ -1251,6 +1585,7 @@ class ModelManager:
         ):
             # Check before each allocation phase. The host monitor may have
             # crossed its boundary during an earlier phase of level-2 wake.
+            self._require_projection_active_locked()
             if self.admission_check is not None:
                 self.admission_check(model)
             resp = self.http.request(

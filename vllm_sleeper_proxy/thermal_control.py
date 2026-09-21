@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import errno
+import hashlib
 import json
 import math
+import os
 import re
+import stat
 import time
 from pathlib import Path
 from typing import Callable
@@ -21,7 +25,27 @@ TRANSITION_KINDS = {
     "store_degraded_cutoff_reconstruction",
 }
 CONTAINMENT_LEVELS = {"graceful", "urgent", "cutoff", "cutoff_recovery"}
-REQUEST_KEYS = {
+PROJECTION_PROTOCOL_VERSION = 1
+REQUIREMENT = "REQ-MODEL-AVAIL-001"
+DIGEST = re.compile(r"^[0-9a-f]{64}$")
+PUBLICATION_STATES = {"quiescing", "active", "inactive"}
+TRANSITIONS = {"bootstrap", "advance", "rebind"}
+ENVELOPE_KEYS = {
+    "projection_protocol_version", "publication_state", "transition",
+    "publication_sequence", "predecessor_publication_sequence",
+    "publication_id", "predecessor_publication_id", "successor_publication_id",
+    "source_store_revision", "source_record_revision",
+    "target_store_revision", "target_record_revision",
+    "source_authority_sha256", "target_authority_sha256",
+    "prepared_at_epoch", "deadline_epoch", "authority", "requirement",
+}
+CONTROL_REQUEST_KEYS = ENVELOPE_KEYS - {"authority"} | {"operation"}
+PUBLICATION_BINDING_KEYS = {
+    "publication_sequence", "publication_id", "target_store_revision",
+    "target_authority_sha256", "proxy_instance_id", "activation_token",
+}
+
+LEGACY_REQUEST_KEYS = {
     "schema_version", "operation", "record_revision", "incident_id",
     "action_id", "generation", "predecessor_action_id", "transition_kind",
     "phase", "containment_level", "created_at_epoch", "phase_updated_at_epoch",
@@ -30,6 +54,11 @@ REQUEST_KEYS = {
     "repair_target_engine_key", "repair_target_status",
     "repair_target_deadline_epoch", "recovery_authorized",
     "engine_keys", "proof_engine_keys",
+}
+REQUEST_KEYS = LEGACY_REQUEST_KEYS | PUBLICATION_BINDING_KEYS
+INACTIVE_PROJECTION_KEYS = {
+    "schema_version", "generated_at_epoch", "active", "state", "applied",
+    "action_id", "reason_codes", "requirement",
 }
 PROJECTION_KEYS = {
     "schema_version", "record_revision", "incident_id", "action_id",
@@ -43,7 +72,7 @@ PROJECTION_KEYS = {
     "repair_target_deadline_epoch", "engine_keys",
     "sleeping_peer_engine_keys", "authorized_operations", "requirement",
 }
-BOUND_REQUEST_FIELDS = REQUEST_KEYS - {
+BOUND_REQUEST_FIELDS = LEGACY_REQUEST_KEYS - {
     "schema_version", "operation", "proof_engine_keys"
 }
 MAX_ACTION_WINDOW_SECONDS = 300.0
@@ -76,6 +105,57 @@ class ThermalActionControlError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class ProjectionEnvelope:
+    publication_state: str
+    transition: str
+    publication_sequence: int
+    predecessor_publication_sequence: int | None
+    publication_id: str
+    predecessor_publication_id: str | None
+    successor_publication_id: str | None
+    source_store_revision: int
+    source_record_revision: int
+    target_store_revision: int
+    target_record_revision: int
+    source_authority_sha256: str | None
+    target_authority_sha256: str
+    prepared_at_epoch: float
+    deadline_epoch: float
+    authority: dict[str, object] | None
+
+    def control_fields(self, operation: str) -> dict[str, object]:
+        return {
+            "projection_protocol_version": PROJECTION_PROTOCOL_VERSION,
+            "operation": operation,
+            "publication_state": self.publication_state,
+            "transition": self.transition,
+            "publication_sequence": self.publication_sequence,
+            "predecessor_publication_sequence": self.predecessor_publication_sequence,
+            "publication_id": self.publication_id,
+            "predecessor_publication_id": self.predecessor_publication_id,
+            "successor_publication_id": self.successor_publication_id,
+            "source_store_revision": self.source_store_revision,
+            "source_record_revision": self.source_record_revision,
+            "target_store_revision": self.target_store_revision,
+            "target_record_revision": self.target_record_revision,
+            "source_authority_sha256": self.source_authority_sha256,
+            "target_authority_sha256": self.target_authority_sha256,
+            "prepared_at_epoch": self.prepared_at_epoch,
+            "deadline_epoch": self.deadline_epoch,
+            "requirement": REQUIREMENT,
+        }
+
+    @property
+    def action_binding(self) -> tuple[int, str, int, str]:
+        return (
+            self.publication_sequence,
+            self.publication_id,
+            self.target_store_revision,
+            self.target_authority_sha256,
+        )
+
+
+@dataclass(frozen=True)
 class ThermalAction:
     record_revision: int
     incident_id: str
@@ -98,10 +178,16 @@ class ThermalAction:
     recovery_authorized: bool
     engine_keys: tuple[str, ...]
     proof_engine_keys: tuple[str, ...]
+    publication_sequence: int = 0
+    publication_id: str = ""
+    target_store_revision: int = 0
+    target_authority_sha256: str = ""
+    proxy_instance_id: str = ""
+    activation_token: str = ""
 
 
 class FileThermalActionAuthority:
-    """Strict, non-mutating reader for one root-published schema-v2 projection."""
+    """Strict, non-mutating reader for one root-published projection envelope."""
 
     def __init__(
         self,
@@ -109,10 +195,17 @@ class FileThermalActionAuthority:
         *,
         now: Callable[[], float] = time.time,
         maximum_bytes: int = 16 * 1024,
+        expected_uid: int | None = None,
+        expected_mode: int | None = None,
+        allow_legacy: bool | None = None,
     ) -> None:
         self.path = path
         self.now = now
         self.maximum_bytes = max(512, min(64 * 1024, int(maximum_bytes)))
+        self.expected_uid = expected_uid
+        self.expected_mode = expected_mode
+        self._allow_legacy_explicit = allow_legacy is True
+        self.allow_legacy = True if allow_legacy is None else allow_legacy
 
     @staticmethod
     def _allowed_phases(operation: str) -> set[str]:
@@ -126,28 +219,325 @@ class FileThermalActionAuthority:
             return RELEASE_PHASES
         raise ValueError("unsupported thermal action operation")
 
-    def _load(self) -> dict[str, object]:
+    def _read_json(self) -> dict[str, object]:
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
         try:
-            with self.path.open("rb") as handle:
-                raw = handle.read(self.maximum_bytes + 1)
+            path_before = os.lstat(self.path)
+            descriptor = os.open(self.path, flags)
         except OSError as exc:
-            raise ThermalActionControlError("unavailable") from exc
+            code = "invalid_authority" if exc.errno in {errno.ELOOP, errno.EMLINK} else "unavailable"
+            raise ThermalActionControlError(code) from exc
+        try:
+            metadata = os.fstat(descriptor)
+            stable_fields = (
+                "st_dev", "st_ino", "st_mode", "st_uid", "st_gid", "st_nlink",
+                "st_size", "st_mtime_ns", "st_ctime_ns",
+            )
+            if any(
+                getattr(path_before, field) != getattr(metadata, field)
+                for field in stable_fields
+            ):
+                raise ThermalActionControlError("invalid_authority")
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                raise ThermalActionControlError("invalid_authority")
+            mode = stat.S_IMODE(metadata.st_mode)
+            if self.expected_uid is not None and metadata.st_uid != self.expected_uid:
+                raise ThermalActionControlError("invalid_authority")
+            if self.expected_mode is not None and mode != self.expected_mode:
+                raise ThermalActionControlError("invalid_authority")
+            chunks: list[bytes] = []
+            remaining = self.maximum_bytes + 1
+            while remaining > 0:
+                chunk = os.read(descriptor, remaining)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            raw = b"".join(chunks)
+            after = os.fstat(descriptor)
+            path_after = os.lstat(self.path)
+            if (
+                any(getattr(metadata, field) != getattr(after, field) for field in stable_fields)
+                or any(getattr(after, field) != getattr(path_after, field) for field in stable_fields)
+                or len(raw) != metadata.st_size
+            ):
+                raise ThermalActionControlError("invalid_authority")
+        except OSError as exc:
+            raise ThermalActionControlError("invalid_authority") from exc
+        finally:
+            os.close(descriptor)
         if len(raw) > self.maximum_bytes:
             raise ThermalActionControlError("invalid_authority")
         try:
-            value = json.loads(
-                raw,
-                object_pairs_hook=_reject_duplicate_json_object,
-            )
+            value = json.loads(raw, object_pairs_hook=_reject_duplicate_json_object)
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
             raise ThermalActionControlError("invalid_authority") from exc
         if not isinstance(value, dict):
             raise ThermalActionControlError("invalid_authority")
-        if value.get("active") is not True:
-            raise ThermalActionControlError("inactive")
-        if set(value) != PROJECTION_KEYS:
-            raise ThermalActionControlError("invalid_authority")
+        if "projection_protocol_version" in value:
+            if mode & 0o022:
+                raise ThermalActionControlError("invalid_authority")
+            try:
+                canonical = json.dumps(
+                    value, sort_keys=True, separators=(",", ":"),
+                    ensure_ascii=False, allow_nan=False,
+                ).encode("utf-8")
+            except (TypeError, ValueError) as exc:
+                raise ThermalActionControlError("invalid_authority") from exc
+            if raw != canonical:
+                raise ThermalActionControlError("invalid_authority")
         return value
+
+    @staticmethod
+    def _canonical_digest(value: dict[str, object]) -> str:
+        try:
+            encoded = json.dumps(
+                value, sort_keys=True, separators=(",", ":"),
+                ensure_ascii=False, allow_nan=False,
+            ).encode("utf-8")
+        except (TypeError, ValueError) as exc:
+            raise ThermalActionControlError("invalid_authority") from exc
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _parse_envelope(
+        self, value: dict[str, object], *, require_live_deadline: bool
+    ) -> ProjectionEnvelope:
+        if set(value) != ENVELOPE_KEYS:
+            raise ThermalActionControlError("invalid_authority")
+        if (
+            type(value.get("projection_protocol_version")) is not int
+            or value.get("projection_protocol_version") != PROJECTION_PROTOCOL_VERSION
+        ):
+            raise ThermalActionControlError("invalid_authority")
+        state = value.get("publication_state")
+        transition = value.get("transition")
+        if (
+            not isinstance(state, str)
+            or state not in PUBLICATION_STATES
+            or not isinstance(transition, str)
+            or transition not in TRANSITIONS
+        ):
+            raise ThermalActionControlError("invalid_authority")
+
+        def positive(name: str) -> int:
+            item = value.get(name)
+            if type(item) is not int or not 1 <= item <= MAX_INTEGER:
+                raise ThermalActionControlError("invalid_authority")
+            return item
+
+        sequence = positive("publication_sequence")
+        predecessor_sequence = value.get("predecessor_publication_sequence")
+        if predecessor_sequence is not None and (
+            type(predecessor_sequence) is not int
+            or not 1 <= predecessor_sequence < sequence
+        ):
+            raise ThermalActionControlError("invalid_authority")
+        publication_id = value.get("publication_id")
+        predecessor_id = value.get("predecessor_publication_id")
+        successor_id = value.get("successor_publication_id")
+        source_digest = value.get("source_authority_sha256")
+        target_digest = value.get("target_authority_sha256")
+        if not isinstance(publication_id, str) or not DIGEST.fullmatch(publication_id):
+            raise ThermalActionControlError("invalid_authority")
+        for digest in (predecessor_id, successor_id, source_digest, target_digest):
+            if digest is not None and (
+                not isinstance(digest, str) or not DIGEST.fullmatch(digest)
+            ):
+                raise ThermalActionControlError("invalid_authority")
+        if sequence == 1:
+            if predecessor_sequence is not None or predecessor_id is not None:
+                raise ThermalActionControlError("invalid_authority")
+        elif (
+            predecessor_sequence != sequence - 1
+            or predecessor_id is None
+        ):
+            raise ThermalActionControlError("invalid_authority")
+        if (state == "quiescing") != (successor_id is not None):
+            raise ThermalActionControlError("invalid_authority")
+        if (transition == "bootstrap") != (source_digest is None):
+            raise ThermalActionControlError("invalid_authority")
+
+        source_store = positive("source_store_revision")
+        source_record = positive("source_record_revision")
+        target_store = positive("target_store_revision")
+        target_record = positive("target_record_revision")
+        if transition == "advance":
+            if target_store != source_store + 1 or target_record != source_record + 1:
+                raise ThermalActionControlError("invalid_authority")
+        elif target_store != source_store or target_record != source_record:
+            raise ThermalActionControlError("invalid_authority")
+
+        prepared = self._finite_number(value.get("prepared_at_epoch"))
+        deadline = self._finite_number(value.get("deadline_epoch"))
+        current = self.now()
+        if (
+            prepared > current + MAX_CLOCK_FUTURE_SKEW_SECONDS
+            or deadline <= prepared
+            or (require_live_deadline and deadline <= current)
+        ):
+            raise ThermalActionControlError(
+                "deadline_expired" if require_live_deadline and deadline <= current
+                else "invalid_authority"
+            )
+        authority = value.get("authority")
+        if state == "quiescing":
+            if authority is not None:
+                raise ThermalActionControlError("invalid_authority")
+        else:
+            expected_authority_keys = (
+                PROJECTION_KEYS if state == "active" else INACTIVE_PROJECTION_KEYS
+            )
+            if not isinstance(authority, dict) or set(authority) != expected_authority_keys:
+                raise ThermalActionControlError("invalid_authority")
+            if authority.get("active") is not (state == "active"):
+                raise ThermalActionControlError("invalid_authority")
+            if state == "inactive" and (
+                type(authority.get("schema_version")) is not int
+                or authority.get("schema_version") != SCHEMA_VERSION
+                or authority.get("state") != "none"
+                or authority.get("applied") is not False
+                or authority.get("action_id") is not None
+                or authority.get("reason_codes") != []
+                or authority.get("requirement") != REQUIREMENT
+            ):
+                raise ThermalActionControlError("invalid_authority")
+            if state == "inactive":
+                generated = self._finite_number(authority.get("generated_at_epoch"))
+                if generated < 0 or generated > current + MAX_CLOCK_FUTURE_SKEW_SECONDS:
+                    raise ThermalActionControlError("invalid_authority")
+            if self._canonical_digest(authority) != target_digest:
+                raise ThermalActionControlError("invalid_authority")
+        if value.get("requirement") != REQUIREMENT:
+            raise ThermalActionControlError("invalid_authority")
+        semantic = dict(value)
+        semantic.pop("publication_id", None)
+        semantic.pop("predecessor_publication_id", None)
+        semantic.pop("successor_publication_id", None)
+        if self._canonical_digest(semantic) != publication_id:
+            raise ThermalActionControlError("invalid_authority")
+        assert isinstance(state, str) and isinstance(transition, str)
+        assert isinstance(publication_id, str) and isinstance(target_digest, str)
+        return ProjectionEnvelope(
+            publication_state=state,
+            transition=transition,
+            publication_sequence=sequence,
+            predecessor_publication_sequence=predecessor_sequence,
+            publication_id=publication_id,
+            predecessor_publication_id=predecessor_id,
+            successor_publication_id=successor_id,
+            source_store_revision=source_store,
+            source_record_revision=source_record,
+            target_store_revision=target_store,
+            target_record_revision=target_record,
+            source_authority_sha256=source_digest,
+            target_authority_sha256=target_digest,
+            prepared_at_epoch=prepared,
+            deadline_epoch=deadline,
+            authority=authority,
+        )
+
+    def legacy_projection_configured(self) -> bool:
+        if not self.allow_legacy:
+            return False
+        if self._allow_legacy_explicit:
+            return True
+        try:
+            return set(self._read_json()) == PROJECTION_KEYS
+        except ThermalActionControlError:
+            return False
+
+    def load_envelope(self, *, require_live_deadline: bool = False) -> ProjectionEnvelope:
+        return self._parse_envelope(
+            self._read_json(), require_live_deadline=require_live_deadline
+        )
+
+    @staticmethod
+    def _request_for_envelope_operation(
+        envelope: ProjectionEnvelope, operation: str
+    ) -> dict[str, object]:
+        authority = envelope.authority
+        if authority is None:
+            raise ThermalActionControlError("invalid_authority")
+        request = {
+            "schema_version": SCHEMA_VERSION,
+            "operation": operation,
+            **{key: authority.get(key) for key in BOUND_REQUEST_FIELDS},
+            "publication_sequence": envelope.publication_sequence,
+            "publication_id": envelope.publication_id,
+            "target_store_revision": envelope.target_store_revision,
+            "target_authority_sha256": envelope.target_authority_sha256,
+            "proxy_instance_id": "0" * 64,
+            "activation_token": "0" * 64,
+        }
+        if operation in {"sleeping_subset_proof", "repair_peer_proof"}:
+            proof = authority.get("sleeping_peer_engine_keys")
+        elif operation == "repair_converge":
+            target = authority.get("repair_target_engine_key")
+            proof = [target] if isinstance(target, str) else []
+        else:
+            proof = authority.get("engine_keys")
+        request["proof_engine_keys"] = proof
+        return request
+
+    def _validate_active_envelope_authority(
+        self, envelope: ProjectionEnvelope
+    ) -> None:
+        authority = envelope.authority
+        assert authority is not None
+        operations = authority.get("authorized_operations")
+        allowed = {
+            "hold", "release", "sleeping_subset_proof",
+            "repair_peer_proof", "repair_converge",
+        }
+        if (
+            not isinstance(operations, list)
+            or not operations
+            or len(operations) != len(set(operations))
+            or any(not isinstance(item, str) or item not in allowed for item in operations)
+            or authority.get("record_revision") != envelope.target_record_revision
+        ):
+            raise ThermalActionControlError("invalid_authority")
+        for operation in operations:
+            self.authorize(
+                operation,
+                self._request_for_envelope_operation(envelope, operation),
+            )
+
+    def authorize_control(
+        self, operation: str, request: object
+    ) -> ProjectionEnvelope:
+        expected_states = {
+            "quiesce": {"quiescing"},
+            "activate": {"active", "inactive"},
+        }.get(operation)
+        if expected_states is None or not isinstance(request, dict) or set(request) != CONTROL_REQUEST_KEYS:
+            raise ThermalActionControlError("invalid_request")
+        if request.get("operation") != operation:
+            raise ThermalActionControlError("invalid_request")
+        envelope = self.load_envelope(require_live_deadline=True)
+        if envelope.publication_state not in expected_states:
+            raise ThermalActionControlError("mismatch")
+        if request != envelope.control_fields(operation):
+            raise ThermalActionControlError("mismatch")
+        if envelope.publication_state == "active":
+            self._validate_active_envelope_authority(envelope)
+        return envelope
+
+    def _load(self) -> tuple[dict[str, object], ProjectionEnvelope | None]:
+        raw = self._read_json()
+        if self.allow_legacy and set(raw) == PROJECTION_KEYS:
+            if raw.get("active") is not True:
+                raise ThermalActionControlError("inactive")
+            return raw, None
+        if self.allow_legacy and raw.get("active") is False and "publication_state" not in raw:
+            raise ThermalActionControlError("inactive")
+        envelope = self._parse_envelope(raw, require_live_deadline=True)
+        if envelope.publication_state != "active":
+            raise ThermalActionControlError("inactive")
+        assert envelope.authority is not None
+        if envelope.authority.get("active") is not True:
+            raise ThermalActionControlError("inactive")
+        return envelope.authority, envelope
 
     @staticmethod
     def _finite_number(value: object) -> float:
@@ -207,7 +597,10 @@ class FileThermalActionAuthority:
 
     def authorize(self, operation: str, request: object) -> ThermalAction:
         allowed_phases = self._allowed_phases(operation)
-        if not isinstance(request, dict) or set(request) != REQUEST_KEYS:
+        if (
+            not isinstance(request, dict)
+            or frozenset(request) not in {frozenset(LEGACY_REQUEST_KEYS), frozenset(REQUEST_KEYS)}
+        ):
             raise ThermalActionControlError("invalid_request")
         if type(request.get("schema_version")) is not int or request["schema_version"] != SCHEMA_VERSION:
             raise ThermalActionControlError("invalid_request")
@@ -220,7 +613,22 @@ class FileThermalActionAuthority:
         if not isinstance(requested_phase, str) or requested_phase not in allowed_phases:
             raise ThermalActionControlError("phase_not_allowed")
 
-        value = self._load()
+        value, envelope = self._load()
+        if envelope is not None and PUBLICATION_BINDING_KEYS <= set(request):
+            requested_binding = tuple(request.get(key) for key in (
+                "publication_sequence", "publication_id", "target_store_revision",
+                "target_authority_sha256",
+            ))
+            proxy_instance_id = request.get("proxy_instance_id")
+            activation_token = request.get("activation_token")
+            if (
+                requested_binding != envelope.action_binding
+                or not isinstance(proxy_instance_id, str)
+                or not DIGEST.fullmatch(proxy_instance_id)
+                or not isinstance(activation_token, str)
+                or not DIGEST.fullmatch(activation_token)
+            ):
+                raise ThermalActionControlError("mismatch")
         if type(value.get("schema_version")) is not int or value["schema_version"] != SCHEMA_VERSION:
             raise ThermalActionControlError("invalid_authority")
         for key in BOUND_REQUEST_FIELDS:
@@ -451,6 +859,16 @@ class FileThermalActionAuthority:
                 raise ThermalActionControlError("invalid_authority")
 
         return ThermalAction(
+            publication_sequence=(envelope.publication_sequence if envelope else 0),
+            publication_id=(envelope.publication_id if envelope else ""),
+            target_store_revision=(envelope.target_store_revision if envelope else 0),
+            target_authority_sha256=(envelope.target_authority_sha256 if envelope else ""),
+            proxy_instance_id=(
+                str(request.get("proxy_instance_id")) if envelope else ""
+            ),
+            activation_token=(
+                str(request.get("activation_token")) if envelope else ""
+            ),
             record_revision=record_revision,
             incident_id=incident_id,
             action_id=action_id,

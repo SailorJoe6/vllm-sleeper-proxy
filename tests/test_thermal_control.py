@@ -142,7 +142,7 @@ class FileThermalActionAuthorityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "containment.json"
             path.write_text(json.dumps(projection()))
-            authority = FileThermalActionAuthority(path, now=lambda: 100.0)
+            authority = FileThermalActionAuthority(path, allow_legacy=True, now=lambda: 100.0)
             action = authority.authorize("hold", request())
         self.assertEqual("thermal-7", action.action_id)
         self.assertEqual("graceful_hold", action.phase)
@@ -154,7 +154,7 @@ class FileThermalActionAuthorityTests(unittest.TestCase):
     def test_inactive_malformed_or_mismatched_authority_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "containment.json"
-            authority = FileThermalActionAuthority(path, now=lambda: 100.0)
+            authority = FileThermalActionAuthority(path, allow_legacy=True, now=lambda: 100.0)
             nonfinite = {**projection(), "overall_deadline_epoch": float("nan")}
             inverted = {**projection(), "drain_deadline_epoch": 190.0, "sleep_deadline_epoch": 180.0}
             cases = (
@@ -179,7 +179,7 @@ class FileThermalActionAuthorityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "containment.json"
             path.write_text(json.dumps(projection()))
-            authority = FileThermalActionAuthority(path, now=lambda: 201.0)
+            authority = FileThermalActionAuthority(path, allow_legacy=True, now=lambda: 201.0)
             with self.assertRaises(ThermalActionControlError) as observed:
                 authority.authorize("hold", request())
         self.assertEqual("deadline_expired", observed.exception.code)
@@ -187,7 +187,7 @@ class FileThermalActionAuthorityTests(unittest.TestCase):
     def test_hold_and_release_phases_are_operation_scoped(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "containment.json"
-            authority = FileThermalActionAuthority(path, now=lambda: 100.0)
+            authority = FileThermalActionAuthority(path, allow_legacy=True, now=lambda: 100.0)
             path.write_text(json.dumps(projection(phase="release_authorized")))
             with self.assertRaises(ThermalActionControlError) as observed:
                 authority.authorize("hold", request(phase="release_authorized"))
@@ -204,7 +204,7 @@ class FileThermalActionAuthorityTests(unittest.TestCase):
             value["overall_deadline_epoch"] = value["created_at_epoch"] + 301
             value["sleep_deadline_epoch"] = value["overall_deadline_epoch"]
             path.write_text(json.dumps(value))
-            authority = FileThermalActionAuthority(path, now=lambda: 100.0)
+            authority = FileThermalActionAuthority(path, allow_legacy=True, now=lambda: 100.0)
             with self.assertRaises(ThermalActionControlError) as observed:
                 authority.authorize("hold", request_from_projection(value))
         self.assertEqual("invalid_authority", observed.exception.code)
@@ -213,12 +213,12 @@ class FileThermalActionAuthorityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "containment.json"
             path.write_text(json.dumps(projection(phase="urgent_hold")))
-            authority = FileThermalActionAuthority(path, now=lambda: 100.0)
+            authority = FileThermalActionAuthority(path, allow_legacy=True, now=lambda: 100.0)
             action = authority.authorize(
                 "hold", request(phase="urgent_hold")
             )
             self.assertEqual("urgent_hold", action.phase)
-            expired = FileThermalActionAuthority(path, now=lambda: 201.0)
+            expired = FileThermalActionAuthority(path, allow_legacy=True, now=lambda: 201.0)
             with self.assertRaises(ThermalActionControlError) as observed:
                 expired.authorize("hold", request(phase="urgent_hold"))
         self.assertEqual("deadline_expired", observed.exception.code)
@@ -228,7 +228,7 @@ class FileThermalActionAuthorityTests(unittest.TestCase):
             path = Path(directory) / "containment.json"
             value = projection()
             path.write_text(json.dumps(value))
-            authority = FileThermalActionAuthority(path, now=lambda: 100.0)
+            authority = FileThermalActionAuthority(path, allow_legacy=True, now=lambda: 100.0)
             original = authority.authorize("hold", request())
             value["sleep_deadline_epoch"] = 190.0
             path.write_text(json.dumps(value))
@@ -265,7 +265,7 @@ class FileThermalActionAuthorityTests(unittest.TestCase):
                 value["sleeping_peer_engine_keys"]
             )
             path.write_text(json.dumps(value))
-            authority = FileThermalActionAuthority(path, now=lambda: 100.0)
+            authority = FileThermalActionAuthority(path, allow_legacy=True, now=lambda: 100.0)
             action = authority.authorize("sleeping_subset_proof", body)
             self.assertEqual("held", action.phase)
             self.assertEqual(
@@ -339,7 +339,7 @@ class FileThermalActionAuthorityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "containment.json"
             path.write_text(json.dumps(projection()))
-            authority = FileThermalActionAuthority(path, now=lambda: 100.0)
+            authority = FileThermalActionAuthority(path, allow_legacy=True, now=lambda: 100.0)
             legacy = {"schema_version": 1, "action_id": "thermal-7", "phase": "graceful_hold"}
             with self.assertRaises(ThermalActionControlError) as observed:
                 authority.authorize("hold", legacy)
@@ -375,7 +375,7 @@ class FileThermalActionAuthorityTests(unittest.TestCase):
             path = Path(directory) / "containment.json"
             current = projection()
             path.write_text(json.dumps(current))
-            authority = FileThermalActionAuthority(path, now=lambda: 100.0)
+            authority = FileThermalActionAuthority(path, allow_legacy=True, now=lambda: 100.0)
             for key, changed in mutations.items():
                 with self.subTest(key=key):
                     stale = request()
@@ -402,7 +402,7 @@ class FileThermalActionAuthorityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "containment.json"
             path.write_text(json.dumps(value))
-            authority = FileThermalActionAuthority(path, now=lambda: 100.0)
+            authority = FileThermalActionAuthority(path, allow_legacy=True, now=lambda: 100.0)
             action = authority.authorize("repair_peer_proof", body)
         self.assertEqual("starting", action.repair_target_status)
         self.assertNotIn(
@@ -426,7 +426,7 @@ class FileThermalActionAuthorityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "containment.json"
             path.write_text(json.dumps(value))
-            authority = FileThermalActionAuthority(path, now=lambda: 100.0)
+            authority = FileThermalActionAuthority(path, allow_legacy=True, now=lambda: 100.0)
             for changed in variants:
                 with self.subTest(changed=changed):
                     with self.assertRaises(ThermalActionControlError):
@@ -453,7 +453,7 @@ class FileThermalActionAuthorityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "containment.json"
             path.write_text(json.dumps(value))
-            authority = FileThermalActionAuthority(path, now=lambda: 100.0)
+            authority = FileThermalActionAuthority(path, allow_legacy=True, now=lambda: 100.0)
             action = authority.authorize("repair_converge", body)
             self.assertEqual(
                 "Qwen3-Embedding-8B", action.repair_target_engine_key
@@ -496,7 +496,7 @@ class FileThermalActionAuthorityTests(unittest.TestCase):
             value = projection(phase="cutoff_recovery_authorized")
             body = request(phase="cutoff_recovery_authorized")
             path.write_text(json.dumps(value))
-            authority = FileThermalActionAuthority(path, now=lambda: 100.0)
+            authority = FileThermalActionAuthority(path, allow_legacy=True, now=lambda: 100.0)
             action = authority.authorize("release", body)
             self.assertEqual("cutoff_recovery", action.transition_kind)
             self.assertIsNone(action.overall_deadline_epoch)
@@ -509,7 +509,7 @@ class FileThermalActionAuthorityTests(unittest.TestCase):
     def test_cutoff_recovery_and_ordinary_release_deadline_matrices_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "containment.json"
-            authority = FileThermalActionAuthority(path, now=lambda: 100.0)
+            authority = FileThermalActionAuthority(path, allow_legacy=True, now=lambda: 100.0)
             cases = []
             cutoff_with_containment = projection(phase="cutoff_recovery_authorized")
             cutoff_with_containment["overall_deadline_epoch"] = 150.0
@@ -532,7 +532,7 @@ class FileThermalActionAuthorityTests(unittest.TestCase):
     def test_kind_generation_phase_and_level_matrix_rejects_impossible_authority(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "containment.json"
-            authority = FileThermalActionAuthority(path, now=lambda: 100.0)
+            authority = FileThermalActionAuthority(path, allow_legacy=True, now=lambda: 100.0)
             cases = []
             bad = projection()
             bad.update({"transition_kind": "hard_cutoff"})

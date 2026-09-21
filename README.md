@@ -191,6 +191,25 @@ GBrain embedding Compose integration:
 | `POST /thermal/actions/repair-peer-proof` | Exact current `starting` target plus its root-projected non-target sleeping peers; disabled by default | Within two seconds, positively proves only the peers and never contacts or mutates the target |
 | `POST /thermal/actions/repair-converge` | Exact current `converging` target plus immutable target deadline; disabled by default | Contacts only the target, uses level-2 sleep when needed, and returns exact target-only sleeping proof |
 | `POST /thermal/actions/release` | Exact schema-v2 ordinary or cutoff-recovery proof authority; disabled by default | Verifies all engines sleeping without sleep, wake, selection, repair, or root-state mutation |
+| `POST /thermal/projection/quiesce` | Exact predecessor-linked zero-operation publication barrier; disabled by default | Gates normal and thermal lifecycle entry and acknowledges only after predecessor authority and transitions are quiescent |
+| `POST /thermal/projection/activate` | Exact linked active or inactive projection derived from the durable root target; disabled by default | Adopts the projection for this Proxy process and only then releases the logical lifecycle barrier |
+
+The dormant projection endpoints implement a two-phase publication barrier. A
+root record revision alone does not revoke an already-loaded Proxy authority.
+Root first publishes a non-actionable `quiescing` envelope and waits for an
+instance-bound acknowledgement after the Proxy has gated new lifecycle entry,
+serialized behind its action lock, drained old work, and crossed the shared
+startup lease. Root may then commit the successor, publish only from its exact
+durable envelope, and request activation. Quiescence is coordination evidence,
+not sleeping/stopped/readiness proof. Missing, stale, malformed, out-of-order,
+or ambiguous state stays fenced. A new Proxy process loses adoption and, when
+action control is enabled, binds control-only without generic engine
+reconciliation until a fresh same-revision rebind. Strict action calls additionally bind the
+process-instance ID plus an unpredictable token generated and disclosed only in the observed activation ACK,
+so an applied activation whose HTTP response is lost cannot authorize action;
+exact replay can recover only that successor. The independent schema-v1 fence
+remains authoritative until root has consumable activation evidence. The feature
+remains default-off and no current Compose file enables it.
 
 The proxy rewrites only the top-level `model` field. It does not transform
 `messages`, inline `data:` image URLs, generation parameters, or response

@@ -19,6 +19,7 @@ from .admission import (
 from .thermal_control import (
     MAX_SLEEPING_SUBSET_PROOF_SECONDS,
     FileThermalActionAuthority,
+    REQUEST_KEYS,
     ThermalActionControlError,
 )
 from .config import load_models_from_env
@@ -43,6 +44,20 @@ def _reject_duplicate_json_object(
 def require_qwen_admission(models, admission_path: str | None) -> None:
     if any(model.upstream_model == "unsloth/Qwen3.8-27B-NVFP4" for model in models) and not admission_path:
         raise RuntimeError("Qwen3.8 requires SLEEPER_ADMISSION_STATUS_PATH")
+
+
+def _thermal_authority_identity_from_env() -> tuple[int, int]:
+    try:
+        uid = int(os.environ.get("SLEEPER_THERMAL_ACTION_STATUS_UID", "0"), 10)
+        mode_text = os.environ.get("SLEEPER_THERMAL_ACTION_STATUS_MODE", "0600")
+        if not mode_text or any(character not in "01234567" for character in mode_text):
+            raise ValueError("mode is not octal")
+        mode = int(mode_text, 8)
+    except ValueError as exc:
+        raise RuntimeError("invalid thermal action authority UID/mode") from exc
+    if not 0 <= uid <= (1 << 31) - 1 or not 0 <= mode <= 0o777 or mode & 0o022:
+        raise RuntimeError("unsafe thermal action authority UID/mode")
+    return uid, mode
 
 
 def compose_admission_checks(*checks):
@@ -81,7 +96,9 @@ class SleeperProxyHandler(BaseHTTPRequestHandler):
     max_request_body_bytes = 10 * 1024 * 1024
     thermal_action_control_enabled = False
     thermal_action_authority: FileThermalActionAuthority | None = None
+    strict_projection_control = False
     thermal_action_max_body_bytes = 2048
+    projection_control_max_body_bytes = 16 * 1024
 
     server_version = "vllm-sleeper-proxy/0.1"
 
@@ -131,6 +148,13 @@ class SleeperProxyHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802 - stdlib API
         path = urlsplit(self.path).path
+        projection_controls = {
+            "/thermal/projection/quiesce": "quiesce",
+            "/thermal/projection/activate": "activate",
+        }
+        if path in projection_controls:
+            self._handle_projection_control(projection_controls[path])
+            return
         thermal_actions = {
             "/thermal/actions/hold": "hold",
             "/thermal/actions/release": "release",
@@ -140,6 +164,18 @@ class SleeperProxyHandler(BaseHTTPRequestHandler):
         }
         if path in thermal_actions:
             self._handle_thermal_action(thermal_actions[path])
+            return
+        if (
+            self.thermal_action_control_enabled
+            and self.strict_projection_control
+            and not self.manager.projection_control_ready
+        ):
+            self._send_error(
+                503,
+                "thermal projection is not active",
+                "projection_unbound",
+                {"Retry-After": "1"},
+            )
             return
         if self.manager.bootstrap_mode and path == "/startup/sleep":
             from urllib.parse import parse_qs
@@ -332,6 +368,95 @@ class SleeperProxyHandler(BaseHTTPRequestHandler):
         finally:
             response.close()
 
+    def _read_control_payload(self) -> object:
+        if self.headers.get("transfer-encoding") is not None:
+            raise ValueError("chunked request body")
+        raw_length = self.headers.get("content-length")
+        try:
+            content_length = int(raw_length) if raw_length is not None else -1
+        except ValueError as exc:
+            raise ValueError("invalid content length") from exc
+        if content_length <= 0 or content_length > self.projection_control_max_body_bytes:
+            raise ValueError("invalid control body")
+        try:
+            return json.loads(
+                self.rfile.read(content_length).decode("utf-8"),
+                object_pairs_hook=_reject_duplicate_json_object,
+            )
+        except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError("invalid control body") from exc
+
+    def _handle_projection_control(self, operation: str) -> None:
+        authority = self.thermal_action_authority
+        if (
+            not self.thermal_action_control_enabled
+            or authority is None
+            or not self.strict_projection_control
+        ):
+            self._send_json(404, {"error": {"message": "not found"}})
+            return
+        try:
+            payload = self._read_control_payload()
+            envelope = authority.authorize_control(operation, payload)
+        except ValueError:
+            self._send_error(400, "invalid projection control body", "invalid_request")
+            return
+        except ThermalActionControlError as exc:
+            status = 400 if exc.code == "invalid_request" else 409
+            self._send_error(
+                status,
+                "projection control does not match root authority",
+                "invalid_request" if status == 400 else "conflict",
+                error_fields={"code": "projection_control_mismatch"},
+            )
+            return
+        try:
+            if operation == "quiesce":
+                phase = self.manager.projection_quiesce(envelope)
+            else:
+                phase = self.manager.projection_activate(envelope)
+            refreshed = authority.authorize_control(operation, payload)
+            if refreshed != envelope:
+                raise ThermalActionControlError("mismatch")
+        except ThermalActionControlError:
+            self._send_error(
+                409,
+                "projection changed during control transition",
+                "conflict",
+                error_fields={"code": "projection_control_mismatch"},
+            )
+            return
+        except (WakeError, OSError, TimeoutError, socket.timeout):
+            self._send_error(
+                503,
+                "projection lifecycle coordination is unavailable",
+                "service_unavailable",
+                {"Retry-After": "1"},
+                {"code": "projection_control_unavailable"},
+            )
+            return
+        assert isinstance(payload, dict)
+        result_field = "quiesced" if operation == "quiesce" else "activated"
+        response = {
+            **payload,
+            "proxy_instance_id": self.manager.proxy_instance_id,
+            "lifecycle_phase": phase,
+            result_field: True,
+        }
+        if operation == "activate":
+            activation_token = self.manager.projection_activation_token
+            if activation_token is None:
+                self._send_error(
+                    503,
+                    "projection activation token is unavailable",
+                    "service_unavailable",
+                    {"Retry-After": "1"},
+                    {"code": "projection_control_unavailable"},
+                )
+                return
+            response["activation_token"] = activation_token
+        self._send_canonical_json(200, response)
+
     def _handle_thermal_action(self, operation: str) -> None:
         authority = self.thermal_action_authority
         if not self.thermal_action_control_enabled or authority is None:
@@ -358,7 +483,21 @@ class SleeperProxyHandler(BaseHTTPRequestHandler):
             self._send_error(400, "invalid thermal action body", "invalid_request")
             return
         try:
+            if self.strict_projection_control and (
+                not isinstance(payload, dict) or set(payload) != REQUEST_KEYS
+            ):
+                raise ThermalActionControlError("invalid_request")
             action = authority.authorize(operation, payload)
+            if self.strict_projection_control:
+                self.manager.require_projection_action(action)
+        except WakeError:
+            self._send_error(
+                409,
+                "thermal action publication is not adopted",
+                "conflict",
+                error_fields={"code": "thermal_action_mismatch"},
+            )
+            return
         except ThermalActionControlError as exc:
             if exc.code == "invalid_request":
                 self._send_error(
@@ -378,6 +517,11 @@ class SleeperProxyHandler(BaseHTTPRequestHandler):
 
         def reauthorize() -> None:
             refreshed = authority.authorize(operation, payload)
+            if self.strict_projection_control:
+                try:
+                    self.manager.require_projection_action(refreshed)
+                except WakeError as exc:
+                    raise ThermalActionControlError("mismatch") from exc
             if refreshed != action:
                 raise ThermalActionControlError("mismatch")
 
@@ -408,6 +552,15 @@ class SleeperProxyHandler(BaseHTTPRequestHandler):
                 "engine_keys": list(action.engine_keys),
                 "proof_engine_keys": list(action.proof_engine_keys),
             }
+            if self.strict_projection_control:
+                common.update({
+                    "publication_sequence": action.publication_sequence,
+                    "publication_id": action.publication_id,
+                    "target_store_revision": action.target_store_revision,
+                    "target_authority_sha256": action.target_authority_sha256,
+                    "proxy_instance_id": action.proxy_instance_id,
+                    "activation_token": action.activation_token,
+                })
             proof_started_at_epoch = (
                 time.time()
                 if operation in {"sleeping_subset_proof", "repair_peer_proof"}
@@ -540,6 +693,20 @@ class SleeperProxyHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(encoded)
 
+    def _send_canonical_json(self, status: int, payload: object) -> None:
+        encoded = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+        self.send_response(status)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
     def _send_json(self, status: int, payload: object) -> None:
         encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
         self.send_response(status)
@@ -561,7 +728,14 @@ def build_server(
     # Reconcile before ThreadingHTTPServer binds its listening socket. If any
     # engine cannot be verified asleep, startup fails closed and no request can
     # observe an incorrect active_model=None state.
-    if not manager.bootstrap_mode:
+    strict_projection_control = (
+        thermal_action_control_enabled
+        and thermal_action_authority is not None
+        and not thermal_action_authority.legacy_projection_configured()
+    )
+    if strict_projection_control:
+        manager.configure_projection_control(True)
+    elif not manager.bootstrap_mode:
         manager.reconcile_startup_state()
 
     class Handler(SleeperProxyHandler):
@@ -571,6 +745,7 @@ def build_server(
     Handler.max_request_body_bytes = max_request_body_bytes
     Handler.thermal_action_control_enabled = thermal_action_control_enabled
     Handler.thermal_action_authority = thermal_action_authority
+    Handler.strict_projection_control = strict_projection_control
     return ThreadingHTTPServer((host, port), Handler)
 
 
@@ -590,9 +765,17 @@ def main(argv: Iterable[str] | None = None) -> int:
         raise RuntimeError(
             "thermal action control requires SLEEPER_THERMAL_ACTION_STATUS_PATH"
         )
+    thermal_action_identity = (
+        _thermal_authority_identity_from_env() if thermal_action_enabled else None
+    )
     thermal_action_authority = (
-        FileThermalActionAuthority(Path(thermal_action_path))
-        if thermal_action_enabled and thermal_action_path
+        FileThermalActionAuthority(
+            Path(thermal_action_path),
+            expected_uid=thermal_action_identity[0],
+            expected_mode=thermal_action_identity[1],
+            allow_legacy=False,
+        )
+        if thermal_action_enabled and thermal_action_path and thermal_action_identity
         else None
     )
     models = load_models_from_env()
