@@ -27,7 +27,7 @@ class LifecycleUnavailableError(WakeError):
 
 
 @contextmanager
-def startup_lease(path: str) -> Iterator[None]:
+def startup_lease(path: str, *, timeout_s: float | None = None) -> Iterator[None]:
     """Hold an OS lease across model startup and readiness validation.
 
     The lock is released automatically if the proxy process crashes. Deployments
@@ -38,7 +38,21 @@ def startup_lease(path: str) -> Iterator[None]:
     if parent:
         os.makedirs(parent, exist_ok=True)
     with open(path, "a+", encoding="utf-8") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        if timeout_s is None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        else:
+            if not math.isfinite(timeout_s) or timeout_s <= 0:
+                raise TimeoutError("startup lease deadline expired")
+            deadline = time.monotonic() + timeout_s
+            while True:
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("startup lease deadline expired")
+                    time.sleep(min(0.01, remaining))
         handle.seek(0)
         handle.truncate()
         handle.write(f"pid={os.getpid()}\n")
@@ -119,6 +133,7 @@ class ModelManager:
         self.bootstrap_mode = bootstrap_mode
         self._startup_finalized = not bootstrap_mode
         self._condition = threading.Condition()
+        self._sleep_operation_lock = threading.Lock()
         self._active_model_name: str | None = None
         self._starting_model_name: str | None = None
         self._active_model_ready = False
@@ -394,16 +409,62 @@ class ModelManager:
             self._inflight_requests += 1
         return ModelLease(self, target)
 
-    def sleep_active_model(self) -> str | None:
+    def sleep_active_model(self, *, drain_timeout_s: float | None = None) -> str | None:
         """Quiesce new requests, drain ownership, and sleep the active model.
 
         Local request state is acquired before the host-wide lease. This keeps
         lock ordering identical to startup and avoids a condition/lease
-        deadlock when another proxy instance is starting a model.
+        deadlock when another proxy instance is starting a model. An optional
+        per-call drain bound may only tighten the configured timeout. Its
+        deadline includes condition-lock contention and never starts a delayed
+        sleep after expiry.
         """
 
-        with self._condition:
-            deadline = time.monotonic() + self.drain_timeout_s
+        bounded = drain_timeout_s is not None
+        if bounded:
+            if (
+                not isinstance(drain_timeout_s, (int, float))
+                or isinstance(drain_timeout_s, bool)
+                or not math.isfinite(float(drain_timeout_s))
+                or float(drain_timeout_s) <= 0
+            ):
+                raise ValueError("drain_timeout_s must be finite and greater than zero")
+            drain_budget = min(float(drain_timeout_s), self.drain_timeout_s)
+        else:
+            drain_budget = self.drain_timeout_s
+        deadline = time.monotonic() + drain_budget
+
+        remaining = deadline - time.monotonic()
+        acquired_sleep_operation = (
+            remaining > 0
+            and self._sleep_operation_lock.acquire(timeout=remaining)
+            if bounded
+            else self._sleep_operation_lock.acquire()
+        )
+        if not acquired_sleep_operation:
+            raise WakeError("timed out waiting for concurrent sleep operation")
+        try:
+            return self._sleep_active_model_serialized(
+                deadline=deadline,
+                bounded=bounded,
+            )
+        finally:
+            self._sleep_operation_lock.release()
+
+    def _sleep_active_model_serialized(
+        self,
+        *,
+        deadline: float,
+        bounded: bool,
+    ) -> str | None:
+        if bounded:
+            remaining = deadline - time.monotonic()
+            acquired = remaining > 0 and self._condition.acquire(timeout=remaining)
+            if not acquired:
+                raise WakeError("timed out acquiring lifecycle state before resource backoff")
+        else:
+            self._condition.acquire()
+        try:
             self._quiescing = True
             try:
                 while self._inflight_requests > 0:
@@ -411,14 +472,27 @@ class ModelManager:
                     if remaining <= 0:
                         raise WakeError("timed out draining requests before resource backoff")
                     self._condition.wait(timeout=remaining)
+                if bounded and time.monotonic() >= deadline:
+                    raise WakeError("timed out draining requests before resource backoff")
                 if self._active_model_name is None:
                     try:
-                        deadline = time.monotonic() + self.owner_validation_timeout_s
-                        with startup_lease(self.startup_lease_path):
+                        validation_deadline = (
+                            deadline if bounded
+                            else time.monotonic() + self.owner_validation_timeout_s
+                        )
+                        lease_timeout = (
+                            max(0.0, deadline - time.monotonic())
+                            if bounded else None
+                        )
+                        with startup_lease(
+                            self.startup_lease_path, timeout_s=lease_timeout
+                        ):
                             states = [
                                 self._is_sleeping(
                                     model,
-                                    timeout_s=self._remaining_owner_validation_timeout(deadline),
+                                    timeout_s=self._remaining_owner_validation_timeout(
+                                        validation_deadline
+                                    ),
                                 )
                                 for model in self.models
                             ]
@@ -446,21 +520,42 @@ class ModelManager:
                 self._quiescing = False
                 self._condition.notify_all()
                 raise
+        finally:
+            self._condition.release()
 
         try:
             self._publish_transition("sleeping", current.name)
-            with startup_lease(self.startup_lease_path):
+            lease_timeout = (
+                max(0.0, deadline - time.monotonic()) if bounded else None
+            )
+            with startup_lease(
+                self.startup_lease_path, timeout_s=lease_timeout
+            ):
+                validation_timeout = (
+                    self._remaining_owner_validation_timeout(deadline)
+                    if bounded else self.owner_validation_timeout_s
+                )
                 sleeping = self._is_sleeping(
                     current,
-                    timeout_s=self.owner_validation_timeout_s,
+                    timeout_s=validation_timeout,
                 )
                 if sleeping is None:
                     raise LifecycleUnavailableError(
                         f"lifecycle state unavailable for {current.name}; retry later"
                     )
                 if sleeping is False:
-                    self._sleep(current)
-                    self._wait_until_sleeping(current)
+                    mutation_timeout = (
+                        self._remaining_owner_validation_timeout(deadline)
+                        if bounded else self.request_timeout_s
+                    )
+                    self._sleep(current, timeout_s=mutation_timeout)
+                    convergence_timeout = (
+                        self._remaining_owner_validation_timeout(deadline)
+                        if bounded else self.wake_timeout_s
+                    )
+                    self._wait_until_sleeping(
+                        current, timeout_s=convergence_timeout
+                    )
         except Exception as exc:
             with self._condition:
                 self._mark_lifecycle_unknown_locked(current)
@@ -545,6 +640,23 @@ class ModelManager:
             raise error
         raise error from cause
 
+    def _raise_lifecycle_demand_locked(
+        self,
+        owner: ModelConfig,
+        requested_name: str,
+        cause: Exception | None = None,
+    ) -> None:
+        """Preserve cached ownership but publish ordinary client demand."""
+        self._active_model_ready = False
+        self._lifecycle_state = "demand"
+        self._publish_transition("demand", requested_name)
+        error = LifecycleUnavailableError(
+            f"lifecycle state unavailable for {owner.name}; retry later"
+        )
+        if cause is None:
+            raise error
+        raise error from cause
+
     @staticmethod
     def _remaining_owner_validation_timeout(deadline: float) -> float:
         remaining = deadline - time.monotonic()
@@ -567,9 +679,9 @@ class ModelManager:
                 timeout_s=self._remaining_owner_validation_timeout(deadline),
             )
         except (ConnectionError, OSError, TimeoutError, TypeError, ValueError, WakeError) as exc:
-            self._raise_lifecycle_unavailable_locked(owner, exc)
+            self._raise_lifecycle_demand_locked(owner, owner.name, exc)
         if sleeping is None:
-            self._raise_lifecycle_unavailable_locked(owner)
+            self._raise_lifecycle_demand_locked(owner, owner.name)
         if sleeping is True:
             self._clear_owner_locked()
             return False
@@ -582,18 +694,18 @@ class ModelManager:
                     timeout_s=self._remaining_owner_validation_timeout(deadline),
                 )
             except (ConnectionError, OSError, TimeoutError, TypeError, ValueError, WakeError) as exc:
-                self._raise_lifecycle_unavailable_locked(owner, exc)
+                self._raise_lifecycle_demand_locked(owner, owner.name, exc)
             if peer_sleeping is not True:
-                self._raise_lifecycle_unavailable_locked(owner)
+                self._raise_lifecycle_demand_locked(owner, owner.name)
         try:
             listed = self._model_is_listed_once(
                 owner,
                 timeout_s=self._remaining_owner_validation_timeout(deadline),
             )
         except (ConnectionError, OSError, TimeoutError, TypeError, ValueError, WakeError) as exc:
-            self._raise_lifecycle_unavailable_locked(owner, exc)
+            self._raise_lifecycle_demand_locked(owner, owner.name, exc)
         if not listed:
-            self._raise_lifecycle_unavailable_locked(owner)
+            self._raise_lifecycle_demand_locked(owner, owner.name)
         self._active_model_ready = True
         self._lifecycle_state = "active"
         self._publish_transition("ready", owner.name)
@@ -627,12 +739,18 @@ class ModelManager:
             owner_name = self._active_model_name
             if owner_name is None:
                 self._active_model_ready = False
-                self._lifecycle_state = "unknown"
-                self._publish_transition("unknown")
+                # Preserve the requested model only as an ordinary lifecycle
+                # demand signal. Root reconciliation may restore the guarded
+                # sleeping lineup after a client request; this is not a
+                # thermal action target or permission to bypass admission.
+                self._lifecycle_state = "demand"
+                self._publish_transition("demand", target.name)
             else:
                 owner = self.find_model(owner_name)
                 if owner.name != target.name:
-                    self._raise_lifecycle_unavailable_locked(owner, exc)
+                    self._raise_lifecycle_demand_locked(
+                        owner, target.name, exc
+                    )
                 try:
                     sleeping = self._is_sleeping(
                         owner,
@@ -642,15 +760,21 @@ class ModelManager:
                         self._sleep(owner)
                         self._wait_until_sleeping(owner)
                         sleeping = True
-                except (ConnectionError, OSError, TimeoutError, TypeError, ValueError, WakeError) as cleanup_exc:
-                    self._raise_lifecycle_unavailable_locked(owner, cleanup_exc)
+                except (ConnectionError, OSError, TimeoutError, TypeError, ValueError, WakeError):
+                    self._active_model_ready = False
+                    self._lifecycle_state = "demand"
+                    self._publish_transition("demand", target.name)
+                    raise exc
                 if sleeping is not True:
-                    self._raise_lifecycle_unavailable_locked(owner, exc)
+                    self._active_model_ready = False
+                    self._lifecycle_state = "demand"
+                    self._publish_transition("demand", target.name)
+                    raise exc
                 self._clear_owner_locked()
             raise
         finally:
             self._starting_model_name = None
-            if self._lifecycle_state != "unknown":
+            if self._lifecycle_state not in {"unknown", "demand"}:
                 self._publish_transition(
                     "ready" if self._active_model_ready else "idle",
                     self._active_model_name,
@@ -723,12 +847,17 @@ class ModelManager:
 
         return target
 
-    def _sleep(self, model: ModelConfig) -> None:
+    def _sleep(
+        self,
+        model: ModelConfig,
+        *,
+        timeout_s: float | None = None,
+    ) -> None:
         query = urlencode({"level": str(self.sleep_level)})
         resp = self.http.request(
             "POST",
             f"{model.control_base_url}/sleep?{query}",
-            timeout=self.request_timeout_s,
+            timeout=self.request_timeout_s if timeout_s is None else timeout_s,
         )
         if resp.status >= 400:
             raise WakeError(f"sleep failed for {model.name}: HTTP {resp.status}: {resp.body[:300]!r}")
@@ -809,16 +938,25 @@ class ModelManager:
                     return value
         return None
 
-    def _wait_until_sleeping(self, model: ModelConfig) -> None:
-        def sleeping() -> bool:
-            return self._is_sleeping(model) is True
-
-        if not sleep_until(
-            sleeping,
-            timeout_s=self.wake_timeout_s,
-            interval_s=self.poll_interval_s,
-        ):
-            raise WakeError(f"timed out waiting for {model.name} to enter sleep state")
+    def _wait_until_sleeping(
+        self,
+        model: ModelConfig,
+        *,
+        timeout_s: float | None = None,
+    ) -> None:
+        budget = self.wake_timeout_s if timeout_s is None else timeout_s
+        deadline = time.monotonic() + budget
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            if self._is_sleeping(
+                model,
+                timeout_s=min(self.request_timeout_s, remaining),
+            ) is True:
+                return
+            time.sleep(min(self.poll_interval_s, max(0.0, deadline - time.monotonic())))
+        raise WakeError(f"timed out waiting for {model.name} to enter sleep state")
 
     def _wait_until_not_sleeping(self, model: ModelConfig) -> None:
         def ready() -> bool:

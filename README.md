@@ -131,8 +131,21 @@ GBrain embedding Compose integration:
   reports startup, lifecycle readiness, selected/starting model, and sanitized
   thermal phase/action fields without waiting for a lifecycle lease.
   The schema-v1 root watchdog and memory-pressure monitor may continue using
-  the existing bodyless loopback `POST /sleep`. No action-scoped thermal
-  control endpoint is part of the compact production design.
+  the existing bodyless loopback `POST /sleep`. The optional single
+  `X-Sleeper-Drain-Timeout-Ms` header accepts an unsigned value from 1 through
+  300000 and may only tighten the configured drain bound; malformed or
+  duplicate values fail with HTTP 400 before lifecycle work. The bound includes
+  concurrent-sleep serialization, condition-lock and startup-lease contention,
+  the sleep request, and positive sleep convergence. One timed-out caller cannot
+  clear another caller's quiesce state or leave a delayed sleep after expiry. No
+  action-scoped thermal control endpoint is part of the compact production
+  design.
+  If a client selects a stopped engine after a released root hold, including a
+  model retained as the Proxy's cached owner, the failed guarded acquisition
+  publishes a short-lived ordinary lifecycle `demand`
+  transition. Root reconciliation may then restore the full required lineup to
+  level-2 sleep. It never treats that transition as a thermal target, claim, or
+  admission bypass; the retry uses the normal serialized wake path.
   The bundled memory monitor polls total-host `MemAvailable` and asks the
   proxy to quiesce and sleep the active model at the configured ceiling.
 * `services/gbrain-embeddings/` wires GBrain → LiteLLM → sleeper proxy → vLLM

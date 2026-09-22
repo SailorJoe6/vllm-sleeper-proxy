@@ -336,6 +336,65 @@ class ServerTests(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertEqual("Qwen3-Embedding-8B", payload["slept_model"])
 
+    def test_sleep_endpoint_accepts_tightening_only_drain_header(self) -> None:
+        self.post_json(
+            "/v1/embeddings",
+            {"model": "Qwen3-Embedding-8B", "input": "hello"},
+        )
+        request = Request(
+            f"{self.base_url}/sleep",
+            headers={"X-Sleeper-Drain-Timeout-Ms": "500"},
+            method="POST",
+        )
+        with patch.object(
+            self.manager,
+            "sleep_active_model",
+            wraps=self.manager.sleep_active_model,
+        ) as sleep:
+            with urlopen(request, timeout=2) as response:
+                self.assertEqual(200, response.status)
+                payload = json.loads(response.read())
+        self.assertTrue(payload["ok"])
+        sleep.assert_called_once_with(drain_timeout_s=0.5)
+
+    def test_sleep_endpoint_rejects_malformed_drain_header_before_lifecycle(self) -> None:
+        for value in ("0", "-1", "1.5", "abc", ""):
+            with self.subTest(value=value), patch.object(
+                self.manager, "sleep_active_model"
+            ) as sleep:
+                request = Request(
+                    f"{self.base_url}/sleep",
+                    headers={"X-Sleeper-Drain-Timeout-Ms": value},
+                    method="POST",
+                )
+                with self.assertRaises(HTTPError) as caught:
+                    urlopen(request, timeout=2)
+                self.assertEqual(400, caught.exception.code)
+                self.assertEqual(
+                    "invalid_request",
+                    json.loads(caught.exception.read())["error"]["type"],
+                )
+                sleep.assert_not_called()
+
+    def test_sleep_endpoint_rejects_duplicate_drain_header_before_lifecycle(self) -> None:
+        host, port = self.server.server_address
+        with patch.object(self.manager, "sleep_active_model") as sleep, socket.create_connection(
+            (host, port), timeout=2
+        ) as client:
+            client.sendall(
+                b"POST /sleep HTTP/1.1\r\n"
+                b"Host: localhost\r\n"
+                b"X-Sleeper-Drain-Timeout-Ms: 500\r\n"
+                b"X-Sleeper-Drain-Timeout-Ms: 400\r\n"
+                b"Connection: close\r\n\r\n"
+            )
+            response = b""
+            while chunk := client.recv(4096):
+                response += chunk
+        self.assertIn(b" 400 ", response.split(b"\r\n", 1)[0])
+        self.assertIn(b'"type":"invalid_request"', response)
+        sleep.assert_not_called()
+
     def test_server_does_not_bind_when_startup_reconciliation_fails(self) -> None:
         class FailedStartupManager(ModelManager):
             def reconcile_startup_state(self) -> None:
@@ -865,7 +924,7 @@ class ServerTests(unittest.TestCase):
         health = self.get_json("/healthz")
         self.assertTrue(health["ok"])
         self.assertFalse(health["ready"])
-        self.assertEqual(health["lifecycle_state"], "unknown")
+        self.assertEqual(health["lifecycle_state"], "demand")
         self.assertEqual(health["active_model"], "Qwen3-Embedding-8B")
         self.assertEqual(health["inflight_requests"], 0)
 

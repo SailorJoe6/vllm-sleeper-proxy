@@ -58,6 +58,31 @@ PROXIED_POST_PATHS = {
     "/v1/embeddings",
 }
 
+SLEEP_DRAIN_TIMEOUT_HEADER = "X-Sleeper-Drain-Timeout-Ms"
+MAX_SLEEP_DRAIN_TIMEOUT_MILLISECONDS = 300_000
+
+
+def parse_sleep_drain_timeout(headers) -> float | None:
+    """Decode one tightening-only bodyless /sleep drain bound."""
+    values = headers.get_all(SLEEP_DRAIN_TIMEOUT_HEADER)
+    if values is None:
+        return None
+    if len(values) != 1:
+        raise ValueError("sleep drain timeout header must appear exactly once")
+    raw = values[0]
+    if (
+        not isinstance(raw, str)
+        or not raw
+        or not raw.isascii()
+        or not raw.isdigit()
+        or len(raw) > 9
+    ):
+        raise ValueError("sleep drain timeout header must be unsigned milliseconds")
+    milliseconds = int(raw)
+    if not 1 <= milliseconds <= MAX_SLEEP_DRAIN_TIMEOUT_MILLISECONDS:
+        raise ValueError("sleep drain timeout header is outside the supported bound")
+    return milliseconds / 1000.0
+
 
 class SleeperProxyHandler(BaseHTTPRequestHandler):
     manager: ModelManager
@@ -143,7 +168,18 @@ class SleeperProxyHandler(BaseHTTPRequestHandler):
             return
         if path == "/sleep":
             try:
-                slept_model = self.manager.sleep_active_model()
+                drain_timeout = parse_sleep_drain_timeout(self.headers)
+            except ValueError as exc:
+                self._send_error(400, str(exc), "invalid_request")
+                return
+            try:
+                slept_model = (
+                    self.manager.sleep_active_model()
+                    if drain_timeout is None
+                    else self.manager.sleep_active_model(
+                        drain_timeout_s=drain_timeout
+                    )
+                )
             except WakeError as exc:
                 self._send_error(503, str(exc), "sleep_failed", {"retry-after": "10"})
                 return

@@ -10,7 +10,13 @@ from dataclasses import replace
 
 from vllm_sleeper_proxy.client import HttpResponse
 from vllm_sleeper_proxy.config import ModelConfig
-from vllm_sleeper_proxy.manager import ModelManager, UnknownModelError, WakeError, startup_lease
+from vllm_sleeper_proxy.manager import (
+    LifecycleUnavailableError,
+    ModelManager,
+    UnknownModelError,
+    WakeError,
+    startup_lease,
+)
 
 
 class FakeHttp:
@@ -432,6 +438,169 @@ class ModelManagerTests(unittest.TestCase):
         self.assertEqual(manager.active_model_name, "Qwen3-Embedding-8B")
         self.assertEqual(manager.lifecycle_state, "unknown")
         self.assertFalse(any("/sleep?" in url for _, url, _ in http.calls))
+
+    def test_bounded_sleep_drain_timeout_emits_no_delayed_sleep(self) -> None:
+        http = FakeHttp()
+        manager = ModelManager(
+            [qwen_model()], http, poll_interval_s=0,
+            wake_timeout_s=1, drain_timeout_s=30,
+        )
+        lease = manager.acquire("Qwen3-Embedding-8B")
+        sleep_posts_before = sum("/sleep?" in url for _, url, _ in http.calls)
+
+        started = time.monotonic()
+        with self.assertRaisesRegex(WakeError, "timed out draining requests"):
+            manager.sleep_active_model(drain_timeout_s=0.02)
+        self.assertLess(time.monotonic() - started, 0.2)
+        self.assertFalse(manager._quiescing)
+
+        lease.release()
+        time.sleep(0.03)
+        self.assertEqual(
+            sleep_posts_before,
+            sum("/sleep?" in url for _, url, _ in http.calls),
+        )
+
+    def test_bounded_sleep_deadline_includes_sleep_convergence(self) -> None:
+        class NeverConvergesHttp(FakeHttp):
+            def request(self, method, url, *, headers=None, body=None, timeout=None):
+                if "/sleep?" in url:
+                    self.calls.append((method, url, body))
+                    return HttpResponse(200, {}, b"{}")
+                return super().request(
+                    method, url, headers=headers, body=body, timeout=timeout
+                )
+
+        http = NeverConvergesHttp()
+        manager = ModelManager(
+            [qwen_model()], http, poll_interval_s=0.001,
+            wake_timeout_s=1, drain_timeout_s=30,
+        )
+        manager.acquire("Qwen3-Embedding-8B").release()
+        started = time.monotonic()
+        with self.assertRaisesRegex(WakeError, "lifecycle state unavailable"):
+            manager.sleep_active_model(drain_timeout_s=0.03)
+        self.assertLess(time.monotonic() - started, 0.2)
+        self.assertFalse(manager._quiescing)
+        self.assertEqual(1, sum("/sleep?" in url for _, url, _ in http.calls))
+
+    def test_bounded_sleep_drain_deadline_includes_condition_contention(self) -> None:
+        http = FakeHttp()
+        manager = ModelManager([qwen_model()], http, drain_timeout_s=30)
+        locked = threading.Event()
+        release = threading.Event()
+
+        def hold_condition() -> None:
+            with manager._condition:
+                locked.set()
+                release.wait(timeout=1)
+
+        holder = threading.Thread(target=hold_condition)
+        holder.start()
+        self.assertTrue(locked.wait(timeout=1))
+        started = time.monotonic()
+        try:
+            with self.assertRaisesRegex(WakeError, "timed out acquiring lifecycle state"):
+                manager.sleep_active_model(drain_timeout_s=0.02)
+        finally:
+            release.set()
+            holder.join(timeout=1)
+        self.assertLess(time.monotonic() - started, 0.2)
+        self.assertFalse(any("/sleep?" in url for _, url, _ in http.calls))
+        self.assertFalse(manager._quiescing)
+
+    def test_bounded_sleep_drain_deadline_includes_startup_lease_contention(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            lease_path = str(Path(directory) / "startup.lock")
+            http = FakeHttp()
+            manager = ModelManager(
+                [qwen_model()],
+                http,
+                poll_interval_s=0,
+                wake_timeout_s=1,
+                drain_timeout_s=30,
+                startup_lease_path=lease_path,
+            )
+            lease = manager.acquire("Qwen3-Embedding-8B")
+            lease.release()
+            errors: list[Exception] = []
+
+            def bounded_sleep() -> None:
+                try:
+                    manager.sleep_active_model(drain_timeout_s=0.02)
+                except Exception as exc:
+                    errors.append(exc)
+
+            with startup_lease(lease_path):
+                thread = threading.Thread(target=bounded_sleep)
+                thread.start()
+                thread.join(timeout=0.2)
+                finished_while_contended = not thread.is_alive()
+            thread.join(timeout=1)
+            self.assertTrue(finished_while_contended)
+            self.assertEqual(1, len(errors))
+            self.assertIsInstance(errors[0], WakeError)
+            self.assertFalse(any("/sleep?" in url for _, url, _ in http.calls))
+            self.assertFalse(manager._quiescing)
+
+    def test_concurrent_bounded_sleep_cannot_clear_another_sleepers_quiesce(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            lease_path = str(Path(directory) / "startup.lock")
+            http = FakeHttp()
+            manager = ModelManager(
+                [qwen_model()],
+                http,
+                poll_interval_s=0,
+                wake_timeout_s=1,
+                drain_timeout_s=1,
+                startup_lease_path=lease_path,
+            )
+            manager.acquire("Qwen3-Embedding-8B").release()
+            long_errors: list[Exception] = []
+
+            def long_sleep() -> None:
+                try:
+                    manager.sleep_active_model(drain_timeout_s=0.3)
+                except Exception as exc:
+                    long_errors.append(exc)
+
+            with startup_lease(lease_path):
+                thread = threading.Thread(target=long_sleep)
+                thread.start()
+                deadline = time.monotonic() + 0.2
+                while not manager._quiescing and time.monotonic() < deadline:
+                    time.sleep(0.001)
+                self.assertTrue(manager._quiescing)
+                with self.assertRaisesRegex(
+                    WakeError, "concurrent sleep operation"
+                ):
+                    manager.sleep_active_model(drain_timeout_s=0.02)
+                self.assertTrue(manager._quiescing)
+                self.assertEqual(0, manager.inflight_requests)
+            thread.join(timeout=1)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual([], long_errors)
+            self.assertFalse(manager._quiescing)
+
+    def test_bounded_sleep_drain_override_only_tightens_configured_timeout(self) -> None:
+        http = FakeHttp()
+        manager = ModelManager(
+            [qwen_model()], http, poll_interval_s=0,
+            wake_timeout_s=1, drain_timeout_s=0.02,
+        )
+        lease = manager.acquire("Qwen3-Embedding-8B")
+        started = time.monotonic()
+        with self.assertRaisesRegex(WakeError, "timed out draining requests"):
+            manager.sleep_active_model(drain_timeout_s=30)
+        self.assertLess(time.monotonic() - started, 0.2)
+        lease.release()
+
+    def test_bounded_sleep_drain_override_must_be_finite_and_positive(self) -> None:
+        manager = ModelManager([qwen_model()], FakeHttp())
+        for value in (0, -1, float("nan"), float("inf")):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "finite and greater than zero"):
+                    manager.sleep_active_model(drain_timeout_s=value)
 
     def test_thermal_sleep_drains_active_lease_and_denies_late_request(self) -> None:
         http = FakeHttp()
@@ -889,7 +1058,7 @@ class ModelManagerTests(unittest.TestCase):
             manager.acquire("Qwen3-Embedding-8B")
 
         self.assertEqual(manager.active_model_name, "Qwen3-Embedding-8B")
-        self.assertEqual(manager.lifecycle_state, "unknown")
+        self.assertEqual(manager.lifecycle_state, "demand")
         self.assertFalse(manager.inference_ready)
         self.assertEqual(manager.inflight_requests, 0)
         self.assertGreater(http.timeouts[-1], 0)
@@ -920,7 +1089,7 @@ class ModelManagerTests(unittest.TestCase):
                 ]
                 self.assertEqual(mutation_urls, [])
                 self.assertEqual(manager.active_model_name, "Qwen3-Embedding-8B")
-                self.assertEqual(manager.lifecycle_state, "unknown")
+                self.assertEqual(manager.lifecycle_state, "demand")
 
     def test_unknown_owner_recovers_only_when_every_peer_is_sleeping(self) -> None:
         http = PerModelSleepHttp({"embedding": False, "vision": True})
@@ -998,7 +1167,7 @@ class ModelManagerTests(unittest.TestCase):
         retry_urls = [url for _, url, _ in http.calls[call_count:]]
         self.assertFalse(any(url.startswith("http://vision") and "/wake_up" in url for url in retry_urls))
         self.assertEqual(manager.active_model_name, "Qwen3-Embedding-8B")
-        self.assertEqual(manager.lifecycle_state, "unknown")
+        self.assertEqual(manager.lifecycle_state, "demand")
 
     def test_partial_wake_failure_is_slept_before_another_model_wakes(self) -> None:
         class FailVisionReadinessOnce(SwitchingHttp):
@@ -1040,6 +1209,55 @@ class ModelManagerTests(unittest.TestCase):
         retry_urls = [url for _, url, _ in http.calls[before_retry:]]
         self.assertIn("http://vision:8000/sleep?level=2", all_urls)
         self.assertIn("http://vllm:8888/wake_up?tags=weights", retry_urls)
+
+
+    def test_vanished_cached_owner_publishes_client_demand(self):
+        with tempfile.TemporaryDirectory() as directory:
+            transition = Path(directory) / "transition.json"
+            http = VanishingOwnerHttp()
+            manager = ModelManager(
+                [qwen_model()],
+                http,
+                poll_interval_s=0,
+                wake_timeout_s=1,
+                owner_validation_timeout_s=0.05,
+                startup_lease_path=str(Path(directory) / "startup.lock"),
+                transition_state_path=str(transition),
+            )
+            manager.acquire("Qwen3-Embedding-8B").release()
+            http.owner_unreachable = True
+            with self.assertRaises(LifecycleUnavailableError):
+                manager.acquire("Qwen3-Embedding-8B")
+            value = json.loads(transition.read_text(encoding="utf-8"))
+            self.assertEqual("demand", value["phase"])
+            self.assertEqual("Qwen3-Embedding-8B", value["model"])
+            self.assertEqual("Qwen3-Embedding-8B", manager.active_model_name)
+
+    def test_unreachable_requested_engine_publishes_bounded_demand_signal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            transition = Path(directory) / "transition.json"
+            lease = Path(directory) / "startup.lock"
+            class UnreachableTarget(PerModelSleepHttp):
+                def request(self, method, url, **kwargs):
+                    if "wake_up" in url or url.endswith("/v1/models"):
+                        raise ConnectionError("requested engine is stopped")
+                    return super().request(method, url, **kwargs)
+
+            manager = ModelManager(
+                [qwen_model()],
+                UnreachableTarget({"embedding": None}),
+                poll_interval_s=0,
+                wake_timeout_s=0.01,
+                startup_lease_path=str(lease),
+                transition_state_path=str(transition),
+            )
+            with self.assertRaises(WakeError):
+                manager.acquire("Qwen3-Embedding-8B")
+            value = json.loads(transition.read_text(encoding="utf-8"))
+            self.assertEqual("demand", value["phase"])
+            self.assertEqual("Qwen3-Embedding-8B", value["model"])
+            self.assertIsInstance(value["pid"], int)
+            self.assertIsInstance(value["updated_at_epoch"], float)
 
 
 if __name__ == "__main__":
