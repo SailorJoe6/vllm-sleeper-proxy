@@ -78,8 +78,9 @@ restart loop. Health fields are nonblocking observational snapshots so a long
 wake or startup-lease wait cannot fail the control-plane health probe. Positive
 sleeping evidence makes repeated sleep idempotent; the
 supported host lifecycle path owns stopped-engine repair. Thermal recovery does
-not remember or preemptively resume the prior model; a normal client retry wakes
-its requested model after safe all-sleeping release.
+not remember or preemptively resume the prior model. After the fence is safely
+released with every engine positively sleeping or stopped, a normal client retry
+uses the ordinary guarded lifecycle path for its requested model.
 
 `SLEEPER_OWNER_VALIDATION_TIMEOUT_SECONDS` is a finite positive wall-clock
 budget for the complete owner, peer, and readiness validation sequence. It
@@ -116,8 +117,9 @@ GBrain embedding Compose integration:
   `error.code=thermal_protection_active`. Optional models also reject missing,
   stale, or malformed projections. The fast thermal projection owns thermal
   denial for required models, so a slower resource snapshot cannot extend a
-  cleared thermal warning. Existing leases may drain; action-scoped thermal
-  sleep quiesces later acquisitions. LiteLLM keeps retries disabled and
+  cleared thermal warning. Existing leases may drain; the root watchdog may use
+  the retained bodyless level-2 `POST /sleep` for a positively awake engine.
+  LiteLLM keeps retries disabled and
   preserves this response; no additional LAN-edge thermal proxy is required.
   The consumer does not own deployment thresholds or positive-danger
   provenance. The denial body uses a constant public message with
@@ -128,39 +130,9 @@ GBrain embedding Compose integration:
   `inference_available=false` distinguish the fenced request plane. It also
   reports startup, lifecycle readiness, selected/starting model, and sanitized
   thermal phase/action fields without waiting for a lifecycle lease.
-  The schema-v1 admission latch, root watchdog, and memory-pressure caller remain
-  unchanged, including bodyless loopback `POST /sleep`. The separate dormant
-  action-authority contract is strict schema v2. `/thermal/actions/hold`,
-  `/thermal/actions/sleeping-subset-proof`, `/thermal/actions/repair-peer-proof`,
-  `/thermal/actions/repair-converge`, and `/thermal/actions/release` remain
-  absent unless both
-  `SLEEPER_THERMAL_ACTION_CONTROL_ENABLED=1` and
-  `SLEEPER_THERMAL_ACTION_STATUS_PATH` are configured. Every request and response
-  binds record revision, incident/action/generation/predecessor lineage,
-  transition kind, phase revision, containment level, kind-specific deadlines,
-  recovery authority, and the exact configured engine set; schema v1 action
-  requests are rejected rather than downgraded. `hold` accepts graceful, urgent,
-  or held work only inside the immutable containment window, serializes on the
-  shared lease, rejects non-level-2 sleep, and returns exact positive all-engine
-  proof. Held authority may also expose the dedicated
-  `/thermal/actions/sleeping-subset-proof` operation. Root binds its exact sorted
-  retained-sleeping subset beside the full configured engine set. Proxy probes
-  only that subset under the action lock, lifecycle condition, and shared startup
-  lease, repeatedly reauthorizes the root projection, and returns conservative
-  proof start/completion times within one two-second budget. It never contacts a
-  stopped peer or sleeps, wakes, selects, repairs, persists, or clears ownership.
-  During a durable repair, `repair-peer-proof` accepts only the exact current
-  `starting` target and proves only its projected non-target sleeping peers within
-  the same two-second budget. `repair-converge` accepts only the exact current
-  `converging` target and immutable target deadline. It contacts only that target,
-  requires level-2 sleep, treats positive sleeping evidence as idempotent success,
-  otherwise requires positive awake evidence before one sleep request, and succeeds
-  only after positive sleeping proof. Both repeatedly reauthorize and never wake,
-  select an owner, mutate Docker or root state, clear the fence, or authorize final
-  release. `release` accepts ordinary release or `cutoff_recovery_authorized` authority and
-  remains the distinct all-engine proof-only final gate. Building this code does
-  not activate any action route. Deployment must enable them only with the matching root migration and a
-  tested local-only binding; action IDs are correlation values, not credentials.
+  The schema-v1 root watchdog and memory-pressure monitor may continue using
+  the existing bodyless loopback `POST /sleep`. No action-scoped thermal
+  control endpoint is part of the compact production design.
   The bundled memory monitor polls total-host `MemAvailable` and asks the
   proxy to quiesce and sleep the active model at the configured ceiling.
 * `services/gbrain-embeddings/` wires GBrain → LiteLLM → sleeper proxy → vLLM
@@ -186,30 +158,6 @@ GBrain embedding Compose integration:
 | `POST /v1/embeddings` | OpenAI-compatible JSON | Buffered upstream response |
 | `POST /v1/chat/completions` | OpenAI-compatible text or inline multimodal JSON | Buffered JSON, or SSE when `"stream": true` |
 | `POST /sleep` | Empty body | Quiesces new inference, drains ownership, then sleeps the active model |
-| `POST /thermal/actions/hold` | Exact schema-v2 generation/revision/deadline/engine-set authority; disabled by default | Sleeps only as root-authorized and returns exact identity-bound all-engine positive proof |
-| `POST /thermal/actions/sleeping-subset-proof` | Exact held authority, full engine set, and root-derived retained-sleeping subset; disabled by default | Within two seconds, verifies only the exact subset without engine lifecycle or root-state mutation and never contacts stopped peers |
-| `POST /thermal/actions/repair-peer-proof` | Exact current `starting` target plus its root-projected non-target sleeping peers; disabled by default | Within two seconds, positively proves only the peers and never contacts or mutates the target |
-| `POST /thermal/actions/repair-converge` | Exact current `converging` target plus immutable target deadline; disabled by default | Contacts only the target, uses level-2 sleep when needed, and returns exact target-only sleeping proof |
-| `POST /thermal/actions/release` | Exact schema-v2 ordinary or cutoff-recovery proof authority; disabled by default | Verifies all engines sleeping without sleep, wake, selection, repair, or root-state mutation |
-| `POST /thermal/projection/quiesce` | Exact predecessor-linked zero-operation publication barrier; disabled by default | Gates normal and thermal lifecycle entry and acknowledges only after predecessor authority and transitions are quiescent |
-| `POST /thermal/projection/activate` | Exact linked active or inactive projection derived from the durable root target; disabled by default | Adopts the projection for this Proxy process and only then releases the logical lifecycle barrier |
-
-The dormant projection endpoints implement a two-phase publication barrier. A
-root record revision alone does not revoke an already-loaded Proxy authority.
-Root first publishes a non-actionable `quiescing` envelope and waits for an
-instance-bound acknowledgement after the Proxy has gated new lifecycle entry,
-serialized behind its action lock, drained old work, and crossed the shared
-startup lease. Root may then commit the successor, publish only from its exact
-durable envelope, and request activation. Quiescence is coordination evidence,
-not sleeping/stopped/readiness proof. Missing, stale, malformed, out-of-order,
-or ambiguous state stays fenced. A new Proxy process loses adoption and, when
-action control is enabled, binds control-only without generic engine
-reconciliation until a fresh same-revision rebind. Strict action calls additionally bind the
-process-instance ID plus an unpredictable token generated and disclosed only in the observed activation ACK,
-so an applied activation whose HTTP response is lost cannot authorize action;
-exact replay can recover only that successor. The independent schema-v1 fence
-remains authoritative until root has consumable activation evidence. The feature
-remains default-off and no current Compose file enables it.
 
 The proxy rewrites only the top-level `model` field. It does not transform
 `messages`, inline `data:` image URLs, generation parameters, or response
