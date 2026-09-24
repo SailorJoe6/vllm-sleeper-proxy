@@ -271,6 +271,28 @@ class ModelManager:
             return None
         return observer(self.models[0])
 
+    def urgent_drain_snapshot(self) -> dict[str, object] | None:
+        """Return one action-bound thermal/in-flight view without waiting.
+
+        The condition is the same lock that covers the second thermal admission
+        check and the in-flight increment. A health request therefore observes
+        either the admitted request count or the fence that denied it, never a
+        count sampled in the admission gap. Lock contention is reported as an
+        unavailable snapshot instead of delaying control-plane health.
+        """
+        if not self._condition.acquire(blocking=False):
+            return None
+        try:
+            thermal = self.thermal_admission_snapshot()
+            return {
+                "action_id": thermal.action_id if thermal is not None else None,
+                "fenced": bool(thermal is not None and thermal.fenced),
+                "control_healthy": self._startup_finalized,
+                "inflight_requests": self._inflight_requests,
+            }
+        finally:
+            self._condition.release()
+
     @property
     def starting_model_name(self) -> str | None:
         """Model that owns the startup lease until readiness is verified.
@@ -403,25 +425,54 @@ class ModelManager:
             if self.pre_admission_check is not None:
                 self.pre_admission_check(target)
             self._wait_for_switch_safety(target)
+            # A condition wait releases this lock. Recheck the fast fence after
+            # reacquisition so an atomic zero-inflight snapshot cannot be
+            # followed by a waiter admitted under an older fence state.
+            if self.pre_admission_check is not None:
+                self.pre_admission_check(target)
             if self.admission_check is not None:
                 self.admission_check(target)
             self._activate_locked(target)
             self._inflight_requests += 1
         return ModelLease(self, target)
 
-    def sleep_active_model(self, *, drain_timeout_s: float | None = None) -> str | None:
+    def sleep_active_model(
+        self,
+        *,
+        drain_timeout_s: float | None = None,
+        containment_timeout_s: float | None = None,
+        drain_deadline_epoch_ms: int | None = None,
+        containment_deadline_epoch_ms: int | None = None,
+    ) -> str | None:
         """Quiesce new requests, drain ownership, and sleep the active model.
 
-        Local request state is acquired before the host-wide lease. This keeps
-        lock ordering identical to startup and avoids a condition/lease
-        deadlock when another proxy instance is starting a model. An optional
-        per-call drain bound may only tighten the configured timeout. Its
-        deadline includes condition-lock contention and never starts a delayed
-        sleep after expiry.
+        Timeout arguments are relative bounds retained for compatibility. Epoch
+        deadline arguments form a mutually exclusive pair. Caller bounds only
+        tighten the configured whole-operation timeout. The monotonic clock is
+        sampled before wall time when mapping epoch deadlines, so handler delay
+        and clock-sampling delay cannot move either deadline later.
         """
 
-        bounded = drain_timeout_s is not None
-        if bounded:
+        relative_mode = drain_timeout_s is not None or containment_timeout_s is not None
+        absolute_mode = (
+            drain_deadline_epoch_ms is not None
+            or containment_deadline_epoch_ms is not None
+        )
+        if relative_mode and absolute_mode:
+            raise ValueError("sleep timeout and absolute deadline modes are mutually exclusive")
+        if containment_timeout_s is not None and drain_timeout_s is None:
+            raise ValueError("containment_timeout_s requires drain_timeout_s")
+        if absolute_mode and (
+            drain_deadline_epoch_ms is None
+            or containment_deadline_epoch_ms is None
+        ):
+            raise ValueError("absolute sleep deadlines must be supplied as a pair")
+
+        started_at = time.monotonic()
+        configured_deadline = started_at + self.drain_timeout_s
+        bounded = relative_mode or absolute_mode
+
+        if relative_mode:
             if (
                 not isinstance(drain_timeout_s, (int, float))
                 or isinstance(drain_timeout_s, bool)
@@ -429,12 +480,64 @@ class ModelManager:
                 or float(drain_timeout_s) <= 0
             ):
                 raise ValueError("drain_timeout_s must be finite and greater than zero")
-            drain_budget = min(float(drain_timeout_s), self.drain_timeout_s)
+            drain_timeout = float(drain_timeout_s)
+            if containment_timeout_s is not None:
+                if (
+                    not isinstance(containment_timeout_s, (int, float))
+                    or isinstance(containment_timeout_s, bool)
+                    or not math.isfinite(float(containment_timeout_s))
+                    or float(containment_timeout_s) <= 0
+                ):
+                    raise ValueError(
+                        "containment_timeout_s must be finite and greater than zero"
+                    )
+                containment_timeout = float(containment_timeout_s)
+                if containment_timeout < drain_timeout:
+                    raise ValueError(
+                        "containment_timeout_s must be greater than or equal to drain_timeout_s"
+                    )
+            else:
+                containment_timeout = drain_timeout
+            drain_deadline = min(started_at + drain_timeout, configured_deadline)
+            lifecycle_deadline = min(
+                started_at + containment_timeout, configured_deadline
+            )
+        elif absolute_mode:
+            for label, value in (
+                ("drain_deadline_epoch_ms", drain_deadline_epoch_ms),
+                ("containment_deadline_epoch_ms", containment_deadline_epoch_ms),
+            ):
+                if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                    raise ValueError(f"{label} must be a positive integer")
+            if containment_deadline_epoch_ms < drain_deadline_epoch_ms:
+                raise ValueError(
+                    "containment_deadline_epoch_ms must be greater than or equal to "
+                    "drain_deadline_epoch_ms"
+                )
+            # Keep the already-read monotonic sample as the anchor. Reading the
+            # exact wall-clock nanoseconds afterwards maps an integer epoch-ms
+            # boundary no later than its real monotonic instant. In particular,
+            # do not floor the observed wall clock to milliseconds: that would
+            # accidentally add up to one millisecond to the caller's deadline.
+            wall_time_ns = time.time_ns()
+            drain_deadline = min(
+                started_at
+                + (drain_deadline_epoch_ms * 1_000_000 - wall_time_ns) / 1e9,
+                configured_deadline,
+            )
+            lifecycle_deadline = min(
+                started_at
+                + (
+                    containment_deadline_epoch_ms * 1_000_000 - wall_time_ns
+                )
+                / 1e9,
+                configured_deadline,
+            )
         else:
-            drain_budget = self.drain_timeout_s
-        deadline = time.monotonic() + drain_budget
+            drain_deadline = configured_deadline
+            lifecycle_deadline = None
 
-        remaining = deadline - time.monotonic()
+        remaining = drain_deadline - time.monotonic()
         acquired_sleep_operation = (
             remaining > 0
             and self._sleep_operation_lock.acquire(timeout=remaining)
@@ -445,7 +548,8 @@ class ModelManager:
             raise WakeError("timed out waiting for concurrent sleep operation")
         try:
             return self._sleep_active_model_serialized(
-                deadline=deadline,
+                drain_deadline=drain_deadline,
+                lifecycle_deadline=lifecycle_deadline,
                 bounded=bounded,
             )
         finally:
@@ -454,11 +558,12 @@ class ModelManager:
     def _sleep_active_model_serialized(
         self,
         *,
-        deadline: float,
+        drain_deadline: float,
+        lifecycle_deadline: float | None,
         bounded: bool,
     ) -> str | None:
         if bounded:
-            remaining = deadline - time.monotonic()
+            remaining = drain_deadline - time.monotonic()
             acquired = remaining > 0 and self._condition.acquire(timeout=remaining)
             if not acquired:
                 raise WakeError("timed out acquiring lifecycle state before resource backoff")
@@ -468,21 +573,23 @@ class ModelManager:
             self._quiescing = True
             try:
                 while self._inflight_requests > 0:
-                    remaining = deadline - time.monotonic()
+                    remaining = drain_deadline - time.monotonic()
                     if remaining <= 0:
                         raise WakeError("timed out draining requests before resource backoff")
                     self._condition.wait(timeout=remaining)
-                if bounded and time.monotonic() >= deadline:
+                if bounded and time.monotonic() >= drain_deadline:
                     raise WakeError("timed out draining requests before resource backoff")
                 if self._active_model_name is None:
                     try:
                         validation_deadline = (
-                            deadline if bounded
+                            lifecycle_deadline
+                            if lifecycle_deadline is not None
                             else time.monotonic() + self.owner_validation_timeout_s
                         )
                         lease_timeout = (
-                            max(0.0, deadline - time.monotonic())
-                            if bounded else None
+                            max(0.0, lifecycle_deadline - time.monotonic())
+                            if lifecycle_deadline is not None
+                            else None
                         )
                         with startup_lease(
                             self.startup_lease_path, timeout_s=lease_timeout
@@ -526,14 +633,17 @@ class ModelManager:
         try:
             self._publish_transition("sleeping", current.name)
             lease_timeout = (
-                max(0.0, deadline - time.monotonic()) if bounded else None
+                max(0.0, lifecycle_deadline - time.monotonic())
+                if lifecycle_deadline is not None
+                else None
             )
             with startup_lease(
                 self.startup_lease_path, timeout_s=lease_timeout
             ):
                 validation_timeout = (
-                    self._remaining_owner_validation_timeout(deadline)
-                    if bounded else self.owner_validation_timeout_s
+                    self._remaining_owner_validation_timeout(lifecycle_deadline)
+                    if lifecycle_deadline is not None
+                    else self.owner_validation_timeout_s
                 )
                 sleeping = self._is_sleeping(
                     current,
@@ -545,13 +655,19 @@ class ModelManager:
                     )
                 if sleeping is False:
                     mutation_timeout = (
-                        self._remaining_owner_validation_timeout(deadline)
-                        if bounded else self.request_timeout_s
+                        self._remaining_owner_validation_timeout(lifecycle_deadline)
+                        if lifecycle_deadline is not None
+                        else self.request_timeout_s
                     )
-                    self._sleep(current, timeout_s=mutation_timeout)
+                    self._sleep(
+                        current,
+                        timeout_s=mutation_timeout,
+                        deadline=lifecycle_deadline,
+                    )
                     convergence_timeout = (
-                        self._remaining_owner_validation_timeout(deadline)
-                        if bounded else self.wake_timeout_s
+                        self._remaining_owner_validation_timeout(lifecycle_deadline)
+                        if lifecycle_deadline is not None
+                        else self.wake_timeout_s
                     )
                     self._wait_until_sleeping(
                         current, timeout_s=convergence_timeout
@@ -852,8 +968,11 @@ class ModelManager:
         model: ModelConfig,
         *,
         timeout_s: float | None = None,
+        deadline: float | None = None,
     ) -> None:
         query = urlencode({"level": str(self.sleep_level)})
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError("sleep containment deadline expired before mutation")
         resp = self.http.request(
             "POST",
             f"{model.control_base_url}/sleep?{query}",

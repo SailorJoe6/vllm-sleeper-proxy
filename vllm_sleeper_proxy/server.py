@@ -59,29 +59,118 @@ PROXIED_POST_PATHS = {
 }
 
 SLEEP_DRAIN_TIMEOUT_HEADER = "X-Sleeper-Drain-Timeout-Ms"
+SLEEP_CONTAINMENT_TIMEOUT_HEADER = "X-Sleeper-Containment-Timeout-Ms"
+SLEEP_DRAIN_DEADLINE_HEADER = "X-Sleeper-Drain-Deadline-Epoch-Ms"
+SLEEP_CONTAINMENT_DEADLINE_HEADER = "X-Sleeper-Containment-Deadline-Epoch-Ms"
 MAX_SLEEP_DRAIN_TIMEOUT_MILLISECONDS = 300_000
+MAX_SLEEP_CONTAINMENT_TIMEOUT_MILLISECONDS = 300_000
 
 
-def parse_sleep_drain_timeout(headers) -> float | None:
-    """Decode one tightening-only bodyless /sleep drain bound."""
-    values = headers.get_all(SLEEP_DRAIN_TIMEOUT_HEADER)
+def _parse_sleep_integer_header(
+    headers,
+    *,
+    header: str,
+    label: str,
+    maximum: int | None = None,
+) -> int | None:
+    values = headers.get_all(header)
     if values is None:
         return None
     if len(values) != 1:
-        raise ValueError("sleep drain timeout header must appear exactly once")
+        raise ValueError(f"sleep {label} header must appear exactly once")
     raw = values[0]
     if (
         not isinstance(raw, str)
         or not raw
         or not raw.isascii()
         or not raw.isdigit()
-        or len(raw) > 9
+        or len(raw) > 20
     ):
-        raise ValueError("sleep drain timeout header must be unsigned milliseconds")
-    milliseconds = int(raw)
-    if not 1 <= milliseconds <= MAX_SLEEP_DRAIN_TIMEOUT_MILLISECONDS:
-        raise ValueError("sleep drain timeout header is outside the supported bound")
-    return milliseconds / 1000.0
+        raise ValueError(f"sleep {label} header must be an unsigned integer")
+    value = int(raw)
+    if value <= 0 or (maximum is not None and value > maximum):
+        raise ValueError(f"sleep {label} header is outside the supported bound")
+    return value
+
+
+def parse_sleep_drain_timeout(headers) -> float | None:
+    """Decode one tightening-only bodyless /sleep drain bound."""
+    milliseconds = _parse_sleep_integer_header(
+        headers,
+        header=SLEEP_DRAIN_TIMEOUT_HEADER,
+        label="drain timeout",
+        maximum=MAX_SLEEP_DRAIN_TIMEOUT_MILLISECONDS,
+    )
+    return None if milliseconds is None else milliseconds / 1000.0
+
+
+def parse_sleep_containment_timeout(headers) -> float | None:
+    """Decode one bodyless /sleep containment bound."""
+    milliseconds = _parse_sleep_integer_header(
+        headers,
+        header=SLEEP_CONTAINMENT_TIMEOUT_HEADER,
+        label="containment timeout",
+        maximum=MAX_SLEEP_CONTAINMENT_TIMEOUT_MILLISECONDS,
+    )
+    return None if milliseconds is None else milliseconds / 1000.0
+
+
+def parse_sleep_timeouts(headers) -> tuple[float | None, float | None]:
+    """Decode and validate the optional relative timeout pair."""
+    drain_timeout = parse_sleep_drain_timeout(headers)
+    containment_timeout = parse_sleep_containment_timeout(headers)
+    if containment_timeout is not None and drain_timeout is None:
+        raise ValueError("sleep containment timeout header requires drain timeout header")
+    if (
+        containment_timeout is not None
+        and drain_timeout is not None
+        and containment_timeout < drain_timeout
+    ):
+        raise ValueError(
+            "sleep containment timeout must be greater than or equal to drain timeout"
+        )
+    return drain_timeout, containment_timeout
+
+
+def parse_sleep_deadlines(headers) -> tuple[int | None, int | None]:
+    """Decode and validate the optional absolute epoch-ms deadline pair."""
+    drain_deadline = _parse_sleep_integer_header(
+        headers,
+        header=SLEEP_DRAIN_DEADLINE_HEADER,
+        label="drain deadline",
+    )
+    containment_deadline = _parse_sleep_integer_header(
+        headers,
+        header=SLEEP_CONTAINMENT_DEADLINE_HEADER,
+        label="containment deadline",
+    )
+    if (drain_deadline is None) != (containment_deadline is None):
+        raise ValueError("absolute sleep deadline headers must be supplied as a pair")
+    if (
+        drain_deadline is not None
+        and containment_deadline is not None
+        and containment_deadline < drain_deadline
+    ):
+        raise ValueError(
+            "sleep containment deadline must be greater than or equal to drain deadline"
+        )
+    return drain_deadline, containment_deadline
+
+
+def parse_sleep_bounds(
+    headers,
+) -> tuple[float | None, float | None, int | None, int | None]:
+    """Decode one mutually exclusive relative-timeout or absolute-deadline mode."""
+    drain_timeout, containment_timeout = parse_sleep_timeouts(headers)
+    drain_deadline, containment_deadline = parse_sleep_deadlines(headers)
+    if drain_timeout is not None and drain_deadline is not None:
+        raise ValueError("sleep timeout and absolute deadline modes are mutually exclusive")
+    return (
+        drain_timeout,
+        containment_timeout,
+        drain_deadline,
+        containment_deadline,
+    )
 
 
 class SleeperProxyHandler(BaseHTTPRequestHandler):
@@ -112,6 +201,7 @@ class SleeperProxyHandler(BaseHTTPRequestHandler):
             thermal = self.manager.thermal_admission_snapshot()
             thermal_fenced = bool(thermal is not None and thermal.fenced)
             inference_available = lifecycle_ready and not thermal_fenced
+            urgent_drain_snapshot = self.manager.urgent_drain_snapshot()
             self._send_json(200 if finalized else 503, {
                 "ok": finalized,
                 "control_healthy": finalized,
@@ -126,6 +216,7 @@ class SleeperProxyHandler(BaseHTTPRequestHandler):
                 "active_model": self.manager.active_model_name,
                 "starting_model": self.manager.starting_model_name,
                 "inflight_requests": self.manager.inflight_requests,
+                "urgent_drain_snapshot": urgent_drain_snapshot,
             })
         elif path == "/v1/models":
             self._send_json(200, self.manager.list_openai_models())
@@ -168,18 +259,32 @@ class SleeperProxyHandler(BaseHTTPRequestHandler):
             return
         if path == "/sleep":
             try:
-                drain_timeout = parse_sleep_drain_timeout(self.headers)
+                (
+                    drain_timeout,
+                    containment_timeout,
+                    drain_deadline,
+                    containment_deadline,
+                ) = parse_sleep_bounds(self.headers)
             except ValueError as exc:
                 self._send_error(400, str(exc), "invalid_request")
                 return
             try:
-                slept_model = (
-                    self.manager.sleep_active_model()
-                    if drain_timeout is None
-                    else self.manager.sleep_active_model(
+                if drain_deadline is not None:
+                    slept_model = self.manager.sleep_active_model(
+                        drain_deadline_epoch_ms=drain_deadline,
+                        containment_deadline_epoch_ms=containment_deadline,
+                    )
+                elif drain_timeout is None:
+                    slept_model = self.manager.sleep_active_model()
+                elif containment_timeout is None:
+                    slept_model = self.manager.sleep_active_model(
                         drain_timeout_s=drain_timeout
                     )
-                )
+                else:
+                    slept_model = self.manager.sleep_active_model(
+                        drain_timeout_s=drain_timeout,
+                        containment_timeout_s=containment_timeout,
+                    )
             except WakeError as exc:
                 self._send_error(503, str(exc), "sleep_failed", {"retry-after": "10"})
                 return

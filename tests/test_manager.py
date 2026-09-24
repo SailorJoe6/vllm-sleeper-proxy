@@ -543,6 +543,394 @@ class ModelManagerTests(unittest.TestCase):
             self.assertFalse(any("/sleep?" in url for _, url, _ in http.calls))
             self.assertFalse(manager._quiescing)
 
+    def test_paired_sleep_uses_containment_deadline_after_drain(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            lease_path = str(Path(directory) / "startup.lock")
+            http = FakeHttp()
+            manager = ModelManager(
+                [qwen_model()],
+                http,
+                poll_interval_s=0,
+                wake_timeout_s=1,
+                drain_timeout_s=30,
+                startup_lease_path=lease_path,
+            )
+            manager.acquire("Qwen3-Embedding-8B").release()
+            results: list[str | None] = []
+            errors: list[Exception] = []
+
+            def paired_sleep() -> None:
+                try:
+                    results.append(
+                        manager.sleep_active_model(
+                            drain_timeout_s=0.02,
+                            containment_timeout_s=0.2,
+                        )
+                    )
+                except Exception as exc:
+                    errors.append(exc)
+
+            with startup_lease(lease_path):
+                thread = threading.Thread(target=paired_sleep)
+                thread.start()
+                time.sleep(0.05)
+                self.assertTrue(thread.is_alive())
+            thread.join(timeout=1)
+
+            self.assertFalse(thread.is_alive())
+            self.assertEqual([], errors)
+            self.assertEqual(["Qwen3-Embedding-8B"], results)
+            self.assertEqual(1, sum("/sleep?" in url for _, url, _ in http.calls))
+
+    def test_paired_sleep_does_not_mutate_after_containment_deadline(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            lease_path = str(Path(directory) / "startup.lock")
+            http = FakeHttp()
+            manager = ModelManager(
+                [qwen_model()],
+                http,
+                poll_interval_s=0,
+                wake_timeout_s=1,
+                drain_timeout_s=30,
+                startup_lease_path=lease_path,
+            )
+            manager.acquire("Qwen3-Embedding-8B").release()
+            errors: list[Exception] = []
+
+            def paired_sleep() -> None:
+                try:
+                    manager.sleep_active_model(
+                        drain_timeout_s=0.01,
+                        containment_timeout_s=0.03,
+                    )
+                except Exception as exc:
+                    errors.append(exc)
+
+            with startup_lease(lease_path):
+                thread = threading.Thread(target=paired_sleep)
+                thread.start()
+                thread.join(timeout=0.2)
+                self.assertFalse(thread.is_alive())
+            self.assertEqual(1, len(errors))
+            self.assertIsInstance(errors[0], WakeError)
+            time.sleep(0.03)
+            self.assertFalse(any("/sleep?" in url for _, url, _ in http.calls))
+            self.assertFalse(manager._quiescing)
+
+    def test_paired_sleep_still_uses_drain_deadline_for_condition_contention(self) -> None:
+        manager = ModelManager([qwen_model()], FakeHttp(), drain_timeout_s=30)
+        locked = threading.Event()
+        release = threading.Event()
+
+        def hold_condition() -> None:
+            with manager._condition:
+                locked.set()
+                release.wait(timeout=1)
+
+        holder = threading.Thread(target=hold_condition)
+        holder.start()
+        self.assertTrue(locked.wait(timeout=1))
+        started = time.monotonic()
+        try:
+            with self.assertRaisesRegex(WakeError, "timed out acquiring lifecycle state"):
+                manager.sleep_active_model(
+                    drain_timeout_s=0.02,
+                    containment_timeout_s=0.2,
+                )
+        finally:
+            release.set()
+            holder.join(timeout=1)
+        self.assertLess(time.monotonic() - started, 0.1)
+
+    def test_paired_sleep_timeouts_must_be_valid_and_ordered(self) -> None:
+        manager = ModelManager([qwen_model()], FakeHttp())
+        with self.assertRaisesRegex(ValueError, "requires drain_timeout_s"):
+            manager.sleep_active_model(containment_timeout_s=1)
+        for drain, containment in (
+            (0, 1),
+            (1, 0),
+            (1, -1),
+            (1, float("nan")),
+            (1, float("inf")),
+            (2, 1),
+        ):
+            with self.subTest(drain=drain, containment=containment):
+                with self.assertRaises(ValueError):
+                    manager.sleep_active_model(
+                        drain_timeout_s=drain,
+                        containment_timeout_s=containment,
+                    )
+
+    def test_absolute_deadlines_use_drain_for_sleep_lock_contention(self) -> None:
+        manager = ModelManager([qwen_model()], FakeHttp(), drain_timeout_s=1)
+        self.assertTrue(manager._sleep_operation_lock.acquire())
+        try:
+            wall_ms = time.time_ns() // 1_000_000
+            started = time.monotonic()
+            with self.assertRaisesRegex(WakeError, "concurrent sleep operation"):
+                manager.sleep_active_model(
+                    drain_deadline_epoch_ms=wall_ms + 20,
+                    containment_deadline_epoch_ms=wall_ms + 200,
+                )
+        finally:
+            manager._sleep_operation_lock.release()
+        self.assertLess(time.monotonic() - started, 0.1)
+
+    def test_absolute_deadlines_use_drain_for_nonzero_inflight(self) -> None:
+        http = FakeHttp()
+        manager = ModelManager(
+            [qwen_model()], http, poll_interval_s=0, drain_timeout_s=1
+        )
+        lease = manager.acquire("Qwen3-Embedding-8B")
+        wall_ms = time.time_ns() // 1_000_000
+        started = time.monotonic()
+        with self.assertRaisesRegex(WakeError, "timed out draining requests"):
+            manager.sleep_active_model(
+                drain_deadline_epoch_ms=wall_ms + 20,
+                containment_deadline_epoch_ms=wall_ms + 200,
+            )
+        self.assertLess(time.monotonic() - started, 0.1)
+        self.assertFalse(any("/sleep?" in url for _, url, _ in http.calls))
+        lease.release()
+
+    def test_expired_absolute_containment_never_mutates_sleep(self) -> None:
+        http = FakeHttp()
+        manager = ModelManager(
+            [qwen_model()], http, poll_interval_s=0, drain_timeout_s=1
+        )
+        manager.acquire("Qwen3-Embedding-8B").release()
+        sleep_posts_before = sum("/sleep?" in url for _, url, _ in http.calls)
+        expired_ms = time.time_ns() // 1_000_000 - 1
+        with self.assertRaises(WakeError):
+            manager.sleep_active_model(
+                drain_deadline_epoch_ms=expired_ms,
+                containment_deadline_epoch_ms=expired_ms,
+            )
+        time.sleep(0.02)
+        self.assertEqual(
+            sleep_posts_before,
+            sum("/sleep?" in url for _, url, _ in http.calls),
+        )
+
+    def test_caller_deadlines_cannot_extend_configured_operation_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            lease_path = str(Path(directory) / "startup.lock")
+            http = FakeHttp()
+            manager = ModelManager(
+                [qwen_model()],
+                http,
+                poll_interval_s=0,
+                drain_timeout_s=0.03,
+                startup_lease_path=lease_path,
+            )
+            manager.acquire("Qwen3-Embedding-8B").release()
+            errors: list[Exception] = []
+
+            def paired_sleep() -> None:
+                try:
+                    manager.sleep_active_model(
+                        drain_timeout_s=0.02,
+                        containment_timeout_s=1,
+                    )
+                except Exception as exc:
+                    errors.append(exc)
+
+            with startup_lease(lease_path):
+                thread = threading.Thread(target=paired_sleep)
+                thread.start()
+                thread.join(timeout=0.15)
+                self.assertFalse(thread.is_alive())
+            self.assertEqual(1, len(errors))
+            self.assertIsInstance(errors[0], WakeError)
+            self.assertFalse(any("/sleep?" in url for _, url, _ in http.calls))
+
+    def test_absolute_deadlines_cannot_extend_configured_operation_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            lease_path = str(Path(directory) / "startup.lock")
+            http = FakeHttp()
+            manager = ModelManager(
+                [qwen_model()],
+                http,
+                poll_interval_s=0,
+                drain_timeout_s=0.03,
+                startup_lease_path=lease_path,
+            )
+            manager.acquire("Qwen3-Embedding-8B").release()
+            errors: list[Exception] = []
+
+            def paired_sleep() -> None:
+                wall_ms = time.time_ns() // 1_000_000
+                try:
+                    manager.sleep_active_model(
+                        drain_deadline_epoch_ms=wall_ms + 20,
+                        containment_deadline_epoch_ms=wall_ms + 1000,
+                    )
+                except Exception as exc:
+                    errors.append(exc)
+
+            with startup_lease(lease_path):
+                thread = threading.Thread(target=paired_sleep)
+                thread.start()
+                thread.join(timeout=0.15)
+                self.assertFalse(thread.is_alive())
+            self.assertEqual(1, len(errors))
+            self.assertIsInstance(errors[0], WakeError)
+            self.assertFalse(any("/sleep?" in url for _, url, _ in http.calls))
+
+    def test_absolute_deadline_arguments_are_paired_exclusive_and_integer(self) -> None:
+        manager = ModelManager([qwen_model()], FakeHttp())
+        wall_ms = time.time_ns() // 1_000_000
+        invalid_calls = (
+            {"drain_deadline_epoch_ms": wall_ms + 10},
+            {"containment_deadline_epoch_ms": wall_ms + 10},
+            {
+                "drain_timeout_s": 1,
+                "drain_deadline_epoch_ms": wall_ms + 10,
+                "containment_deadline_epoch_ms": wall_ms + 20,
+            },
+            {
+                "drain_deadline_epoch_ms": True,
+                "containment_deadline_epoch_ms": wall_ms + 20,
+            },
+            {
+                "drain_deadline_epoch_ms": float(wall_ms + 10),
+                "containment_deadline_epoch_ms": wall_ms + 20,
+            },
+            {
+                "drain_deadline_epoch_ms": wall_ms + 20,
+                "containment_deadline_epoch_ms": wall_ms + 10,
+            },
+        )
+        for kwargs in invalid_calls:
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                manager.sleep_active_model(**kwargs)
+
+    def test_urgent_drain_snapshot_is_null_when_condition_is_unavailable(self) -> None:
+        manager = ModelManager([qwen_model()], FakeHttp())
+        locked = threading.Event()
+        release = threading.Event()
+
+        def hold_condition() -> None:
+            with manager._condition:
+                locked.set()
+                release.wait(timeout=1)
+
+        holder = threading.Thread(target=hold_condition)
+        holder.start()
+        self.assertTrue(locked.wait(timeout=1))
+        try:
+            started = time.monotonic()
+            self.assertIsNone(manager.urgent_drain_snapshot())
+            self.assertLess(time.monotonic() - started, 0.1)
+        finally:
+            release.set()
+            holder.join(timeout=1)
+
+    def test_urgent_drain_snapshot_is_atomic_with_second_admission_and_increment(self) -> None:
+        class ControlledAdmission:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.second_started = threading.Event()
+                self.allow_second = threading.Event()
+
+            def __call__(self, model) -> None:
+                self.calls += 1
+                if self.calls == 2:
+                    self.second_started.set()
+                    self.allow_second.wait(timeout=1)
+
+            def snapshot(self, model):
+                from types import SimpleNamespace
+
+                return SimpleNamespace(fenced=True, action_id="thermal-atomic")
+
+        admission = ControlledAdmission()
+        manager = ModelManager(
+            [qwen_model()], FakeHttp(), pre_admission_check=admission,
+            poll_interval_s=0,
+        )
+        leases = []
+        thread = threading.Thread(
+            target=lambda: leases.append(manager.acquire("Qwen3-Embedding-8B"))
+        )
+        thread.start()
+        self.assertTrue(admission.second_started.wait(timeout=1))
+        self.assertIsNone(manager.urgent_drain_snapshot())
+        admission.allow_second.set()
+        thread.join(timeout=1)
+        self.assertFalse(thread.is_alive())
+        snapshot = manager.urgent_drain_snapshot()
+        self.assertEqual(
+            {
+                "action_id": "thermal-atomic",
+                "fenced": True,
+                "control_healthy": True,
+                "inflight_requests": 1,
+            },
+            snapshot,
+        )
+        leases[0].release()
+
+    def test_atomic_zero_snapshot_fences_request_waiting_on_quiesce(self) -> None:
+        class ControlledAdmission:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.waiting = threading.Event()
+                self.fenced = False
+
+            def __call__(self, model) -> None:
+                self.calls += 1
+                if self.calls == 2:
+                    self.waiting.set()
+                if self.fenced:
+                    raise RuntimeError("thermal fence")
+
+            def snapshot(self, model):
+                from types import SimpleNamespace
+
+                return SimpleNamespace(
+                    fenced=self.fenced,
+                    action_id="thermal-waiter" if self.fenced else None,
+                )
+
+        admission = ControlledAdmission()
+        manager = ModelManager(
+            [qwen_model()], FakeHttp(), pre_admission_check=admission,
+            poll_interval_s=0,
+        )
+        with manager._condition:
+            manager._quiescing = True
+        errors: list[Exception] = []
+
+        def acquire() -> None:
+            try:
+                manager.acquire("Qwen3-Embedding-8B")
+            except Exception as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=acquire)
+        thread.start()
+        self.assertTrue(admission.waiting.wait(timeout=1))
+        admission.fenced = True
+        snapshot = manager.urgent_drain_snapshot()
+        self.assertEqual(
+            {
+                "action_id": "thermal-waiter",
+                "fenced": True,
+                "control_healthy": True,
+                "inflight_requests": 0,
+            },
+            snapshot,
+        )
+        with manager._condition:
+            manager._quiescing = False
+            manager._condition.notify_all()
+        thread.join(timeout=1)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(1, len(errors))
+        self.assertRegex(str(errors[0]), "thermal fence")
+        self.assertEqual(0, manager.inflight_requests)
+
     def test_concurrent_bounded_sleep_cannot_clear_another_sleepers_quiesce(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             lease_path = str(Path(directory) / "startup.lock")

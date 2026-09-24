@@ -13,6 +13,7 @@ from vllm_sleeper_proxy.admission import FileThermalAdmissionGuard, ThermalCoold
 from vllm_sleeper_proxy.client import HttpResponse
 from vllm_sleeper_proxy.config import ModelConfig
 from vllm_sleeper_proxy.manager import ModelManager, WakeError
+from vllm_sleeper_proxy import server as server_module
 from vllm_sleeper_proxy.server import build_server, require_qwen_admission
 
 
@@ -235,6 +236,7 @@ class ServerTests(unittest.TestCase):
         self.assertFalse(health["ready"])
         self.assertEqual(health["lifecycle_state"], "starting")
         self.assertEqual(health["inflight_requests"], 0)
+        self.assertIsNone(health["urgent_drain_snapshot"])
         release_readiness.set()
         request_thread.join(timeout=2)
         self.assertFalse(request_thread.is_alive())
@@ -280,6 +282,15 @@ class ServerTests(unittest.TestCase):
             self.assertFalse(health["inference_available"])
             self.assertEqual("sleep", health["thermal_phase"])
             self.assertEqual("thermal-600-accepted", health["thermal_action_id"])
+            self.assertEqual(
+                {
+                    "action_id": "thermal-600-accepted",
+                    "fenced": True,
+                    "control_healthy": True,
+                    "inflight_requests": 0,
+                },
+                health["urgent_drain_snapshot"],
+            )
 
             request = Request(f"{self.base_url}/v1/embeddings", method="POST")
             with self.assertRaises(HTTPError) as caught:
@@ -312,6 +323,55 @@ class ServerTests(unittest.TestCase):
             self.assertEqual("thermal_protection_active", corrupt_error["code"])
             self.assertEqual("recovering", corrupt_error["thermal_phase"])
             self.assertEqual("thermal-corrupt-health", corrupt_error["action_id"])
+
+    def test_healthz_reports_atomic_urgent_drain_snapshot(self) -> None:
+        from types import SimpleNamespace
+
+        class Admission:
+            def __call__(self, model) -> None:
+                return None
+
+            def snapshot(self, model):
+                return SimpleNamespace(
+                    fenced=True,
+                    phase="sleep",
+                    action_id="thermal-health-atomic",
+                )
+
+        self.manager.pre_admission_check = Admission()
+        lease = self.manager.acquire("Qwen3-Embedding-8B")
+        health = self.get_json("/healthz")
+        self.assertEqual(
+            {
+                "action_id": "thermal-health-atomic",
+                "fenced": True,
+                "control_healthy": True,
+                "inflight_requests": 1,
+            },
+            health["urgent_drain_snapshot"],
+        )
+        lease.release()
+
+    def test_healthz_sets_urgent_drain_snapshot_null_when_condition_busy(self) -> None:
+        locked = threading.Event()
+        release = threading.Event()
+
+        def hold_condition() -> None:
+            with self.manager._condition:
+                locked.set()
+                release.wait(timeout=1)
+
+        holder = threading.Thread(target=hold_condition)
+        holder.start()
+        self.assertTrue(locked.wait(timeout=1))
+        try:
+            started = time.monotonic()
+            health = self.get_json("/healthz")
+            self.assertLess(time.monotonic() - started, 0.5)
+            self.assertIsNone(health["urgent_drain_snapshot"])
+        finally:
+            release.set()
+            holder.join(timeout=1)
 
     def test_sleep_endpoint_quiesces_active_model(self) -> None:
         self.post_json(
@@ -357,8 +417,208 @@ class ServerTests(unittest.TestCase):
         self.assertTrue(payload["ok"])
         sleep.assert_called_once_with(drain_timeout_s=0.5)
 
+    def test_sleep_endpoint_accepts_paired_drain_and_containment_headers(self) -> None:
+        request = Request(
+            f"{self.base_url}/sleep",
+            headers={
+                "X-Sleeper-Drain-Timeout-Ms": "500",
+                "X-Sleeper-Containment-Timeout-Ms": "1500",
+            },
+            method="POST",
+        )
+        with patch.object(
+            self.manager,
+            "sleep_active_model",
+            return_value=None,
+        ) as sleep:
+            with urlopen(request, timeout=2) as response:
+                self.assertEqual(200, response.status)
+                payload = json.loads(response.read())
+        self.assertTrue(payload["ok"])
+        sleep.assert_called_once_with(
+            drain_timeout_s=0.5,
+            containment_timeout_s=1.5,
+        )
+
+    def test_sleep_endpoint_accepts_paired_absolute_deadline_headers(self) -> None:
+        wall_ms = time.time_ns() // 1_000_000
+        request = Request(
+            f"{self.base_url}/sleep",
+            headers={
+                "X-Sleeper-Drain-Deadline-Epoch-Ms": str(wall_ms + 500),
+                "X-Sleeper-Containment-Deadline-Epoch-Ms": str(wall_ms + 1500),
+            },
+            method="POST",
+        )
+        with patch.object(
+            self.manager,
+            "sleep_active_model",
+            return_value=None,
+        ) as sleep:
+            with urlopen(request, timeout=2) as response:
+                self.assertEqual(200, response.status)
+        sleep.assert_called_once_with(
+            drain_deadline_epoch_ms=wall_ms + 500,
+            containment_deadline_epoch_ms=wall_ms + 1500,
+        )
+
+    def test_sleep_endpoint_rejects_incomplete_mixed_or_invalid_absolute_deadlines(self) -> None:
+        wall_ms = time.time_ns() // 1_000_000
+        cases = (
+            {"X-Sleeper-Drain-Deadline-Epoch-Ms": str(wall_ms + 100)},
+            {"X-Sleeper-Containment-Deadline-Epoch-Ms": str(wall_ms + 100)},
+            {
+                "X-Sleeper-Drain-Timeout-Ms": "50",
+                "X-Sleeper-Drain-Deadline-Epoch-Ms": str(wall_ms + 100),
+                "X-Sleeper-Containment-Deadline-Epoch-Ms": str(wall_ms + 200),
+            },
+            {
+                "X-Sleeper-Drain-Deadline-Epoch-Ms": "true",
+                "X-Sleeper-Containment-Deadline-Epoch-Ms": str(wall_ms + 200),
+            },
+            {
+                "X-Sleeper-Drain-Deadline-Epoch-Ms": "1.5",
+                "X-Sleeper-Containment-Deadline-Epoch-Ms": str(wall_ms + 200),
+            },
+            {
+                "X-Sleeper-Drain-Deadline-Epoch-Ms": str(wall_ms + 200),
+                "X-Sleeper-Containment-Deadline-Epoch-Ms": str(wall_ms + 100),
+            },
+        )
+        for headers in cases:
+            with self.subTest(headers=headers), patch.object(
+                self.manager, "sleep_active_model"
+            ) as sleep:
+                request = Request(
+                    f"{self.base_url}/sleep",
+                    headers=headers,
+                    method="POST",
+                )
+                with self.assertRaises(HTTPError) as caught:
+                    urlopen(request, timeout=2)
+                self.assertEqual(400, caught.exception.code)
+                sleep.assert_not_called()
+
+    def test_sleep_endpoint_rejects_duplicate_absolute_deadline(self) -> None:
+        host, port = self.server.server_address
+        wall_ms = time.time_ns() // 1_000_000
+        with patch.object(self.manager, "sleep_active_model") as sleep, socket.create_connection(
+            (host, port), timeout=2
+        ) as client:
+            request = (
+                "POST /sleep HTTP/1.1\r\n"
+                "Host: localhost\r\n"
+                f"X-Sleeper-Drain-Deadline-Epoch-Ms: {wall_ms + 100}\r\n"
+                f"X-Sleeper-Drain-Deadline-Epoch-Ms: {wall_ms + 90}\r\n"
+                f"X-Sleeper-Containment-Deadline-Epoch-Ms: {wall_ms + 200}\r\n"
+                "Connection: close\r\n\r\n"
+            ).encode()
+            client.sendall(request)
+            response = b""
+            while chunk := client.recv(4096):
+                response += chunk
+        self.assertIn(b" 400 ", response.split(b"\r\n", 1)[0])
+        sleep.assert_not_called()
+
+    def test_delayed_handler_cannot_extend_absolute_containment_deadline(self) -> None:
+        self.post_json(
+            "/v1/embeddings",
+            {"model": "Qwen3-Embedding-8B", "input": "hello"},
+        )
+        sleep_posts_before = sum("/sleep?" in url for _, url, _ in self.http.requests)
+        wall_ms = time.time_ns() // 1_000_000
+        request = Request(
+            f"{self.base_url}/sleep",
+            headers={
+                "X-Sleeper-Drain-Deadline-Epoch-Ms": str(wall_ms + 20),
+                "X-Sleeper-Containment-Deadline-Epoch-Ms": str(wall_ms + 30),
+            },
+            method="POST",
+        )
+        original = self.manager.sleep_active_model
+
+        def delayed(**kwargs):
+            time.sleep(0.05)
+            return original(**kwargs)
+
+        with patch.object(self.manager, "sleep_active_model", side_effect=delayed):
+            with self.assertRaises(HTTPError) as caught:
+                urlopen(request, timeout=2)
+            self.assertEqual(503, caught.exception.code)
+        time.sleep(0.02)
+        self.assertEqual(
+            sleep_posts_before,
+            sum("/sleep?" in url for _, url, _ in self.http.requests),
+        )
+
+    def test_sleep_endpoint_rejects_containment_without_drain(self) -> None:
+        request = Request(
+            f"{self.base_url}/sleep",
+            headers={"X-Sleeper-Containment-Timeout-Ms": "1500"},
+            method="POST",
+        )
+        with patch.object(self.manager, "sleep_active_model") as sleep:
+            with self.assertRaises(HTTPError) as caught:
+                urlopen(request, timeout=2)
+            self.assertEqual(400, caught.exception.code)
+            self.assertEqual(
+                "invalid_request",
+                json.loads(caught.exception.read())["error"]["type"],
+            )
+            sleep.assert_not_called()
+
+    def test_sleep_endpoint_rejects_invalid_containment_header_before_lifecycle(self) -> None:
+        for drain, containment in (
+            ("500", "0"),
+            ("500", "-1"),
+            ("500", "1.5"),
+            ("500", "abc"),
+            ("500", ""),
+            ("500", "300001"),
+            ("500", "400"),
+        ):
+            with self.subTest(containment=containment), patch.object(
+                self.manager, "sleep_active_model"
+            ) as sleep:
+                request = Request(
+                    f"{self.base_url}/sleep",
+                    headers={
+                        "X-Sleeper-Drain-Timeout-Ms": drain,
+                        "X-Sleeper-Containment-Timeout-Ms": containment,
+                    },
+                    method="POST",
+                )
+                with self.assertRaises(HTTPError) as caught:
+                    urlopen(request, timeout=2)
+                self.assertEqual(400, caught.exception.code)
+                self.assertEqual(
+                    "invalid_request",
+                    json.loads(caught.exception.read())["error"]["type"],
+                )
+                sleep.assert_not_called()
+
+    def test_sleep_endpoint_rejects_duplicate_containment_header_before_lifecycle(self) -> None:
+        host, port = self.server.server_address
+        with patch.object(self.manager, "sleep_active_model") as sleep, socket.create_connection(
+            (host, port), timeout=2
+        ) as client:
+            client.sendall(
+                b"POST /sleep HTTP/1.1\r\n"
+                b"Host: localhost\r\n"
+                b"X-Sleeper-Drain-Timeout-Ms: 500\r\n"
+                b"X-Sleeper-Containment-Timeout-Ms: 1500\r\n"
+                b"X-Sleeper-Containment-Timeout-Ms: 1400\r\n"
+                b"Connection: close\r\n\r\n"
+            )
+            response = b""
+            while chunk := client.recv(4096):
+                response += chunk
+        self.assertIn(b" 400 ", response.split(b"\r\n", 1)[0])
+        self.assertIn(b'"type":"invalid_request"', response)
+        sleep.assert_not_called()
+
     def test_sleep_endpoint_rejects_malformed_drain_header_before_lifecycle(self) -> None:
-        for value in ("0", "-1", "1.5", "abc", ""):
+        for value in ("0", "-1", "1.5", "abc", "", "300001"):
             with self.subTest(value=value), patch.object(
                 self.manager, "sleep_active_model"
             ) as sleep:

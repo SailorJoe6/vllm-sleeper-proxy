@@ -131,13 +131,25 @@ GBrain embedding Compose integration:
   reports startup, lifecycle readiness, selected/starting model, and sanitized
   thermal phase/action fields without waiting for a lifecycle lease.
   The schema-v1 root watchdog and memory-pressure monitor may continue using
-  the existing bodyless loopback `POST /sleep`. The optional single
+  the existing bodyless loopback `POST /sleep`. The optional
   `X-Sleeper-Drain-Timeout-Ms` header accepts an unsigned value from 1 through
-  300000 and may only tighten the configured drain bound; malformed or
-  duplicate values fail with HTTP 400 before lifecycle work. The bound includes
-  concurrent-sleep serialization, condition-lock and startup-lease contention,
-  the sleep request, and positive sleep convergence. One timed-out caller cannot
-  clear another caller's quiesce state or leave a delayed sleep after expiry. No
+  300000 and alone preserves the legacy whole-operation bound. An urgent caller
+  may pair it with `X-Sleeper-Containment-Timeout-Ms`: concurrent-sleep and
+  condition contention, quiesce, and in-flight drain use the earlier drain bound;
+  startup-lease acquisition, sleep, and positive convergence use the later
+  containment bound. A mutually exclusive absolute mode uses the paired
+  `X-Sleeper-Drain-Deadline-Epoch-Ms` and
+  `X-Sleeper-Containment-Deadline-Epoch-Ms` headers. Absolute deadlines survive
+  handler delay and are mapped conservatively to monotonic time. All caller
+  bounds are capped by `SLEEPER_DRAIN_TIMEOUT_SECONDS`. Incomplete pairs, mixed
+  relative/absolute modes, containment earlier than drain, and malformed or
+  duplicate values fail with HTTP 400 before lifecycle work. One timed-out
+  caller cannot clear another caller's quiesce state or issue a sleep mutation
+  after the effective containment deadline. `/healthz` retains its approximate
+  top-level `inflight_requests` field for compatibility.
+  `/healthz.urgent_drain_snapshot` atomically reports `action_id`, `fenced`,
+  `control_healthy`, and the exact integer `inflight_requests` under the admission
+  condition; it is `null` instead of blocking when that lock is busy. No
   action-scoped thermal control endpoint is part of the compact production
   design.
   If a client selects a stopped engine after a released root hold, including a
