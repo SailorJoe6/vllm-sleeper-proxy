@@ -148,8 +148,11 @@ GBrain embedding Compose integration:
   after the effective containment deadline. `/healthz` retains its approximate
   top-level `inflight_requests` field for compatibility.
   `/healthz.urgent_drain_snapshot` atomically reports `action_id`, `fenced`,
-  `control_healthy`, and the exact integer `inflight_requests` under the admission
-  condition; it is `null` instead of blocking when that lock is busy. No
+  `control_healthy`, and the exact integer `inflight_requests` under a dedicated
+  short-held request-admission lock. Slow lifecycle condition ownership never
+  hides that proof. Final post-activation admission and the counter increment use
+  the same lock, so either the request is counted or a fenced zero snapshot wins;
+  it is `null` only during that short linearization interval. No
   action-scoped thermal control endpoint is part of the compact production
   design.
   If a client selects a stopped engine after a released root hold, including a

@@ -133,6 +133,9 @@ class ModelManager:
         self.bootstrap_mode = bootstrap_mode
         self._startup_finalized = not bootstrap_mode
         self._condition = threading.Condition()
+        # Sole linearization point for final request admission, release, and
+        # urgent zero-inflight proof. Never hold this across engine I/O.
+        self._request_lock = threading.Lock()
         self._sleep_operation_lock = threading.Lock()
         self._active_model_name: str | None = None
         self._starting_model_name: str | None = None
@@ -153,7 +156,7 @@ class ModelManager:
         target = self.find_model(requested)
         with startup_lease(self.startup_lease_path):
             with self._condition:
-                if self._inflight_requests or self._pending_switch_name is not None:
+                if self._exact_inflight_requests() or self._pending_switch_name is not None:
                     raise WakeError("cannot bootstrap sleep while requests are active")
                 self._starting_model_name = target.name
                 self._publish_transition("bootstrap_sleep", target.name)
@@ -274,13 +277,13 @@ class ModelManager:
     def urgent_drain_snapshot(self) -> dict[str, object] | None:
         """Return one action-bound thermal/in-flight view without waiting.
 
-        The condition is the same lock that covers the second thermal admission
-        check and the in-flight increment. A health request therefore observes
-        either the admitted request count or the fence that denied it, never a
-        count sampled in the admission gap. Lock contention is reported as an
-        unavailable snapshot instead of delaying control-plane health.
+        The dedicated request lock covers the final thermal admission check,
+        in-flight increment, and release decrement. A health request therefore
+        observes either the admitted request count or the fence that denied it,
+        never a count sampled in the admission gap. Its brief lock contention is
+        reported as an unavailable snapshot instead of delaying control health.
         """
-        if not self._condition.acquire(blocking=False):
+        if not self._request_lock.acquire(blocking=False):
             return None
         try:
             thermal = self.thermal_admission_snapshot()
@@ -291,7 +294,7 @@ class ModelManager:
                 "inflight_requests": self._inflight_requests,
             }
         finally:
-            self._condition.release()
+            self._request_lock.release()
 
     @property
     def starting_model_name(self) -> str | None:
@@ -305,8 +308,22 @@ class ModelManager:
 
     @property
     def inflight_requests(self) -> int:
-        """Approximate request count for nonblocking health observation."""
+        """Approximate lock-free count for compatible top-level health status."""
         return self._inflight_requests
+
+    def _exact_inflight_requests(self, deadline: float | None = None) -> int:
+        """Read the authoritative count, bounded when a drain deadline applies."""
+        if deadline is None:
+            acquired = self._request_lock.acquire()
+        else:
+            remaining = deadline - time.monotonic()
+            acquired = remaining > 0 and self._request_lock.acquire(timeout=remaining)
+        if not acquired:
+            raise WakeError("timed out draining requests while request state was busy")
+        try:
+            return self._inflight_requests
+        finally:
+            self._request_lock.release()
 
     def _publish_transition(self, phase: str, model_name: str | None = None) -> None:
         """Atomically publish lifecycle ownership for the host guard.
@@ -342,7 +359,7 @@ class ModelManager:
                 self._starting_model_name = "__system_startup__"
                 self._publish_transition("starting", "__system_startup__")
                 try:
-                    if self._inflight_requests or self._pending_switch_name is not None:
+                    if self._exact_inflight_requests() or self._pending_switch_name is not None:
                         raise WakeError("cannot reconcile startup state while requests are active")
 
                     for model in self.models:
@@ -433,7 +450,13 @@ class ModelManager:
             if self.admission_check is not None:
                 self.admission_check(target)
             self._activate_locked(target)
-            self._inflight_requests += 1
+            # Final admission and the in-flight increment share one short-held
+            # lock with urgent_drain_snapshot. Either this increment wins, or a
+            # fenced zero snapshot wins and this recheck rejects the request.
+            with self._request_lock:
+                if self.pre_admission_check is not None:
+                    self.pre_admission_check(target)
+                self._inflight_requests += 1
         return ModelLease(self, target)
 
     def sleep_active_model(
@@ -572,63 +595,70 @@ class ModelManager:
         try:
             self._quiescing = True
             try:
-                while self._inflight_requests > 0:
+                while self._exact_inflight_requests(drain_deadline) > 0:
                     remaining = drain_deadline - time.monotonic()
                     if remaining <= 0:
                         raise WakeError("timed out draining requests before resource backoff")
                     self._condition.wait(timeout=remaining)
                 if bounded and time.monotonic() >= drain_deadline:
                     raise WakeError("timed out draining requests before resource backoff")
-                if self._active_model_name is None:
-                    try:
-                        validation_deadline = (
-                            lifecycle_deadline
-                            if lifecycle_deadline is not None
-                            else time.monotonic() + self.owner_validation_timeout_s
-                        )
-                        lease_timeout = (
-                            max(0.0, lifecycle_deadline - time.monotonic())
-                            if lifecycle_deadline is not None
-                            else None
-                        )
-                        with startup_lease(
-                            self.startup_lease_path, timeout_s=lease_timeout
-                        ):
-                            states = [
-                                self._is_sleeping(
-                                    model,
-                                    timeout_s=self._remaining_owner_validation_timeout(
-                                        validation_deadline
-                                    ),
-                                )
-                                for model in self.models
-                            ]
-                    except Exception as exc:
-                        self._lifecycle_state = "unknown"
-                        self._active_model_ready = False
-                        self._publish_transition("unknown")
-                        raise LifecycleUnavailableError(
-                            "all-engine sleep state unavailable; retry later"
-                        ) from exc
-                    if not states or any(state is not True for state in states):
-                        self._lifecycle_state = "unknown"
-                        self._active_model_ready = False
-                        self._publish_transition("unknown")
-                        raise LifecycleUnavailableError(
-                            "all-engine sleep state unavailable; retry later"
-                        )
-                    self._lifecycle_state = "sleeping"
-                    self._quiescing = False
-                    self._publish_transition("idle")
-                    self._condition.notify_all()
-                    return None
-                current = self.find_model(self._active_model_name)
+                current = (
+                    None
+                    if self._active_model_name is None
+                    else self.find_model(self._active_model_name)
+                )
             except Exception:
                 self._quiescing = False
                 self._condition.notify_all()
                 raise
         finally:
             self._condition.release()
+
+        if current is None:
+            try:
+                validation_deadline = (
+                    lifecycle_deadline
+                    if lifecycle_deadline is not None
+                    else time.monotonic() + self.owner_validation_timeout_s
+                )
+                lease_timeout = (
+                    max(0.0, lifecycle_deadline - time.monotonic())
+                    if lifecycle_deadline is not None
+                    else None
+                )
+                with startup_lease(self.startup_lease_path, timeout_s=lease_timeout):
+                    states = [
+                        self._is_sleeping(
+                            model,
+                            timeout_s=self._remaining_owner_validation_timeout(
+                                validation_deadline
+                            ),
+                        )
+                        for model in self.models
+                    ]
+                if not states or any(state is not True for state in states):
+                    raise LifecycleUnavailableError(
+                        "all-engine sleep state unavailable; retry later"
+                    )
+            except Exception as exc:
+                with self._condition:
+                    self._lifecycle_state = "unknown"
+                    self._active_model_ready = False
+                    self._quiescing = False
+                    self._publish_transition("unknown")
+                    self._condition.notify_all()
+                if isinstance(exc, LifecycleUnavailableError):
+                    raise
+                raise LifecycleUnavailableError(
+                    "all-engine sleep state unavailable; retry later"
+                ) from exc
+            with self._condition:
+                self._lifecycle_state = "sleeping"
+                self._active_model_ready = False
+                self._quiescing = False
+                self._publish_transition("idle")
+                self._condition.notify_all()
+            return None
 
         try:
             self._publish_transition("sleeping", current.name)
@@ -688,10 +718,13 @@ class ModelManager:
         return current.name
 
     def release(self, target: ModelConfig) -> None:
-        with self._condition:
+        # Do not nest the request lock inside the lifecycle condition. A release
+        # must publish exact zero even while lifecycle control holds _condition.
+        with self._request_lock:
             if self._inflight_requests <= 0:
                 raise RuntimeError(f"no in-flight request to release for {target.name}")
             self._inflight_requests -= 1
+        with self._condition:
             self._condition.notify_all()
 
     def mark_owner_unavailable(self, target: ModelConfig) -> None:
@@ -716,7 +749,7 @@ class ModelManager:
             if (
                 self._active_model_name is not None
                 and self._active_model_name != target.name
-                and self._inflight_requests > 0
+                and self._exact_inflight_requests(deadline) > 0
             ):
                 self._pending_switch_name = target.name
                 self._wait_for_drain(deadline, target)

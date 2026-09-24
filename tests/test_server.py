@@ -236,7 +236,11 @@ class ServerTests(unittest.TestCase):
         self.assertFalse(health["ready"])
         self.assertEqual(health["lifecycle_state"], "starting")
         self.assertEqual(health["inflight_requests"], 0)
-        self.assertIsNone(health["urgent_drain_snapshot"])
+        self.assertEqual(
+            {"action_id": None, "fenced": False, "control_healthy": True,
+             "inflight_requests": 0},
+            health["urgent_drain_snapshot"],
+        )
         release_readiness.set()
         request_thread.join(timeout=2)
         self.assertFalse(request_thread.is_alive())
@@ -352,7 +356,7 @@ class ServerTests(unittest.TestCase):
         )
         lease.release()
 
-    def test_healthz_sets_urgent_drain_snapshot_null_when_condition_busy(self) -> None:
+    def test_healthz_keeps_urgent_drain_snapshot_when_condition_busy(self) -> None:
         locked = threading.Event()
         release = threading.Event()
 
@@ -368,7 +372,33 @@ class ServerTests(unittest.TestCase):
             started = time.monotonic()
             health = self.get_json("/healthz")
             self.assertLess(time.monotonic() - started, 0.5)
+            self.assertEqual(
+                {"action_id": None, "fenced": False, "control_healthy": True,
+                 "inflight_requests": 0},
+                health["urgent_drain_snapshot"],
+            )
+        finally:
+            release.set()
+            holder.join(timeout=1)
+
+    def test_healthz_is_prompt_when_request_lock_is_busy(self) -> None:
+        locked = threading.Event()
+        release = threading.Event()
+
+        def hold_request_lock() -> None:
+            with self.manager._request_lock:
+                locked.set()
+                release.wait(timeout=1)
+
+        holder = threading.Thread(target=hold_request_lock)
+        holder.start()
+        self.assertTrue(locked.wait(timeout=1))
+        try:
+            started = time.monotonic()
+            health = self.get_json("/healthz")
+            self.assertLess(time.monotonic() - started, 0.5)
             self.assertIsNone(health["urgent_drain_snapshot"])
+            self.assertEqual(0, health["inflight_requests"])
         finally:
             release.set()
             holder.join(timeout=1)

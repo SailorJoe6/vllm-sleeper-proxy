@@ -805,7 +805,31 @@ class ModelManagerTests(unittest.TestCase):
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
                 manager.sleep_active_model(**kwargs)
 
-    def test_urgent_drain_snapshot_is_null_when_condition_is_unavailable(self) -> None:
+    def test_bounded_sleep_times_out_on_request_lock_contention(self) -> None:
+        manager = ModelManager([qwen_model()], FakeHttp(), poll_interval_s=0)
+        locked = threading.Event()
+        release = threading.Event()
+
+        def hold_request_lock() -> None:
+            with manager._request_lock:
+                locked.set()
+                release.wait(timeout=1)
+
+        holder = threading.Thread(target=hold_request_lock)
+        holder.start()
+        self.assertTrue(locked.wait(timeout=1))
+        try:
+            started = time.monotonic()
+            with self.assertRaisesRegex(WakeError, "timed out draining requests"):
+                manager.sleep_active_model(
+                    drain_timeout_s=0.02, containment_timeout_s=0.1
+                )
+            self.assertLess(time.monotonic() - started, 0.1)
+        finally:
+            release.set()
+            holder.join(timeout=1)
+
+    def test_urgent_drain_snapshot_is_available_when_condition_is_unavailable(self) -> None:
         manager = ModelManager([qwen_model()], FakeHttp())
         locked = threading.Event()
         release = threading.Event()
@@ -820,29 +844,86 @@ class ModelManagerTests(unittest.TestCase):
         self.assertTrue(locked.wait(timeout=1))
         try:
             started = time.monotonic()
-            self.assertIsNone(manager.urgent_drain_snapshot())
+            self.assertEqual(
+                {"action_id": None, "fenced": False, "control_healthy": True,
+                 "inflight_requests": 0},
+                manager.urgent_drain_snapshot(),
+            )
             self.assertLess(time.monotonic() - started, 0.1)
         finally:
             release.set()
             holder.join(timeout=1)
 
-    def test_urgent_drain_snapshot_is_atomic_with_second_admission_and_increment(self) -> None:
-        class ControlledAdmission:
-            def __init__(self) -> None:
-                self.calls = 0
-                self.second_started = threading.Event()
-                self.allow_second = threading.Event()
-
+    def test_zero_inflight_snapshot_remains_available_during_no_owner_validation(self) -> None:
+        class FencedAdmission:
             def __call__(self, model) -> None:
-                self.calls += 1
-                if self.calls == 2:
-                    self.second_started.set()
-                    self.allow_second.wait(timeout=1)
+                raise RuntimeError("thermal fence")
 
             def snapshot(self, model):
                 from types import SimpleNamespace
 
-                return SimpleNamespace(fenced=True, action_id="thermal-atomic")
+                return SimpleNamespace(fenced=True, action_id="thermal-no-owner")
+
+        manager = ModelManager(
+            [qwen_model()], FakeHttp(), pre_admission_check=FencedAdmission(),
+            poll_interval_s=0,
+        )
+        validation_started = threading.Event()
+        release_validation = threading.Event()
+        errors: list[Exception] = []
+
+        def blocked_sleep_state(model, *, timeout_s=None):
+            validation_started.set()
+            release_validation.wait(timeout=1)
+            return True
+
+        manager._is_sleeping = blocked_sleep_state
+
+        def sleep() -> None:
+            try:
+                manager.sleep_active_model(drain_timeout_s=0.5, containment_timeout_s=1)
+            except Exception as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=sleep)
+        thread.start()
+        self.assertTrue(validation_started.wait(timeout=1))
+        try:
+            started = time.monotonic()
+            self.assertEqual(
+                {
+                    "action_id": "thermal-no-owner",
+                    "fenced": True,
+                    "control_healthy": True,
+                    "inflight_requests": 0,
+                },
+                manager.urgent_drain_snapshot(),
+            )
+            self.assertLess(time.monotonic() - started, 0.1)
+            self.assertTrue(manager._quiescing)
+        finally:
+            release_validation.set()
+            thread.join(timeout=1)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual([], errors)
+
+    def test_urgent_drain_snapshot_is_atomic_with_final_admission_increment(self) -> None:
+        class ControlledAdmission:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.final_started = threading.Event()
+                self.allow_final = threading.Event()
+
+            def __call__(self, model) -> None:
+                self.calls += 1
+                if self.calls == 4:
+                    self.final_started.set()
+                    self.allow_final.wait(timeout=1)
+
+            def snapshot(self, model):
+                from types import SimpleNamespace
+
+                return SimpleNamespace(fenced=False, action_id=None)
 
         admission = ControlledAdmission()
         manager = ModelManager(
@@ -854,22 +935,79 @@ class ModelManagerTests(unittest.TestCase):
             target=lambda: leases.append(manager.acquire("Qwen3-Embedding-8B"))
         )
         thread.start()
-        self.assertTrue(admission.second_started.wait(timeout=1))
+        self.assertTrue(admission.final_started.wait(timeout=1))
         self.assertIsNone(manager.urgent_drain_snapshot())
-        admission.allow_second.set()
+        admission.allow_final.set()
         thread.join(timeout=1)
         self.assertFalse(thread.is_alive())
         snapshot = manager.urgent_drain_snapshot()
         self.assertEqual(
             {
-                "action_id": "thermal-atomic",
-                "fenced": True,
+                "action_id": None,
+                "fenced": False,
                 "control_healthy": True,
                 "inflight_requests": 1,
             },
             snapshot,
         )
         leases[0].release()
+
+    def test_fenced_zero_snapshot_blocks_acquire_after_slow_activation(self) -> None:
+        class Admission:
+            def __init__(self) -> None:
+                self.fenced = False
+
+            def __call__(self, model) -> None:
+                if self.fenced:
+                    raise RuntimeError("thermal fence")
+
+            def snapshot(self, model):
+                from types import SimpleNamespace
+
+                return SimpleNamespace(
+                    fenced=self.fenced,
+                    action_id="thermal-activation" if self.fenced else None,
+                )
+
+        admission = Admission()
+        manager = ModelManager(
+            [qwen_model()], FakeHttp(), pre_admission_check=admission,
+            poll_interval_s=0,
+        )
+        activation_started = threading.Event()
+        release_activation = threading.Event()
+        leases = []
+        errors: list[Exception] = []
+
+        def activate(target):
+            activation_started.set()
+            release_activation.wait(timeout=1)
+            return target
+
+        manager._activate_locked = activate
+
+        def acquire() -> None:
+            try:
+                leases.append(manager.acquire("Qwen3-Embedding-8B"))
+            except Exception as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=acquire)
+        thread.start()
+        self.assertTrue(activation_started.wait(timeout=1))
+        admission.fenced = True
+        self.assertEqual(
+            {"action_id": "thermal-activation", "fenced": True,
+             "control_healthy": True, "inflight_requests": 0},
+            manager.urgent_drain_snapshot(),
+        )
+        release_activation.set()
+        thread.join(timeout=1)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual([], leases)
+        self.assertEqual(1, len(errors))
+        self.assertRegex(str(errors[0]), "thermal fence")
+        self.assertEqual(0, manager.inflight_requests)
 
     def test_atomic_zero_snapshot_fences_request_waiting_on_quiesce(self) -> None:
         class ControlledAdmission:
@@ -930,6 +1068,39 @@ class ModelManagerTests(unittest.TestCase):
         self.assertEqual(1, len(errors))
         self.assertRegex(str(errors[0]), "thermal fence")
         self.assertEqual(0, manager.inflight_requests)
+
+    def test_release_publishes_zero_while_lifecycle_condition_is_busy(self) -> None:
+        manager = ModelManager([qwen_model()], FakeHttp())
+        with manager._request_lock:
+            manager._inflight_requests = 1
+        condition_held = threading.Event()
+        release_condition = threading.Event()
+
+        def hold_condition() -> None:
+            with manager._condition:
+                condition_held.set()
+                release_condition.wait(timeout=1)
+
+        holder = threading.Thread(target=hold_condition)
+        holder.start()
+        self.assertTrue(condition_held.wait(timeout=1))
+        releaser = threading.Thread(target=lambda: manager.release(qwen_model()))
+        releaser.start()
+        deadline = time.monotonic() + 0.2
+        while manager.inflight_requests != 0 and time.monotonic() < deadline:
+            time.sleep(0.001)
+        self.assertEqual(0, manager.inflight_requests)
+        self.assertTrue(releaser.is_alive())
+        self.assertEqual(
+            {"action_id": None, "fenced": False, "control_healthy": True,
+             "inflight_requests": 0},
+            manager.urgent_drain_snapshot(),
+        )
+        release_condition.set()
+        holder.join(timeout=1)
+        releaser.join(timeout=1)
+        self.assertFalse(holder.is_alive())
+        self.assertFalse(releaser.is_alive())
 
     def test_concurrent_bounded_sleep_cannot_clear_another_sleepers_quiesce(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
